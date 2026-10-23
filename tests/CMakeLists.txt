@@ -1,0 +1,7 @@
+foreach(name kernels range_coder container determinism anchors)
+  add_executable(test_${name} test_${name}.cpp)
+  target_include_directories(test_${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(test_${name} PRIVATE hce_format hce_corpus hce_warnings)
+  add_test(NAME ${name} COMMAND test_${name})
+endforeach()
+target_link_libraries(test_anchors PRIVATE hce_encoder)
