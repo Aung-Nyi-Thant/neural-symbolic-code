@@ -10,6 +10,12 @@
 // SINGLE_ISSUER / DEFER_TASKRUN: they bind the ring to one thread, while the
 // stream adapters may be driven by different threads over their lifetime
 // (a pipeline's writer thread, then the owner calling finish()).
+//
+// Locked memory: for unprivileged users, recent kernels charge both the ring
+// and registered buffers to RLIMIT_MEMLOCK (8 MiB by default), shared by all
+// of the user's rings, and a closed ring returns its share asynchronously.
+// So buffers are registered only within a quarter of the limit, unregistered
+// synchronously on close, and ring creation retries ENOMEM for a few ms.
 #include "aio/backends.hpp"
 
 #include <liburing.h>
@@ -17,20 +23,27 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <thread>
 #include <vector>
+
+#include <sys/resource.h>
+#include <unistd.h>
 
 namespace hce::aio::detail {
 namespace {
 
 constexpr long long kWaitSliceNs = 20'000'000;  // interrupt() latency bound while waiting
 constexpr unsigned kReapBatch = 64;
+constexpr int kInitAttempts = 6;  // waits of 1, 2, 4, 8 and 16 ms between them: about 31 ms in all
 
-class UringEngine {
- public:
-  static constexpr const char* kName = "io_uring";
-
-  // Takes the file only when the ring exists; otherwise `sys_error` says why.
-  UringEngine(NativeFile& file, const Options& opt, int& sys_error) noexcept : depth_(opt.queue_depth) {
+// Creates a ring with the preferred flags, or plain on kernels without them.
+// ENOMEM and EAGAIN are retried: the locked memory of rings closed a moment
+// ago may still be on its way back. Returns 0 or a negative errno.
+int init_ring(unsigned depth, io_uring& ring) noexcept {
+  int r = 0;
+  for (int attempt = 0; attempt < kInitAttempts; ++attempt) {
+    if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(1 << (attempt - 1)));
     io_uring_params p{};
 #ifdef IORING_SETUP_COOP_TASKRUN
     p.flags |= IORING_SETUP_COOP_TASKRUN;  // 5.19: no IPI to run completion work
@@ -38,12 +51,32 @@ class UringEngine {
 #ifdef IORING_SETUP_SUBMIT_ALL
     p.flags |= IORING_SETUP_SUBMIT_ALL;  // 5.18: one bad SQE does not stall the batch
 #endif
-    int r = io_uring_queue_init_params(depth_, &ring_, &p);
+    r = io_uring_queue_init_params(depth, &ring, &p);
     if (r == -EINVAL && p.flags != 0) {  // older kernel: plain ring
       p = {};
-      r = io_uring_queue_init_params(depth_, &ring_, &p);
+      r = io_uring_queue_init_params(depth, &ring, &p);
     }
-    if (r < 0) {
+    if (r != -ENOMEM && r != -EAGAIN) break;
+  }
+  return r;
+}
+
+// Registered buffers stay within a quarter of RLIMIT_MEMLOCK: one stream must
+// not take the locked memory that the user's other rings need to exist.
+bool fits_locked_memory(std::size_t bytes) noexcept {
+  if (::geteuid() == 0) return true;  // as a rule CAP_IPC_LOCK: nothing is charged
+  rlimit rl{};
+  if (::getrlimit(RLIMIT_MEMLOCK, &rl) != 0) return false;
+  return rl.rlim_cur == RLIM_INFINITY || bytes <= rl.rlim_cur / 4;
+}
+
+class UringEngine {
+ public:
+  static constexpr const char* kName = "io_uring";
+
+  // Takes the file only when the ring exists; otherwise `sys_error` says why.
+  UringEngine(NativeFile& file, const Options& opt, int& sys_error) noexcept : depth_(opt.queue_depth) {
+    if (const int r = init_ring(depth_, ring_); r < 0) {
       sys_error = -r;
       return;
     }
@@ -69,7 +102,11 @@ class UringEngine {
       if (cqe->user_data != LIBURING_UDATA_TIMEOUT) --submitted_;
       io_uring_cqe_seen(&ring_, cqe);
     }
-    io_uring_queue_exit(&ring_);  // also unregisters the file and the buffers
+    // queue_exit would unregister these too, but asynchronously: return the
+    // locked memory now, so that the next ring finds it.
+    if (!fixed_.empty()) io_uring_unregister_buffers(&ring_);
+    if (fixed_file_) io_uring_unregister_files(&ring_);
+    io_uring_queue_exit(&ring_);
   }
 
   unsigned depth() const noexcept { return depth_; }
@@ -80,8 +117,13 @@ class UringEngine {
     try {
       std::vector<iovec> v;
       v.reserve(buffers.size());
-      for (const MutBytes b : buffers) v.push_back(iovec{b.data(), b.size()});
-      // Fails under a low RLIMIT_MEMLOCK on kernels before 5.12: plain opcodes then.
+      std::size_t bytes = 0;
+      for (const MutBytes b : buffers) {
+        v.push_back(iovec{b.data(), b.size()});
+        bytes += b.size();
+      }
+      if (!fits_locked_memory(bytes)) return;  // plain opcodes: a copy-free path is not worth a failed ring
+      // Can still fail when other rings hold the user's locked memory: plain opcodes then.
       if (io_uring_register_buffers(&ring_, v.data(), static_cast<unsigned>(v.size())) == 0) fixed_ = std::move(v);
     } catch (...) {
     }
@@ -191,7 +233,7 @@ std::unique_ptr<Facade> make(NativeFile& file, const Options& opt, int& sys_erro
 bool uring_probe() noexcept {
   static const bool ok = [] {
     io_uring ring{};
-    if (io_uring_queue_init(4, &ring, 0) < 0) return false;  // ENOSYS, EPERM (seccomp, sysctl), ENOMEM
+    if (init_ring(4, ring) < 0) return false;  // ENOSYS, EPERM (seccomp, sysctl), lasting ENOMEM
     bool good = false;
     if (io_uring_probe* p = io_uring_get_probe_ring(&ring)) {  // 5.6+: IORING_OP_READ / WRITE exist
       good = io_uring_opcode_supported(p, IORING_OP_READ) && io_uring_opcode_supported(p, IORING_OP_WRITE) &&
