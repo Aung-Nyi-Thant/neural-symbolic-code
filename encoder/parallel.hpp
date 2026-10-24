@@ -36,6 +36,10 @@ struct EncodeOptions {
   std::optional<hc::u64> content_size;        // written to the header; the input must match exactly
   hc::u64 max_memory = hc::u64{1} << 30;      // workers are shed until the pipeline fits
   std::stop_token stop;                       // external cancellation; never requested by the pipeline
+  // Read-only state shared by every worker's codec (a frozen
+  // structural::GlobalModel for StructuralCMCodec), handed to Enc::set_context()
+  // when the codec has one. It must outlive the call and not change during it.
+  const void* codec_context = nullptr;
 };
 
 struct EncodeResult {

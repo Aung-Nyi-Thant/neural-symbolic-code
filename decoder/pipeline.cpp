@@ -21,6 +21,7 @@
 #include "decoder/pipeline.hpp"
 
 #include "codec/neural_cm_codec.hpp"
+#include "structural/structural_cm_codec.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -50,6 +51,12 @@ using hc::u64;
 constexpr std::size_t kReadBytes = std::size_t{1} << 20;
 constexpr std::size_t kFillBytes = std::size_t{64} << 10;
 constexpr unsigned kMaxWorkers = 256;
+
+// DecodeOptions::codec_context, for codecs that take shared read-only state.
+template <class C>
+void attach_context(C& codec, const void* ctx) noexcept {
+  if constexpr (requires { codec.set_context(ctx); }) codec.set_context(ctx);
+}
 
 hc::DecoderOptions decoder_options(const DecodeOptions& o) {
   hc::DecoderOptions d;
@@ -97,6 +104,7 @@ template <hc::BlockCodec Codec>
 DecodeResult decode_sequential(InputStream& in, OutputStream& out, const DecodeOptions& opt) {
   DecodeResult r;
   Codec codec;
+  attach_context(codec, opt.codec_context);
   hc::StreamDecoder<Codec> dec(codec, decoder_options(opt));
   const std::unique_ptr<std::byte[]> ib(new std::byte[kReadBytes]);
   const std::unique_ptr<std::byte[]> ob(new std::byte[kReadBytes]);
@@ -251,6 +259,7 @@ class Pipeline final : public hc::SplitSink {
     wopt.limits.max_memory_bytes = plan_.worker_memory;
     std::vector<std::unique_ptr<Worker<Codec>>> workers;
     for (unsigned i = 0; i < plan_.threads; ++i) workers.push_back(std::make_unique<Worker<Codec>>(wopt));
+    for (auto& wp : workers) attach_context(wp->codec, opt_.codec_context);  // before any worker starts
 
     const std::stop_callback on_stop(opt_.stop, [this]() noexcept { fail(Errc::cancelled); });
     {
@@ -761,5 +770,6 @@ DecodeResult decode_stream(InputStream& in, OutputStream& out, const DecodeOptio
 }
 
 template DecodeResult decode_stream<NeuralCMCodec>(InputStream&, OutputStream&, const DecodeOptions&);
+template DecodeResult decode_stream<StructuralCMCodec>(InputStream&, OutputStream&, const DecodeOptions&);
 
 }  // namespace hce
