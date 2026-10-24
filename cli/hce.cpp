@@ -39,7 +39,7 @@ using hce::cli::FdInput;
 using hce::cli::FdOutput;
 using hce::cli::OutputFile;
 
-constexpr std::string_view kVersion = "2.0.0";
+constexpr std::string_view kVersion = "2.1.0";
 
 enum Exit : int { kSuccess = 0, kUsageOrIo = 1, kCorrupt = 2, kDataLoss = 3, kLimit = 4, kUnsupported = 5 };
 

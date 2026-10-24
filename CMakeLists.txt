@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(hce
-  VERSION 2.0.0
+  VERSION 2.1.0
   DESCRIPTION "Hybrid compression engine: neural CM codec in Container v3 FRAMED, encoder, decoder and CLI"
   LANGUAGES CXX)
 

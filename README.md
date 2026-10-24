@@ -38,7 +38,7 @@ for hostile input, partial damage and parallelism.
 | **Parallelism** | Frames compress and decompress on all cores under counting-semaphore back-pressure and a hard memory bound. |
 
 > [!NOTE]
-> **Status:** version 2.0.0. Container v3 FRAMED, codec profile 1 (`prior_id` `0x4E434D01`).
+> **Status:** version 2.1.0. Container v3 FRAMED, codec profile 1 (`prior_id` `0x4E434D01`).
 > Streams from 1.x, written by the retired LZ stand-in codec, are rejected as unsupported (exit 5),
 > never misdecoded.
 
