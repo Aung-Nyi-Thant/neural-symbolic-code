@@ -61,6 +61,39 @@ target_link_libraries(hce_pipeline
   PUBLIC hce_core hce_codec Threads::Threads
   PRIVATE hce_warnings)
 
+# Asynchronous file I/O (aio/): io_uring on Linux when liburing is available,
+# worker threads on macOS, Windows and every other system. The engine does
+# not depend on it: its adapters implement the pipelines' InputStream /
+# OutputStream. At run time, `automatic` falls back to threads wherever
+# io_uring is compiled in but not permitted (seccomp, io_uring_disabled).
+set(HCE_AIO_URING "AUTO" CACHE STRING "io_uring backend for aio/: AUTO, ON (require liburing) or OFF")
+set_property(CACHE HCE_AIO_URING PROPERTY STRINGS AUTO ON OFF)
+
+add_library(hce_aio STATIC
+  aio/async_io.cpp
+  aio/async_streams.cpp
+  aio/native_file.cpp
+  aio/thread_backend.cpp)
+target_link_libraries(hce_aio PUBLIC hce_core Threads::Threads PRIVATE hce_warnings)
+
+set(HCE_AIO_BACKENDS "threads")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT HCE_AIO_URING STREQUAL "OFF")
+  find_package(PkgConfig QUIET)
+  # A host liburing is useless to a cross build: there, look only when told to.
+  if(PKG_CONFIG_FOUND AND (NOT CMAKE_CROSSCOMPILING OR HCE_AIO_URING STREQUAL "ON"))
+    pkg_check_modules(LIBURING QUIET IMPORTED_TARGET liburing>=2.2)
+  endif()
+  if(LIBURING_FOUND)
+    target_sources(hce_aio PRIVATE aio/uring_backend.cpp)
+    target_compile_definitions(hce_aio PRIVATE HCE_AIO_HAVE_URING=1)
+    target_link_libraries(hce_aio PRIVATE PkgConfig::LIBURING)
+    set(HCE_AIO_BACKENDS "io_uring (liburing ${LIBURING_VERSION}), threads")
+  elseif(HCE_AIO_URING STREQUAL "ON")
+    message(FATAL_ERROR "HCE_AIO_URING=ON, but liburing >= 2.2 was not found (install liburing-dev)")
+  endif()
+endif()
+message(STATUS "hce_aio backends: ${HCE_AIO_BACKENDS}")
+
 # Command-line tool (POSIX).
 add_executable(hce cli/hce.cpp)
 target_link_libraries(hce PRIVATE hce_pipeline hce_warnings)
@@ -87,6 +120,10 @@ if(HCE_BUILD_TESTS)
   target_link_libraries(test_cli PRIVATE hce_core hce_warnings)
   add_test(NAME cli COMMAND test_cli $<TARGET_FILE:hce>)
 
+  add_executable(test_aio tests/test_aio.cpp)
+  target_link_libraries(test_aio PRIVATE hce_aio hce_pipeline hce_warnings)
+  add_test(NAME aio COMMAND test_aio)
+
   # Sanitizer failures get exit codes of their own, so the CLI tests can never
   # mistake one for an hce exit status.
   set(HCE_TEST_ENV
@@ -101,5 +138,5 @@ if(HCE_BUILD_TESTS)
     list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " HCE_WRAPPER)
     list(APPEND HCE_TEST_ENV "HCE_TEST_WRAPPER=${HCE_WRAPPER}")
   endif()
-  set_tests_properties(framing codec pipeline cli PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
+  set_tests_properties(framing codec pipeline cli aio PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
 endif()
