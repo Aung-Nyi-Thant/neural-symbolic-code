@@ -37,3 +37,7 @@ build.ninja
 *.swp
 *~
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
