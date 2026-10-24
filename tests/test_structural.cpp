@@ -85,6 +85,25 @@ static Vec ids_of(const st::GlobalModel& m, const std::vector<st::StructuralToke
   return v;
 }
 
+// Like a file descriptor: a read that returns 0 (even of an empty buffer) is the end, for good.
+class LatchingInput final : public hce::InputStream {
+ public:
+  explicit LatchingInput(Bytes data) noexcept : data_(data) {}
+  std::size_t read(hc::MutBytes buf) override {
+    if (eof_) return 0;
+    const std::size_t n = std::min({buf.size(), data_.size() - pos_, std::size_t{4093}});
+    std::memcpy(buf.data(), data_.data() + pos_, n);
+    pos_ += n;
+    eof_ = n == 0;
+    return n;
+  }
+
+ private:
+  Bytes data_;
+  std::size_t pos_ = 0;
+  bool eof_ = false;
+};
+
 // --------------------------------------------------------------- Phase 1 ---
 
 static void test_tokenizer() {
@@ -129,6 +148,32 @@ static void test_tokenizer() {
   CHECK(st::detokenize(k) == long_lit);
   CHECK(std::all_of(k.begin(), k.end(), [](const auto& x) { return x.value.size() <= st::kMaxTokenBytes; }));
   CHECK(pre.tokenize("").empty());
+}
+
+static void test_languages() {
+  CHECK(st::parse_language("py") == st::Language::python && st::parse_language("c++") == st::Language::cpp);
+  CHECK(st::parse_language("ts") == st::Language::typescript && !st::parse_language("cobol"));
+  CHECK(st::language_for_path("a/b.PY") == st::Language::python && st::language_for_path("x.hpp") == st::Language::cpp);
+  CHECK(st::language_for_path("x.rs") == st::Language::rust && st::language_for_path("vector") == st::Language::generic);
+  for (std::uint8_t l = 0; l < st::kLanguages; ++l) {
+    const auto lang = static_cast<st::Language>(l);
+    CHECK(st::parse_language(st::to_string(lang)) == lang);
+  }
+  // The table decides KEYWORD versus IDENTIFIER; every table is lossless.
+  const std::string src = "def f(self): return function(x) if x else nil\n";
+  const auto kind = [&](st::Language lang, const char* word) {
+    for (const auto& t : st::tokenize(src, lang))
+      if (t.value == word) return t.type;
+    return TokenType::OPERATOR;
+  };
+  CHECK(kind(st::Language::python, "def") == TokenType::KEYWORD && kind(st::Language::cpp, "def") == TokenType::IDENTIFIER);
+  CHECK(kind(st::Language::javascript, "function") == TokenType::KEYWORD && kind(st::Language::python, "function") == TokenType::IDENTIFIER);
+  CHECK(kind(st::Language::go, "nil") == TokenType::KEYWORD && kind(st::Language::rust, "nil") == TokenType::IDENTIFIER);
+  for (std::uint8_t l = 0; l < st::kLanguages; ++l)
+    for (std::uint32_t seed = 0; seed < 20; ++seed) {
+      const std::string text = random_text(2000, seed, true);
+      CHECK(st::detokenize(st::tokenize(text, static_cast<st::Language>(l))) == text);
+    }
 }
 
 static void test_token_image() {
@@ -381,6 +426,33 @@ static void test_archives() {
     CHECK(st::decompress_file(arc, back, o).status == Errc::ok && read_text(back) == s);
   }
 
+  // Streams: memory in, memory out; the language is recorded; cancellation stops every stage.
+  {
+    const std::string py = "def f(x):\n    return x + 1\n\nprint(f(2))\n";
+    hce::MemoryInput in(Bytes(reinterpret_cast<const std::byte*>(py.data()), py.size()));
+    hce::MemoryOutput arc;
+    st::ArchiveOptions so = o;
+    so.language = st::Language::python;
+    const st::ArchiveStats c = st::compress_stream(in, arc, so);
+    CHECK(c.status == Errc::ok && c.archive_bytes == arc.data.size() && st::is_archive(arc.data));
+    LatchingInput ain(arc.data);  // the model section ends exactly where the token stream starts
+    hce::MemoryOutput back;
+    const st::ArchiveStats d = st::decompress_stream(ain, back, o);
+    CHECK(d.status == Errc::ok && d.language == st::Language::python);
+    CHECK(std::string(reinterpret_cast<const char*>(back.data.data()), back.data.size()) == py);
+    std::stop_source stop;
+    stop.request_stop();
+    st::ArchiveOptions co = o;
+    co.stop = stop.get_token();
+    hce::MemoryInput in2(Bytes(reinterpret_cast<const std::byte*>(py.data()), py.size()));
+    hce::MemoryOutput arc2;
+    CHECK(st::compress_stream(in2, arc2, co).status == Errc::cancelled);
+    hce::MemoryInput ain2(arc.data);
+    hce::MemoryOutput back2;
+    CHECK(st::decompress_stream(ain2, back2, co).status == Errc::cancelled);
+    CHECK(!st::is_archive(Bytes(arc.data).first(3)));
+  }
+
   // Damaged archives fail and leave no output behind.
   write_text(src, code);
   const fs::path arc = g_dir / "dmg.hcs", back = g_dir / "dmg.out";
@@ -414,6 +486,7 @@ int main() {
   fs::create_directories(g_dir);
 
   test_tokenizer();
+  test_languages();
   test_token_image();
   test_tracker();
   std::printf("  tokenizer, token image and tracker ok\n");

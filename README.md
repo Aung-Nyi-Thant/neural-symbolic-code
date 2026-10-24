@@ -7,6 +7,7 @@
 21–45% smaller than `zstd -19` on text, source code and logs · bit-exact on x86-64 and AArch64 ·
 zero sanitizer findings across GCC and Clang
 
+[![CI](https://github.com/Aung-Nyi-Thant/neural-symbolic-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Aung-Nyi-Thant/neural-symbolic-code/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](#quick-start)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Sanitizers](https://img.shields.io/badge/sanitizers-ASan%20%C2%B7%20UBSan%20%C2%B7%20TSan-2ea44f)](#quality-assurance)
@@ -16,7 +17,7 @@ zero sanitizer findings across GCC and Clang
 
 [Overview](#overview) · [Architecture](#architecture) · [Hardening](#hardening-and-security-r11r21) ·
 [Quality](#quality-assurance) · [Benchmarks](#performance-and-benchmarks) · [Quick start](#quick-start) ·
-[License](#license)
+[Tooling](#tooling-and-automation) · [License](#license)
 
 </div>
 
@@ -216,24 +217,30 @@ HCE is specified by eleven hardening rules. Each is enforced in code and exercis
 
 ## Quality assurance
 
-Every configuration builds with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror`.
-All four test suites pass in each of them with **zero compiler warnings and zero sanitizer reports**.
+Every configuration builds with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Werror`,
+and every suite it builds passes with **zero compiler warnings and zero sanitizer reports**.
+[CI](.github/workflows/ci.yml) runs the whole matrix on every push and pull request; each row is a CMake
+preset, so any of them reproduces locally (see [Tooling and automation](#tooling-and-automation)).
 
-| Configuration | Toolchain | Instrumentation | Suites passed | Wall time |
-|---|---|---|:---:|---:|
-| `release` | GCC 13.3 `-O3` | — | ✅ 4 / 4 | 27 s |
-| `gcc-asan` | GCC 13.3 | ASan + UBSan | ✅ 4 / 4 | 117 s |
-| `clang-asan` | Clang 18.1 | ASan + UBSan | ✅ 4 / 4 | 85 s |
-| `gcc-tsan` | GCC 13.3 | TSan | ✅ 4 / 4 | 376 s |
-| `clang-tsan` | Clang 18.1 | TSan | ✅ 4 / 4 | 233 s |
-| `aarch64-qemu` | GCC 13.3 cross, `armv8.2-a+dotprod` | QEMU 8.2, `-cpu max` | ✅ 4 / 4 | 124 s |
+| Preset | Toolchain | Instrumentation | Suites |
+|---|---|---|:---:|
+| `release` | GCC 13 `-O3` | — | 6 |
+| `clang-release` | Clang 18 `-O3` | — | 6 |
+| `gcc-asan` | GCC 13 | ASan + UBSan | 6 |
+| `clang-asan` | Clang 18 | ASan + UBSan | 6 |
+| `gcc-tsan` | GCC 13 | TSan | 6 |
+| `clang-tsan` | Clang 18 | TSan | 6 |
+| `aarch64-qemu` | GCC 13 cross, `armv8.2-a+dotprod` | QEMU user mode, `-cpu max` | 6 |
+| `mingw-wine` | MinGW-w64 GCC 13 cross, static | Wine 9 | 5 (the CLI is POSIX-only) |
 
 | Suite | Scope | Highlights |
 |---|---|---|
 | `framing` | Container (R18–R21) | 3,000-iteration mutation fuzz (bit flips, insertions, deletions, truncation), checked in strict and fill modes. Also: resync, forged markers, bombs, late join, cancellation. |
 | `codec` | CM codec | 200,000-case SIMD parity per path. Nine golden streams. 120 CRC-valid hostile payloads, decoded in two modes. Also: replay, late join, window bound and reset-cost bound. |
 | `pipeline` | Parallel encoder and decoder | Byte-identical output for 1, 2, 3, 5 and 8 threads. Differential fuzzing on damaged streams (pipeline ≡ sequential). Also: cancellation, I/O failure, and a race-regression test (60 repetitions). |
-| `cli` | `hce` binary | Exit codes, atomic output files, pipes, SIGINT and EPIPE, gap reports, limits, legacy-stream rejection. |
+| `aio` | Asynchronous file I/O | Every backend present (io_uring, worker threads): the engine contract, round trips across sizes, queue depths and `O_DIRECT`, interrupts and errors, and the pipelines over async files. |
+| `structural` | Structural codec | Tokenizer fuzzing for losslessness, hostile token and model images, deterministic models, round trips across thread counts and SIMD paths, archives on every aio backend, damaged archives. |
+| `cli` | `hce` binary | Exit codes, atomic output files, pipes, SIGINT and EPIPE, gap reports, limits, legacy-stream rejection, structural mode and format detection. |
 
 **Cross-architecture bit-exactness.** The same nine golden streams, compared by size and CRC-32C, are
 reproduced on x86-64 with the scalar, SSE2 and AVX2 kernels and on AArch64 with NEON, from GCC and Clang
@@ -306,6 +313,22 @@ The input is 32 MiB of access logs, which forms four 8 MiB frames, at level 2. T
 | `-T 4`, default `trusted` limits | 3 | 1.54 MB/s | 2.0× |
 | `-T 4 --max-window 8M --max-level 2` | 4 | 3.05 MB/s | **3.9×** |
 
+### Source-code corpora (`tools/benchmark.py`)
+
+Produced by [`tools/benchmark.py`](tools/benchmark.py), which [CI](#tooling-and-automation) also runs:
+the same Xeon VM, 4 threads for every tool, hce level 2. Every result was decompressed and compared with
+the original.
+
+| Codec | Python stdlib (9.9 MB) | libstdc++ headers (12.4 MB) | HCE sources (0.5 MB) |
+|---|---:|---:|---:|
+| `hce` (byte codec) | **13.12%** | **7.75%** | **16.99%** |
+| `hce --structural` | 15.91% | 8.90% | 19.64% |
+| `xz -9e` | 16.41% | 9.54% | 21.65% |
+| `zstd -19` | 16.78% | 9.99% | 22.08% |
+
+Compressed size as % of the original. Speeds, compress / decompress in MB/s: byte codec 0.84 / 0.75 and
+1.14 / 1.10, structural 1.45 / 1.73 and 1.76 / 2.18, on the two large corpora.
+
 > [!IMPORTANT]
 > **Cost is symmetric.** Context mixing spends about as much CPU to decompress as to compress: roughly
 > 0.5–1.5 MB/s per core, against 60–250 MB/s for zstd or xz decompression. HCE is built for archival,
@@ -327,6 +350,8 @@ The input is 32 MiB of access logs, which forms four 8 MiB frames, at level 2. T
 sudo apt install build-essential cmake ninja-build                # minimal
 sudo apt install clang libclang-rt-18-dev                         # Clang + sanitizer runtimes
 sudo apt install g++-aarch64-linux-gnu qemu-user                  # AArch64 cross-testing
+sudo apt install g++-mingw-w64-x86-64-posix wine64                # Windows cross-testing
+sudo apt install liburing-dev pkg-config                          # io_uring backend (optional)
 ```
 
 ### Build, test, install
@@ -334,7 +359,7 @@ sudo apt install g++-aarch64-linux-gnu qemu-user                  # AArch64 cros
 ```bash
 cmake --preset release            # Release: codec at -O3 with loop vectorization
 cmake --build --preset release
-ctest --preset release -j4        # framing, codec, pipeline and cli suites
+ctest --preset release            # all six suites
 sudo cmake --install build/release   # installs bin/hce
 ```
 
@@ -351,15 +376,16 @@ ctest --test-dir build -j4 --output-on-failure
 | `HCE_NATIVE` | `OFF` | Adds `-march=native` to the whole build; the binary may then not run on other CPUs. Mixer kernels are already chosen at run time (AVX2 → SSE2 → scalar on x86-64, NEON on AArch64), so a portable build loses little. |
 | `HCE_SANITIZE` | empty | `address,undefined` or `thread`. |
 | `HCE_WERROR` | `ON` | Treat warnings as errors; set `OFF` for packaging on newer compilers. |
-| `HCE_BUILD_TESTS` | `ON` | Build the four test suites. |
+| `HCE_BUILD_TESTS` | `ON` | Build the test suites. |
+| `HCE_AIO_URING` | `AUTO` | io_uring backend of `aio/`: `AUTO` builds it when pkg-config finds liburing ≥ 2.2, `ON` requires it, `OFF` builds the thread backend only. |
 
 The codec library always builds with `-O3 -ftree-vectorize`, except in `Debug` builds.
 
 Reproduce the full verification matrix:
 
 ```bash
-for p in release gcc-asan clang-asan gcc-tsan clang-tsan aarch64-qemu; do
-  cmake --preset "$p" && cmake --build --preset "$p" && ctest --preset "$p" -j4 || break
+for p in release clang-release gcc-asan clang-asan gcc-tsan clang-tsan aarch64-qemu mingw-wine; do
+  cmake --preset "$p" && cmake --build --preset "$p" && ctest --preset "$p" || break
 done
 ```
 
@@ -372,7 +398,24 @@ hce -d < app.log.hce | grep ERROR                 # decompress to a pipe
 hce -t -i app.log.hce --stats=json                # verify every byte, write nothing
 hce -d --limits untrusted -i upload.hce -o out    # hostile input: R19 limits
 hce -l 4 --window 64M --frame 32M -i big.tar -o big.tar.hce
+hce --structural -i server.py -o server.py.hcs    # structural codec; --lang auto-detects Python from .py
+hce -d -i server.py.hcs -o server.py              # -d and -t recognize either format by its first bytes
 ```
+
+`-v` prints one readable line: sizes, ratio, time and speed. This is real output:
+
+```console
+$ hce --structural -v -T4 -i repo.cpp -o repo.hcs
+hce: repo.cpp -> repo.hcs: 414834 -> 83359 bytes (20.09% of the original, 4.98x) in 0.862 s, 0.48 MB/s; structural, cpp, 140708 tokens, 4571 symbols, 4 threads, level 2, spool via io_uring
+```
+
+`--stats=json` writes the same numbers, and more, as one integer-valued JSON object for scripts.
+
+> [!NOTE]
+> **Byte codec or structural codec?** The byte codec (the default) compresses source code 15–20%
+> smaller; `--structural` runs about twice as fast and still beats `zstd -19` and `xz -9e` (see
+> [benchmarks](#source-code-corpora-toolsbenchmarkpy)). `--lang` only changes which words count as
+> keywords, which moves the size by less than 0.1%: the codec's contexts key on the tokens themselves.
 
 Recover a damaged archive. This is real output:
 
@@ -406,7 +449,7 @@ Usage: hce [MODE] [OPTIONS] [-i INPUT] [-o OUTPUT]
 
 Modes:
   -z, --compress          compress (default)
-  -d, --decompress        decompress
+  -d, --decompress        decompress (either format, recognized by its first bytes)
   -t, --test              decompress and verify, discarding the output
 
 Input and output:
@@ -425,6 +468,13 @@ Compression:
       --frame SIZE        frame length / sync interval, block..1G (default 8M)
       --no-content-size   do not record the input size in the header
   -T, --threads N         worker threads (default: one per CPU)
+      --structural        two-pass structural codec for source code: tokens,
+                          a frozen global model, token-level context mixing
+      --lang LANG         keyword table for --structural: auto (default: from
+                          the input's extension), generic, c, cpp, python,
+                          javascript, typescript, java, go, rust
+      --spool-dir DIR     where --structural keeps its token spool (default:
+                          next to the output file, else the temporary directory)
 
 Decompression:
       --recovery MODE     strict | skip | skip_and_fill (default strict)
@@ -438,13 +488,26 @@ Decompression:
       --max-ratio N       expansion budget: output <= N * input + burst (0 = off)
       --ratio-burst SIZE  burst depth of the expansion budget (default 64M)
       --max-output SIZE   largest total output
+                          Structural archives are verified as a whole: they take
+                          --max-memory, but not --recovery, --report or the
+                          other limits.
 
 Reporting:
       --stats[=FORMAT]    integer telemetry on stderr: text (default) or json
-  -v, --verbose           same as --stats=text
+  -v, --verbose           a readable summary on stderr: sizes, ratio, time, speed
   -q, --quiet             suppress warnings and error messages
   -h, --help              show this help
   -V, --version           show version information
+
+SIZE takes an optional K, M, G or T suffix (powers of 1024).
+
+Environment:
+  HCE_AIO=io_uring|threads        I/O backend of the --structural token spool
+  HCE_SIMD=scalar|sse2|avx2|neon  mixer kernels (default: the best available)
+
+Exit status: 0 success (with -d/-t: every byte verified), 1 usage or I/O error,
+2 corrupt input, 3 finished with data loss, 4 resource limit exceeded,
+5 unsupported version or feature.
 ```
 
 </details>
@@ -488,6 +551,47 @@ add_subdirectory(third_party/hce)
 target_link_libraries(my_app PRIVATE hce_pipeline)
 ```
 
+## Tooling and automation
+
+### Benchmark script
+
+[`tools/benchmark.py`](tools/benchmark.py) (Python 3.8+, standard library only) compresses each corpus
+with `hce --structural`, `hce`, `zstd -19` and `xz -9e`, decompresses every result and compares it with
+the original byte for byte, and writes Markdown and CSV tables of size and speed.
+
+```bash
+tools/benchmark.py                                   # every built-in corpus, every tool found
+tools/benchmark.py --corpus hce-repo --runs 3 --md bench.md --csv bench.csv
+tools/benchmark.py --corpus logs=/var/log/syslog --codecs ncm,zstd --threads 8
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--corpus NAME[=PATH]` | all built-ins found | `python-stdlib`, `cxx-headers`, `hce-repo`, or any file or directory; repeatable |
+| `--codecs LIST` | `structural,ncm,zstd,xz` | Subset to run; missing tools are skipped unless named explicitly |
+| `--hce PATH` | `build/release/hce` | The binary under test |
+| `--level N`, `--threads N` | `2`, all CPUs | hce level; threads for every tool |
+| `--runs N` | `1` | Repetitions; the fastest time is reported |
+| `--max-bytes N` | none | Cut every corpus, for quick runs |
+| `--md FILE`, `--csv FILE` | none | Also write the report to files (Markdown always goes to stdout) |
+
+Corpora are concatenations of their files in sorted order, so every run measures the same bytes. Exit
+status: 0 when every round trip verified, 1 when a command failed or an output differed, 2 for usage errors.
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
+
+| Job | What it runs |
+|---|---|
+| `linux (preset)` | `release`, `clang-release`, `gcc-asan`, `clang-asan`, `gcc-tsan`, `clang-tsan`: build with `-Werror`, then all six suites; io_uring compiled in (`HCE_AIO_URING=ON`) |
+| `aarch64 (QEMU)` | The `aarch64-qemu` preset: a static cross build, every suite under `qemu-aarch64 -cpu max` |
+| `windows (MinGW-w64 + Wine)` | The `mingw-wine` preset: a static Windows build, five suites under Wine |
+| `benchmark (smoke)` | `tools/benchmark.py` on the three corpora; tables in the job summary and as an artifact |
+
+Failed test jobs upload `LastTest.log`. Each job is a preset, so `cmake --preset P && cmake --build
+--preset P && ctest --preset P` reproduces it locally.
+
 ---
 
 ## Wire format
@@ -519,10 +623,15 @@ codec/ncm_tables.hpp              Fixed-point tables generated at compile time
 encoder/parallel.{hpp,cpp}        Multi-threaded encoder: T workers, T+2 slots, ordered writer
 decoder/pipeline.{hpp,cpp}        Multi-threaded decoder: splitter, workers, ordered writer
 io/stream.hpp                     Stream interfaces and in-memory implementations
+aio/                              Asynchronous file I/O: io_uring and worker-thread backends, stream adapters
+structural/                       Structural codec: tokenizer, frozen global model, token-level CM, HCS archives
 cli/hce.cpp, cli/posix_io.hpp     The hce command-line tool
 test_hc_framed.cpp                Container suite with mutation fuzzing
-tests/                            Codec, pipeline and CLI suites; legacy-stream fixture
+tests/                            Codec, pipeline, aio, structural and CLI suites; legacy-stream fixture
+tools/benchmark.py                Multi-corpus benchmark against zstd and xz, Markdown and CSV output
 cmake/aarch64-linux-gnu.cmake     AArch64 cross toolchain; tests run under QEMU
+cmake/x86_64-w64-mingw32.cmake    Windows cross toolchain (MinGW-w64); tests run under Wine
+.github/workflows/ci.yml          CI: the preset matrix, cross targets and the benchmark
 ```
 
 ---
@@ -539,14 +648,15 @@ cmake/aarch64-linux-gnu.cmake     AArch64 cross toolchain; tests run under QEMU
   incompressible region is not deduplicated.
 - **Fuzzing.** Fuzzing is randomized and runs inside the test suites (mutation and differential). There is
   no coverage-guided harness (libFuzzer/OSS-Fuzz) yet.
-- **Platforms.** Linux x86-64 and AArch64 are tested. macOS and Windows have not been validated, and the CLI
-  requires POSIX.
+- **Platforms.** Linux x86-64 and AArch64 are tested. Windows builds (MinGW-w64) pass the library suites
+  under Wine; native Windows (MSVC) and macOS have not been validated, and the CLI requires POSIX.
+- **Structural codec.** `--structural` is faster but compresses source code 15–20% larger than the byte
+  codec: its dictionary of distinct tokens costs about a third of every archive.
 - **Format.** Profile 1 is frozen by golden vectors, but the 4-byte container magic is still provisional.
 
 ## Roadmap
 
 - Coverage-guided fuzz targets for the container and codec decoders (libFuzzer, OSS-Fuzz).
-- Continuous integration that runs the six-configuration matrix on every change.
 - Decoder worker planning driven by the stream header rather than the limits' worst case.
 - Seek-index ancillary blocks for random access; the container already reserves them.
 - A final container magic number, then a formal format specification document.
@@ -558,8 +668,8 @@ cmake/aarch64-linux-gnu.cmake     AArch64 cross toolchain; tests run under QEMU
 Changes are welcome. The bar matches the guarantees above:
 
 1. **Zero warnings** under the project's `-Werror` flag set, on GCC and Clang.
-2. **All six configurations pass:** `release`, `gcc-asan`, `clang-asan`, `gcc-tsan`, `clang-tsan`
-   and `aarch64-qemu`.
+2. **All eight configurations pass:** `release`, `clang-release`, `gcc-asan`, `clang-asan`, `gcc-tsan`,
+   `clang-tsan`, `aarch64-qemu` and `mingw-wine`. CI checks them on every pull request.
 3. **No floating point in the codec**, and every kernel path stays bit-exact with the scalar reference.
 4. **R17:** golden streams are never edited. A change to any coded bit ships as a new codec profile with
    new golden vectors.

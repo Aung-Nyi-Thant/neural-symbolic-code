@@ -36,6 +36,7 @@ class FdInput final : public InputStream {
       : fd_(fd), pollable_(pollable), stop_(std::move(stop)) {}
 
   std::size_t read(hc::MutBytes buf) override {
+    if (buf.empty()) return 0;  // read(fd, p, 0) returns 0 too: that is not the end of the file
     while (err_ == hc::Errc::ok && !eof_) {
       if (stop_.stop_requested() || interrupted_.load(std::memory_order_relaxed)) {
         err_ = hc::Errc::cancelled;

@@ -24,6 +24,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -35,6 +37,23 @@ inline constexpr std::size_t kMaxSourceBytes = std::size_t{1} << 30;  // per tok
 inline constexpr std::uint8_t kTokenTypes = 6;
 inline constexpr std::array<std::byte, 4> kTokenStreamMagic{std::byte{'H'}, std::byte{'S'}, std::byte{'T'},
                                                             std::byte{'1'}};
+
+// Keyword tables: which identifier-shaped words become KEYWORD tokens. The
+// table only shapes the tokens (and so the compression); every table is
+// lossless, and decoders never need to know which one was used. `generic`
+// is the union of the others and is what StructuralPreprocessor::tokenize() uses.
+enum class Language : std::uint8_t { generic = 0, c, cpp, python, javascript, typescript, java, go, rust };
+inline constexpr std::uint8_t kLanguages = 9;
+
+const char* to_string(Language lang) noexcept;
+// generic, c, cpp (c++, cxx), python (py), javascript (js), typescript (ts),
+// java, go, rust (rs). "auto" is not a language: resolve it with language_for_path().
+std::optional<Language> parse_language(std::string_view name) noexcept;
+// By file extension (.py, .cpp, .hpp, .h, .c, .js, .ts, .java, .go, .rs, ...); generic otherwise.
+Language language_for_path(const std::filesystem::path& path) noexcept;
+
+// tokenize() with the keyword table of `lang`; the same contract otherwise.
+std::vector<StructuralToken> tokenize(std::string_view source, Language lang);
 
 struct TokenStreamLimits {
   hc::u64 max_tokens = hc::u64{1} << 28;

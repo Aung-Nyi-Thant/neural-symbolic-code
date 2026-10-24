@@ -7,10 +7,17 @@
 //   3  finished with data loss: a recovery mode reported gaps
 //   4  an R19 resource limit was exceeded (expansion budget, memory cap, ...)
 //   5  unsupported format version or feature
+//
+// Two formats: FRAMED v3 streams of the byte-level neural CM codec (the
+// default), and HCS archives of the two-pass structural codec (--structural).
+// Decompression tells them apart by their first bytes.
+#include "aio/async_io.hpp"
 #include "cli/posix_io.hpp"
 #include "codec/neural_cm_codec.hpp"
 #include "decoder/pipeline.hpp"
 #include "encoder/parallel.hpp"
+#include "structural/archive.hpp"
+#include "structural/structural_cm_codec.hpp"
 
 #include <atomic>
 #include <bit>
@@ -19,6 +26,7 @@
 #include <csignal>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -38,6 +46,7 @@ using hc::u64;
 using hce::cli::FdInput;
 using hce::cli::FdOutput;
 using hce::cli::OutputFile;
+namespace st = hce::structural;
 
 constexpr std::string_view kVersion = "2.1.0";
 
@@ -54,7 +63,7 @@ constexpr std::string_view kHelp = R"(Usage: hce [MODE] [OPTIONS] [-i INPUT] [-o
 
 Modes:
   -z, --compress          compress (default)
-  -d, --decompress        decompress
+  -d, --decompress        decompress (either format, recognized by its first bytes)
   -t, --test              decompress and verify, discarding the output
 
 Input and output:
@@ -73,6 +82,13 @@ Compression:
       --frame SIZE        frame length / sync interval, block..1G (default 8M)
       --no-content-size   do not record the input size in the header
   -T, --threads N         worker threads (default: one per CPU)
+      --structural        two-pass structural codec for source code: tokens,
+                          a frozen global model, token-level context mixing
+      --lang LANG         keyword table for --structural: auto (default: from
+                          the input's extension), generic, c, cpp, python,
+                          javascript, typescript, java, go, rust
+      --spool-dir DIR     where --structural keeps its token spool (default:
+                          next to the output file, else the temporary directory)
 
 Decompression:
       --recovery MODE     strict | skip | skip_and_fill (default strict)
@@ -86,15 +102,22 @@ Decompression:
       --max-ratio N       expansion budget: output <= N * input + burst (0 = off)
       --ratio-burst SIZE  burst depth of the expansion budget (default 64M)
       --max-output SIZE   largest total output
+                          Structural archives are verified as a whole: they take
+                          --max-memory, but not --recovery, --report or the
+                          other limits.
 
 Reporting:
       --stats[=FORMAT]    integer telemetry on stderr: text (default) or json
-  -v, --verbose           same as --stats=text
+  -v, --verbose           a readable summary on stderr: sizes, ratio, time, speed
   -q, --quiet             suppress warnings and error messages
   -h, --help              show this help
   -V, --version           show version information
 
 SIZE takes an optional K, M, G or T suffix (powers of 1024).
+
+Environment:
+  HCE_AIO=io_uring|threads        I/O backend of the --structural token spool
+  HCE_SIMD=scalar|sse2|avx2|neon  mixer kernels (default: the best available)
 
 Exit status: 0 success (with -d/-t: every byte verified), 1 usage or I/O error,
 2 corrupt input, 3 finished with data loss, 4 resource limit exceeded,
@@ -109,6 +132,11 @@ struct Options {
   std::optional<std::string> input, output, report;
   bool force = false, keep_partial = false, quiet = false, record_size = true;
   StatsFormat stats = StatsFormat::none;
+  bool summary = false;  // -v
+  // Structural codec.
+  bool structural = false;
+  std::optional<st::Language> lang;  // nullopt: auto, from the input's extension
+  std::optional<std::string> spool_dir;
   // Compression.
   hc::u8 level = 2, window_log = 23, block_log = 18;
   u64 frame_bytes = u64{8} << 20;
@@ -166,6 +194,7 @@ Options parse(int argc, char** argv) {
     std::optional<u64> memory, window, block, level, ratio, burst, output;
   } ov;
   std::optional<std::string_view> profile;
+  bool lang_given = false, layout_given = false;
   const std::vector<std::string_view> args(argv + 1, argv + argc);
   for (std::size_t i = 0; i < args.size(); ++i) {
     std::string_view a = args[i];
@@ -192,7 +221,7 @@ Options parse(int argc, char** argv) {
     const auto is = [&](std::string_view s, std::string_view l) { return a == s || a == l; };
     if (is("-z", "--compress") || is("-d", "--decompress") || is("-t", "--test") || is("-h", "--help") ||
         is("-V", "--version") || is("-f", "--force") || is("-q", "--quiet") || is("-v", "--verbose") ||
-        a == "--keep-partial" || a == "--no-content-size") {
+        a == "--keep-partial" || a == "--no-content-size" || a == "--structural") {
       flag();
       if (is("-z", "--compress")) o.mode = Mode::compress;
       else if (is("-d", "--decompress")) o.mode = Mode::decompress;
@@ -201,8 +230,9 @@ Options parse(int argc, char** argv) {
       else if (is("-V", "--version")) o.version = true;
       else if (is("-f", "--force")) o.force = true;
       else if (is("-q", "--quiet")) o.quiet = true;
-      else if (is("-v", "--verbose")) o.stats = StatsFormat::text;
+      else if (is("-v", "--verbose")) o.summary = true;
       else if (a == "--keep-partial") o.keep_partial = true;
+      else if (a == "--structural") o.structural = true;
       else o.record_size = false;
     } else if (a == "--stats") {
       const std::string_view f = attached.value_or("text");
@@ -216,6 +246,14 @@ Options parse(int argc, char** argv) {
       o.output = std::string(value());
     } else if (a == "--report") {
       o.report = std::string(value());
+    } else if (a == "--lang") {
+      const std::string_view v = value();
+      if (v == "auto") o.lang.reset();
+      else if (const auto l = st::parse_language(v)) o.lang = *l;
+      else bad_value(a, v, "auto, generic, c, cpp, python, javascript, typescript, java, go or rust");
+      lang_given = true;
+    } else if (a == "--spool-dir") {
+      o.spool_dir = std::string(value());
     } else if (a == "-l" || a == "--level") {
       const std::string_view v = value();
       const auto n = parse_uint(v);
@@ -223,13 +261,16 @@ Options parse(int argc, char** argv) {
       o.level = static_cast<hc::u8>(*n);
     } else if (a == "--window") {
       o.window_log = parse_log2(a, value(), hc::kMinWindowLog, hc::kMaxWindowLog);
+      layout_given = true;
     } else if (a == "--block") {
       o.block_log = parse_log2(a, value(), hc::kMinBlockLog, hc::kMaxBlockLog);
+      layout_given = true;
     } else if (a == "--frame") {
       const std::string_view v = value();
       const auto n = parse_size(v);
       if (!n) bad_value(a, v, "expected a size");
       o.frame_bytes = *n;
+      layout_given = true;
     } else if (a == "-T" || a == "--threads") {
       const std::string_view v = value();
       const auto n = parse_uint(v);
@@ -298,6 +339,11 @@ Options parse(int argc, char** argv) {
   if (o.mode == Mode::test && o.output) throw UsageError("-t discards its output; -o is not allowed");
   if (o.keep_partial && (!o.output || *o.output == "-")) throw UsageError("--keep-partial needs -o FILE");
   if (o.report && o.output && *o.report == *o.output) throw UsageError("--report and -o name the same file");
+  if (!o.structural && (lang_given || o.spool_dir)) throw UsageError("--lang and --spool-dir need --structural");
+  if (o.structural && decoding && (lang_given || o.spool_dir))
+    throw UsageError("--lang and --spool-dir apply to compression only");
+  if (o.structural && !decoding && (layout_given || !o.record_size))
+    throw UsageError("--window, --block, --frame and --no-content-size apply to the byte codec only");
   return o;
 }
 
@@ -308,6 +354,8 @@ std::string num(u64 v) {
   const auto [end, ec] = std::to_chars(buf, buf + sizeof buf, v);
   return std::string(buf, end);
 }
+
+u64 micros(double seconds) { return static_cast<u64>(seconds * 1e6 + 0.5); }
 
 // a * b / c without overflow for the magnitudes telemetry sees.
 u64 scale(u64 a, u64 b, u64 c) {
@@ -496,9 +544,16 @@ unsigned default_threads() { return std::max(1u, std::min(std::thread::hardware_
 // ------------------------------------------------------------------ modes ---
 
 struct Outcome {
+  Outcome() = default;
+  Outcome(int code, std::string err, std::string warn) : exit(code), error(std::move(err)), warning(std::move(warn)) {}
+
   int exit = kSuccess;
   std::string error;    // printed as "hce: error: ..."
   std::string warning;  // printed as "hce: warning: ..."
+  // For the -v summary and the derived telemetry fields.
+  u64 raw_bytes = 0, packed_bytes = 0;  // uncompressed and compressed sides
+  bool decoding = false, verified = false;
+  std::string detail;                   // codec and settings, in words
 };
 
 int decode_exit(Errc s, const Options& o, const hce::DecodeResult& r) {
@@ -535,7 +590,8 @@ std::string limit_hint(Errc s) {
 }
 
 struct Streams {
-  FdInput& in;
+  FdInput& fd_in;          // the input descriptor, for error reports
+  hce::InputStream& in;    // what the codecs read: fd_in, after any sniffed prefix
   hce::OutputStream& out;
   const FdOutput* out_fd;  // null when the output is discarded (-t)
 };
@@ -543,7 +599,7 @@ struct Streams {
 // Describes an io_error or cancellation precisely: which side, and why.
 std::string io_failure(const Streams& io, const std::string& in_name, const std::string& out_name) {
   if (SignalGuard::signal() != 0) return "interrupted by signal " + num(static_cast<u64>(SignalGuard::signal()));
-  if (io.in.sys_errno() != 0) return in_name + ": read error: " + std::strerror(io.in.sys_errno());
+  if (io.fd_in.sys_errno() != 0) return in_name + ": read error: " + std::strerror(io.fd_in.sys_errno());
   if (io.out_fd && io.out_fd->broken_pipe()) return out_name + ": output closed early (broken pipe)";
   if (io.out_fd && io.out_fd->sys_errno() != 0) return out_name + ": write error: " + std::strerror(io.out_fd->sys_errno());
   return "interrupted";
@@ -581,7 +637,13 @@ Outcome run_compress(const Options& o, const Input& in, const std::string& out_n
   t.add("stream_id", r.stream_id);
 
   switch (r.status) {
-    case Errc::ok: return {};
+    case Errc::ok: {
+      Outcome ok;
+      ok.raw_bytes = r.bytes_in;
+      ok.packed_bytes = r.bytes_out;
+      ok.detail = "byte codec, level " + num(o.level) + ", " + num(r.threads) + (r.threads == 1 ? " thread" : " threads");
+      return ok;
+    }
     case Errc::content_mismatch:
       return {kUsageOrIo,
               in.name + ": input is " + num(r.bytes_in) + (r.bytes_in > eo.content_size.value_or(0) ? "+" : "") +
@@ -635,18 +697,26 @@ Outcome run_decompress(const Options& o, const std::string& in_name, const std::
 
   const int code = decode_exit(r.status, o, r);
   const std::string what = hc::to_string(r.status);
+  Outcome done;  // success or data loss: the summary's numbers
+  done.raw_bytes = r.bytes_out;
+  done.packed_bytes = r.bytes_in;
+  done.decoding = true;
+  done.verified = r.stats.content_verified && r.stats.damage_events == 0;
+  done.detail = "byte codec, " + num(r.threads ? r.threads : 1) + (r.threads > 1 ? " threads" : " thread");
   switch (code) {
     case kSuccess:
       if (o.expect_size && r.bytes_out != *o.expect_size)
         return {kUsageOrIo, "decoded " + num(r.bytes_out) + " bytes, --expect-size says " + num(*o.expect_size), {}};
       if (r.stats.damage_events > 0)
-        return {kSuccess, {}, in_name + ": input was damaged (" + num(r.stats.damage_events) + " events) but no data was lost"};
-      return {};
+        done.warning = in_name + ": input was damaged (" + num(r.stats.damage_events) + " events) but no data was lost";
+      return done;
     case kDataLoss: {
       std::string w = in_name + ": recovered with data loss: " + num(r.stats.gaps) + " gap(s)";
       if (r.status == Errc::truncated) w += ", input truncated";
       if (r.stats.bytes_lost) w += ", " + num(r.stats.bytes_lost) + " bytes lost";
-      return {kDataLoss, {}, w + (report ? "; see --report" : "; use --report to list the ranges")};
+      done.exit = kDataLoss;
+      done.warning = w + (report ? "; see --report" : "; use --report to list the ranges");
+      return done;
     }
     case kCorrupt:
       if (o.recovery != hc::Recovery::strict) return {kCorrupt, in_name + ": no recognizable hce stream data", {}};
@@ -657,6 +727,193 @@ Outcome run_decompress(const Options& o, const std::string& in_name, const std::
       if (r.status == Errc::out_of_memory) return {kUsageOrIo, "out of memory", {}};
       return {kUsageOrIo, io_failure(io, in_name, out_name), {}};
   }
+}
+
+
+// ------------------------------------------------------- structural mode ---
+
+// The spool goes next to the output file (same file system, cleaned up with
+// it), else to the temporary directory (empty path: the archive default).
+std::string spool_path(const Options& o, const Output& out) {
+  std::filesystem::path dir;
+  if (o.spool_dir) dir = *o.spool_dir;
+  else if (out.is_file) dir = std::filesystem::path(out.name).parent_path();
+  else return {};
+  if (dir.empty()) dir = ".";
+  return (dir / (".hce-spool-" + num(static_cast<u64>(::getpid())) + ".tmp")).string();
+}
+
+st::Language resolve_language(const Options& o, const Input& in) {
+  if (o.lang) return *o.lang;
+  return in.owned ? st::language_for_path(in.name) : st::Language::generic;
+}
+
+int structural_exit(Errc s) {
+  if (s == Errc::ok) return kSuccess;
+  if (hc::is_limit(s)) return kLimit;
+  switch (s) {
+    case Errc::unsupported_version:
+    case Errc::unsupported_feature: return kUnsupported;
+    case Errc::io_error:
+    case Errc::out_of_memory:
+    case Errc::cancelled: return kUsageOrIo;
+    default: return kCorrupt;
+  }
+}
+
+void add_structural(Telemetry& t, const st::ArchiveStats& s) {
+  t.add("codec", "structural");
+  t.add("status", hc::to_string(s.status));
+  if (s.status != Errc::ok) t.add("stage", s.stage);
+  t.add("language", st::to_string(s.language));
+  t.add("tokens", s.tokens);
+  t.add("symbols", s.symbols);
+  t.add("dictionary_bytes", s.dictionary_bytes);
+  t.add("model_bytes", s.model_bytes);
+  t.add("stream_bytes", s.stream_bytes);
+  t.add("threads", s.threads);
+}
+
+std::string structural_detail(const st::ArchiveStats& s, const std::string& extra) {
+  return "structural, " + std::string(st::to_string(s.language)) + ", " + num(s.tokens) + " tokens, " + num(s.symbols) +
+         " symbols, " + num(s.threads) + (s.threads == 1 ? " thread" : " threads") + extra;
+}
+
+Outcome run_compress_structural(const Options& o, const Input& in, const Output& out, Streams io, std::stop_token stop,
+                                Telemetry& t) {
+  if (o.expect_size && S_ISREG(in.st.st_mode) && static_cast<u64>(in.st.st_size) != *o.expect_size)
+    return {kUsageOrIo, in.name + ": size is " + num(static_cast<u64>(in.st.st_size)) + " bytes, --expect-size says " + num(*o.expect_size), {}};
+  st::ArchiveOptions ao;
+  ao.level = o.level;
+  ao.threads = o.threads ? o.threads : default_threads();
+  ao.language = resolve_language(o, in);
+  ao.max_memory = o.limits.max_memory_bytes;
+  ao.stop = std::move(stop);
+  ao.spool = spool_path(o, out);
+  const st::ArchiveStats s = st::compress_stream(io.in, io.out, ao);
+
+  t.add("mode", "compress");
+  add_structural(t, s);
+  t.add("in_bytes", s.source_bytes);
+  t.add("out_bytes", s.archive_bytes);
+  t.add("ratio_x1000", scale(s.source_bytes, 1000, s.archive_bytes));
+  t.add("spool_backend", s.backend);
+  t.add("spool_us", micros(s.seconds[0]));
+  t.add("pass1_us", micros(s.seconds[1]));
+  t.add("pass2_us", micros(s.seconds[2]));
+
+  if (s.status == Errc::ok) {
+    if (o.expect_size && s.source_bytes != *o.expect_size)
+      return {kUsageOrIo, in.name + ": input is " + num(s.source_bytes) + " bytes, --expect-size says " + num(*o.expect_size), {}};
+    Outcome ok;
+    ok.raw_bytes = s.source_bytes;
+    ok.packed_bytes = s.archive_bytes;
+    ok.detail = structural_detail(s, ", level " + num(o.level) + ", spool via " + s.backend);
+    return ok;
+  }
+  const int code = structural_exit(s.status);
+  const std::string stage = s.stage;
+  if (s.status == Errc::out_of_memory) return {kUsageOrIo, "out of memory", {}};
+  if (code == kUsageOrIo && (stage == "read" || stage == "write" || s.status == Errc::cancelled))
+    return {kUsageOrIo, io_failure(io, in.name, out.name), {}};
+  if (code == kUsageOrIo) {
+    const std::string where = ao.spool.empty() ? "token spool" : "token spool " + ao.spool.string();
+    return {kUsageOrIo, where + ": " + (s.sys_error ? std::strerror(s.sys_error) : hc::to_string(s.status)), {}};
+  }
+  if (code == kLimit)
+    return {kLimit, in.name + ": too many distinct tokens for the structural codec (" + hc::to_string(s.status) +
+                        "); compress without --structural", {}};
+  return {code, "structural compression failed (" + stage + "): " + hc::to_string(s.status), {}};
+}
+
+Outcome run_decompress_structural(const Options& o, const std::string& in_name, const std::string& out_name,
+                                  Streams io, std::stop_token stop, Telemetry& t) {
+  if (o.recovery != hc::Recovery::strict || o.report)
+    return {kUsageOrIo, in_name + ": structural archives are verified as a whole; --recovery and --report apply to byte-codec streams", {}};
+  st::ArchiveOptions ao;
+  ao.threads = o.threads ? o.threads : default_threads();
+  ao.max_memory = o.limits.max_memory_bytes;
+  ao.stop = std::move(stop);
+  const st::ArchiveStats s = st::decompress_stream(io.in, io.out, ao);
+
+  t.add("mode", o.mode == Mode::test ? "test" : "decompress");
+  add_structural(t, s);
+  t.add("in_bytes", s.archive_bytes);
+  t.add("out_bytes", s.source_bytes);
+  t.add("ratio_x1000", scale(s.source_bytes, 1000, s.archive_bytes));
+  t.add("verified", u64{s.status == Errc::ok});
+  t.add("model_us", micros(s.seconds[0]));
+  t.add("tokens_us", micros(s.seconds[1]));
+
+  const int code = structural_exit(s.status);
+  if (code == kSuccess) {
+    if (o.expect_size && s.source_bytes != *o.expect_size)
+      return {kUsageOrIo, "decoded " + num(s.source_bytes) + " bytes, --expect-size says " + num(*o.expect_size), {}};
+    Outcome ok;
+    ok.raw_bytes = s.source_bytes;
+    ok.packed_bytes = s.archive_bytes;
+    ok.decoding = ok.verified = true;
+    ok.detail = structural_detail(s, "");
+    return ok;
+  }
+  const std::string what = std::string(hc::to_string(s.status)) + " (" + s.stage + ")";
+  switch (code) {
+    case kCorrupt: return {kCorrupt, in_name + ": corrupt structural archive: " + what, {}};
+    case kLimit: return {kLimit, in_name + ": resource limit exceeded: " + what + " (raise --max-memory)", {}};
+    case kUnsupported: return {kUnsupported, in_name + ": unsupported structural archive: " + what, {}};
+    default:
+      if (s.status == Errc::out_of_memory) return {kUsageOrIo, "out of memory", {}};
+      return {kUsageOrIo, io_failure(io, in_name, out_name), {}};
+  }
+}
+
+// ---------------------------------------------------------- format sniff ---
+
+// Replays the bytes read to recognize the format, then reads on.
+class PrefixedInput final : public hce::InputStream {
+ public:
+  PrefixedInput(hce::InputStream& in, hc::Bytes prefix) noexcept : in_(in), prefix_(prefix) {}
+  std::size_t read(hc::MutBytes buf) override {
+    if (buf.empty()) return 0;
+    if (pos_ < prefix_.size()) {
+      const std::size_t n = std::min(buf.size(), prefix_.size() - pos_);
+      std::memcpy(buf.data(), prefix_.data() + pos_, n);
+      pos_ += n;
+      return n;
+    }
+    return in_.read(buf);
+  }
+  Errc error() const noexcept override { return in_.error(); }
+  void interrupt() noexcept override { in_.interrupt(); }
+
+ private:
+  hce::InputStream& in_;
+  hc::Bytes prefix_;
+  std::size_t pos_ = 0;
+};
+
+std::size_t read_prefix(hce::InputStream& in, hc::MutBytes buf) {
+  std::size_t got = 0;
+  while (got < buf.size()) {
+    const std::size_t n = in.read(buf.subspan(got));
+    if (n == 0) break;
+    got += n;
+  }
+  return got;
+}
+
+// ----------------------------------------------------------------- summary ---
+
+// One readable line for -v: sizes, ratio, time and speed (MB = 10^6 bytes).
+std::string summary_line(const Outcome& r, const std::string& in_name, const std::string& out_name, u64 us) {
+  const double secs = static_cast<double>(us) / 1e6;
+  const double raw = static_cast<double>(r.raw_bytes), packed = static_cast<double>(r.packed_bytes);
+  const u64 from = r.decoding ? r.packed_bytes : r.raw_bytes, to = r.decoding ? r.raw_bytes : r.packed_bytes;
+  char buf[160];
+  std::snprintf(buf, sizeof buf, " bytes (%.2f%% of the original, %.2fx) in %.3f s, %.2f MB/s", raw > 0 ? 100.0 * packed / raw : 0.0,
+                packed > 0 ? raw / packed : 0.0, secs, secs > 0 ? raw / secs / 1e6 : 0.0);
+  return "hce: " + in_name + " -> " + out_name + ": " + num(from) + " -> " + num(to) + buf + "; " + r.detail +
+         (r.decoding && r.verified ? "; verified" : "") + "\n";
 }
 
 int run(int argc, char** argv) {
@@ -672,9 +929,11 @@ int run(int argc, char** argv) {
     return kSuccess;
   }
   if (o.version) {
-    std::printf("hce %.*s (container v3 FRAMED, neural CM codec 0x%08X, levels 0-%u, %s kernels)\n",
-                static_cast<int>(kVersion.size()), kVersion.data(), hce::kNeuralCMCodecId,
-                static_cast<unsigned>(hce::kNeuralCMMaxLevel), hce::NeuralCMCodec::simd_path());
+    std::printf("hce %.*s (container v3 FRAMED, neural CM codec 0x%08X, structural codec 0x%08X, levels 0-%u, "
+                "%s kernels, %s aio)\n",
+                static_cast<int>(kVersion.size()), kVersion.data(), hce::kNeuralCMCodecId, hce::kStructuralCMCodecId,
+                static_cast<unsigned>(hce::kNeuralCMMaxLevel), hce::NeuralCMCodec::simd_path(),
+                hce::aio::to_string(hce::aio::resolve(hce::aio::Backend::automatic)));
     return kSuccess;
   }
 
@@ -708,11 +967,25 @@ int run(int argc, char** argv) {
   FdOutput dst(out.fd, out.pollable, stop.get_token());
   hce::NullOutput discard;
   const bool testing = o.mode == Mode::test;
-  const Streams io{src, testing ? static_cast<hce::OutputStream&>(discard) : dst, testing ? nullptr : &dst};
+  // -d/-t: read the first bytes to tell the formats apart, then replay them.
+  std::array<std::byte, 4> head{};
+  const std::size_t head_len = o.mode == Mode::compress ? 0 : read_prefix(src, head);
+  PrefixedInput source(src, hc::Bytes(head.data(), head_len));
+  const bool archive = st::is_archive(hc::Bytes(head.data(), head_len));
+  const Streams io{src, source, testing ? static_cast<hce::OutputStream&>(discard) : dst, testing ? nullptr : &dst};
   Telemetry t;
-  Outcome res = o.mode == Mode::compress
-                    ? run_compress(o, in, out.name, io, stop.get_token(), t)
-                    : run_decompress(o, in.name, out.name, io, o.report ? &report : nullptr, stop.get_token(), t);
+  Outcome res;
+  if (o.mode == Mode::compress) {
+    res = o.structural ? run_compress_structural(o, in, out, io, stop.get_token(), t)
+                       : run_compress(o, in, out.name, io, stop.get_token(), t);
+  } else if (archive) {
+    res = run_decompress_structural(o, in.name, out.name, io, stop.get_token(), t);
+  } else if (o.structural) {
+    res = {src.error() != Errc::ok ? kUsageOrIo : kCorrupt,
+           src.error() != Errc::ok ? io_failure(io, in.name, out.name) : in.name + ": not a structural archive", {}};
+  } else {
+    res = run_decompress(o, in.name, out.name, io, o.report ? &report : nullptr, stop.get_token(), t);
+  }
   if (SignalGuard::signal() != 0 && res.exit == kSuccess)  // finished anyway: the output is complete
     res.warning = "signal received after the work was done";
 
@@ -733,8 +1006,14 @@ int run(int argc, char** argv) {
     if (!res.warning.empty()) std::fprintf(stderr, "hce: warning: %s\n", res.warning.c_str());
     if (!res.error.empty()) std::fprintf(stderr, "hce: error: %s\n", res.error.c_str());
   }
+  const bool finished = res.exit == kSuccess || res.exit == kDataLoss;
+  if (o.summary && finished) std::fputs(summary_line(res, in.name, out.name, us).c_str(), stderr);
   if (o.stats != StatsFormat::none) {
     t.add("elapsed_us", us);
+    if (finished && res.raw_bytes > 0) {
+      t.add("speed_bytes_per_s", scale(res.raw_bytes, 1000000, std::max<u64>(us, 1)));
+      t.add("size_pct_x100", scale(res.packed_bytes, 10000, res.raw_bytes));
+    }
     t.add("exit", static_cast<u64>(res.exit));
     std::fputs(t.render(o.stats).c_str(), stderr);
   }
