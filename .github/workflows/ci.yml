@@ -53,6 +53,15 @@ jobs:
         if: contains(matrix.preset, 'san')
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
+      - name: Describe the runner
+        run: |
+          uname -a
+          ulimit -a
+          for k in io_uring_disabled io_uring_group; do
+            [ -r /proc/sys/kernel/$k ] && echo "kernel.$k = $(cat /proc/sys/kernel/$k)"
+          done
+          true
+
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -DHCE_AIO_URING=ON
 

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -25,6 +26,13 @@ using hc::u64;
 using Vec = std::vector<std::byte>;
 
 static int g_failures = 0;
+
+// Why an open failed, next to the CHECK that reports it: CI logs need the errno.
+static void explain(const char* what, const hce::aio::OpenError& err) {
+  if (err.status != Errc::ok)
+    std::printf("  %s failed: %s, sys_error %d (%s)\n", what, hc::to_string(err.status), err.sys_error,
+                err.sys_error ? std::strerror(err.sys_error) : "-");
+}
 #define CHECK(cond)                                                   \
   do {                                                                \
     if (!(cond)) {                                                    \
@@ -167,6 +175,7 @@ static void test_stream_roundtrips(aio::Backend backend) {
       const fs::path p = g_dir / "stream.bin";
       aio::OpenError err;
       auto out = aio::AsyncFileOutput::create(p, o, &err);
+      explain("AsyncFileOutput::create", err);
       CHECK(out && err.status == Errc::ok);
       if (!out) continue;
       CHECK(std::string(out->backend()) == aio::to_string(backend));
@@ -179,6 +188,7 @@ static void test_stream_roundtrips(aio::Backend backend) {
       for (const bool direct : {false, true}) {
         o.direct = direct;
         auto in = aio::AsyncFileInput::open(p, o, &err);
+        explain("AsyncFileInput::open", err);
         CHECK(in && in->size() == size);
         if (!in) continue;
         direct_honored += in->direct();
