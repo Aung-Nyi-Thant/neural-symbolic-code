@@ -1,0 +1,81 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release (system compiler)",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "gcc-asan",
+      "inherits": "base",
+      "displayName": "GCC, AddressSanitizer + UndefinedBehaviorSanitizer",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "HCE_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "clang-asan",
+      "inherits": "base",
+      "displayName": "Clang, AddressSanitizer + UndefinedBehaviorSanitizer",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "HCE_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "gcc-tsan",
+      "inherits": "base",
+      "displayName": "GCC, ThreadSanitizer",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "HCE_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "clang-tsan",
+      "inherits": "base",
+      "displayName": "Clang, ThreadSanitizer",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "HCE_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "aarch64-qemu",
+      "inherits": "base",
+      "displayName": "AArch64 (NEON) cross build, tests under qemu-aarch64",
+      "toolchainFile": "${sourceDir}/cmake/aarch64-linux-gnu.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "gcc-asan", "configurePreset": "gcc-asan" },
+    { "name": "clang-asan", "configurePreset": "clang-asan" },
+    { "name": "gcc-tsan", "configurePreset": "gcc-tsan" },
+    { "name": "clang-tsan", "configurePreset": "clang-tsan" },
+    { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu" }
+  ],
+  "testPresets": [
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "gcc-asan", "configurePreset": "gcc-asan", "output": { "outputOnFailure": true } },
+    { "name": "clang-asan", "configurePreset": "clang-asan", "output": { "outputOnFailure": true } },
+    { "name": "gcc-tsan", "configurePreset": "gcc-tsan", "output": { "outputOnFailure": true } },
+    { "name": "clang-tsan", "configurePreset": "clang-tsan", "output": { "outputOnFailure": true } },
+    { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu", "output": { "outputOnFailure": true } }
+  ]
+}

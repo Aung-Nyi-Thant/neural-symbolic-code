@@ -1,0 +1,39 @@
+# Build trees: the CMake presets build into build/<preset>
+/build/
+/out/
+/cmake-build-*/
+
+# CMake and CTest artifacts from ad-hoc or in-source builds
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+CTestTestfile.cmake
+Testing/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Objects, libraries and coverage data
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Tool caches
+.cache/
+.ccache/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
