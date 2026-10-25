@@ -142,6 +142,23 @@ static void test_encoder_determinism_and_roundtrip() {
   CHECK(r1.frames > 3 && r1.blocks > r1.frames && r1.bytes_in == data.size() && r1.bytes_out == ref.size());
   CHECK(ref.size() * 4 < data.size());
   for (const unsigned t : {2u, 3u, 5u, 8u}) CHECK(encode(data, small_frames(t)) == ref);
+  // Profile 2 too: one stream for every thread count, decoded alike by the
+  // sequential decoder and the pipeline, whose workers fit either profile.
+  {
+    hce::EncodeOptions o2 = small_frames(1);
+    o2.prior_id = hce::kNeuralCMCodecId2;
+    const Vec ref2 = encode(data, o2);
+    CHECK(ref2 != ref && ref2.size() * 4 < data.size());
+    for (const unsigned t : {3u, 8u}) {
+      o2.threads = t;
+      CHECK(encode(data, o2) == ref2);
+    }
+    hce::DecodeOptions d2;
+    d2.limits.max_window_log = 20;
+    const Decoded s2 = decode(ref2, d2, 1);
+    CHECK(s2.r.status == Errc::ok && s2.out == data);
+    for (const unsigned t : {2u, 4u}) CHECK(equivalent(s2, decode(ref2, d2, t)));
+  }
 
   // Workers are sized for the largest stream the limits accept (level 4:
   // 149 MiB of model); a 1 MiB window cap leaves room for four of them.
@@ -224,7 +241,7 @@ static void test_concatenated_and_unsupported() {
   hce::DecodeOptions any_level;
   any_level.limits.max_level = 255;
   for (const bool with_frames : {false, true}) {
-    for (const u32 prior : {0x12345678u, hce_test::kLegacyLzCodecId, hce::kNeuralCMFamily | 2u}) {
+    for (const u32 prior : {0x12345678u, hce_test::kLegacyLzCodecId, hce::kNeuralCMFamily | (hce::kNeuralCMMaxProfile + 1u)}) {
       Vec s = encode(with_frames ? a : Vec{}, small_frames(1));
       store_le<u32>(&s[12], prior);  // prior_id
       store_le<u32>(&s[28], crc32c(Bytes(s).first(28)));

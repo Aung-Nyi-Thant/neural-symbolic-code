@@ -124,16 +124,20 @@ def compress(
     data: BytesLike,
     *,
     level: int = 2,
+    profile: int = 2,
     threads: int = 1,
     structural: bool = False,
     language: str = "generic",
 ) -> bytes:
     """Compresses ``data``; the output is identical for every ``threads`` value.
 
-    ``level`` (0..4) trades memory for ratio. ``structural=True`` selects the
-    structural codec, with ``language`` choosing its keyword table.
+    ``level`` (0..4) trades memory for ratio. ``profile`` picks the byte
+    codec's model: 2 (the default) is about 5% smaller, 1 is faster and is what
+    hce 2.0 and 2.1 wrote; both decompress everywhere. ``structural=True``
+    selects the structural codec, with ``language`` choosing its keyword table.
     """
-    return _hce.compress(data, level=level, threads=threads, structural=structural, language=language)
+    return _hce.compress(data, level=level, profile=profile, threads=threads, structural=structural,
+                         language=language)
 
 
 def decompress(
@@ -161,6 +165,7 @@ def compress_file(
     dest: PathLike,
     *,
     level: int = 2,
+    profile: int = 2,
     threads: int = 1,
     structural: bool = False,
     language: str = "auto",
@@ -171,7 +176,7 @@ def compress_file(
     available). ``language="auto"`` picks the keyword table by extension.
     """
     return Stats._from(
-        _hce.compress_file(os.fspath(source), os.fspath(dest), level=level, threads=threads,
+        _hce.compress_file(os.fspath(source), os.fspath(dest), level=level, profile=profile, threads=threads,
                            structural=structural, language=language)
     )
 

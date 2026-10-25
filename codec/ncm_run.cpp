@@ -7,6 +7,7 @@
 
 #include "codec/ncm_model.hpp"
 #include "codec/ncm_pipe.hpp"
+#include "codec/ncm_model2.hpp"
 #include "codec/ncm_simd.hpp"
 
 #include <algorithm>
@@ -14,8 +15,8 @@
 namespace hce::ncm {
 namespace {
 
-template <class K>
-inline std::size_t encode_loop(CMModel& m, hc::Bytes frame, std::size_t begin, std::size_t end,
+template <class K, class Model>
+inline std::size_t encode_loop(Model& m, hc::Bytes frame, std::size_t begin, std::size_t end,
                                hc::MutBytes out) noexcept {
   ArithEncoder enc(out.data(), out.size());
   EncodeIO io{enc};
@@ -23,7 +24,7 @@ inline std::size_t encode_loop(CMModel& m, hc::Bytes frame, std::size_t begin, s
   m.begin_block(h, begin);
   for (std::size_t i = begin; i < end && !enc.full(); ++i) {
     const int c = static_cast<int>(frame[i]);
-    m.code_byte<K>(io, c);
+    m.template code_byte<K>(io, c);
     m.byte_update(h, c);
   }
   if (!enc.full()) enc.flush();
@@ -82,14 +83,21 @@ inline std::size_t encode_piped_loop(CMModel& m, Pipe& pipe, hc::Bytes frame, st
   return enc.full() ? 0 : enc.size();
 }
 
+// Profile 2 has no pipelined loop yet: its records would not fit one Lanes.
 template <class K>
-inline hc::Errc decode_loop(CMModel& m, hc::Bytes payload, hc::u32 usize, hc::Window& w) noexcept {
+inline std::size_t encode_piped_loop(p2::CMModel2& m, Pipe&, hc::Bytes frame, std::size_t begin,
+                                     std::size_t end, hc::MutBytes out) noexcept {
+  return encode_loop<K>(m, frame, begin, end, out);
+}
+
+template <class K, class Model>
+inline hc::Errc decode_loop(Model& m, hc::Bytes payload, hc::u32 usize, hc::Window& w) noexcept {
   ArithDecoder dec(payload);
   DecodeIO io{dec};
   const WindowHistory h{&w, w.pos() - w.frame_offset()};
   m.begin_block(h, w.frame_offset());
   for (hc::u32 i = 0; i < usize; ++i) {
-    const int c = m.code_byte<K>(io, 0);
+    const int c = m.template code_byte<K>(io, 0);
     if (dec.overrun()) return hc::Errc::payload_corrupt;  // ran past the payload: corrupt
     w.put(static_cast<std::byte>(c));
     m.byte_update(h, c);
@@ -97,50 +105,55 @@ inline hc::Errc decode_loop(CMModel& m, hc::Bytes payload, hc::u32 usize, hc::Wi
   return dec.exact() ? hc::Errc::ok : hc::Errc::payload_corrupt;
 }
 
-template <class K>
-inline void replay_loop(CMModel& m, hc::Bytes frame, const BlockRange* blocks, std::size_t n) noexcept {
+template <class K, class Model>
+inline void replay_loop(Model& m, hc::Bytes frame, const BlockRange* blocks, std::size_t n) noexcept {
   ReplayIO io;
   const FrameHistory h{frame.data()};
   for (std::size_t b = 0; b < n; ++b) {
     m.begin_block(h, blocks[b].first);
     for (std::size_t i = blocks[b].first; i < blocks[b].second; ++i) {
       const int c = static_cast<int>(frame[i]);
-      m.code_byte<K>(io, c);
+      m.template code_byte<K>(io, c);
       m.byte_update(h, c);
     }
   }
 }
 
-// One Runner per policy; ATTR: the instruction set its loops are compiled for.
-#define HCE_NCM_RUNNER(NAME, K, ATTR)                                                                         \
-  ATTR __attribute__((flatten)) std::size_t NAME##_encode(CMModel& m, hc::Bytes frame, std::size_t begin,     \
+// One Runner per policy and model; ATTR: the instruction set its loops are compiled for.
+#define HCE_NCM_RUNNER(NAME, K, ATTR, MODEL)                                                                         \
+  ATTR __attribute__((flatten)) std::size_t NAME##_encode(MODEL& m, hc::Bytes frame, std::size_t begin,     \
                                                           std::size_t end, hc::MutBytes out) noexcept {       \
     return encode_loop<K>(m, frame, begin, end, out);                                                         \
   }                                                                                                           \
-  ATTR __attribute__((flatten)) std::size_t NAME##_encode_piped(CMModel& m, Pipe& pipe, hc::Bytes frame,      \
+  ATTR __attribute__((flatten)) std::size_t NAME##_encode_piped(MODEL& m, Pipe& pipe, hc::Bytes frame,        \
                                                                 std::size_t begin, std::size_t end,           \
                                                                 hc::MutBytes out) noexcept {                  \
     return encode_piped_loop<K>(m, pipe, frame, begin, end, out);                                             \
   }                                                                                                           \
-  ATTR __attribute__((flatten)) hc::Errc NAME##_decode(CMModel& m, hc::Bytes payload, hc::u32 usize,          \
+  ATTR __attribute__((flatten)) hc::Errc NAME##_decode(MODEL& m, hc::Bytes payload, hc::u32 usize,          \
                                                        hc::Window& w) noexcept {                              \
     return decode_loop<K>(m, payload, usize, w);                                                              \
   }                                                                                                           \
-  ATTR __attribute__((flatten)) void NAME##_replay(CMModel& m, hc::Bytes frame, const BlockRange* blocks,     \
+  ATTR __attribute__((flatten)) void NAME##_replay(MODEL& m, hc::Bytes frame, const BlockRange* blocks,     \
                                                    std::size_t n) noexcept {                                  \
     replay_loop<K>(m, frame, blocks, n);                                                                      \
   }                                                                                                           \
-  constexpr Runner k##NAME{NAME##_encode, NAME##_encode_piped, NAME##_decode, NAME##_replay};
+  constexpr RunnerFor<MODEL> k##NAME{NAME##_encode, NAME##_encode_piped, NAME##_decode, NAME##_replay};
 
 #define HCE_NCM_DEFAULT_TARGET
-HCE_NCM_RUNNER(scalar, simd::Scalar, HCE_NCM_DEFAULT_TARGET)
+HCE_NCM_RUNNER(scalar, simd::Scalar, HCE_NCM_DEFAULT_TARGET, CMModel)
+HCE_NCM_RUNNER(p2_scalar, simd::Scalar, HCE_NCM_DEFAULT_TARGET, p2::CMModel2)
 #if HCE_NCM_X86
-HCE_NCM_RUNNER(sse2, simd::Sse2, HCE_NCM_DEFAULT_TARGET)
-HCE_NCM_RUNNER(avx2, simd::Avx2, HCE_NCM_TARGET_AVX2)
-HCE_NCM_RUNNER(avx512, simd::Avx512, HCE_NCM_TARGET_AVX512)
+HCE_NCM_RUNNER(sse2, simd::Sse2, HCE_NCM_DEFAULT_TARGET, CMModel)
+HCE_NCM_RUNNER(avx2, simd::Avx2, HCE_NCM_TARGET_AVX2, CMModel)
+HCE_NCM_RUNNER(avx512, simd::Avx512, HCE_NCM_TARGET_AVX512, CMModel)
+HCE_NCM_RUNNER(p2_sse2, simd::Sse2, HCE_NCM_DEFAULT_TARGET, p2::CMModel2)
+HCE_NCM_RUNNER(p2_avx2, simd::Avx2, HCE_NCM_TARGET_AVX2, p2::CMModel2)
+HCE_NCM_RUNNER(p2_avx512, simd::Avx512, HCE_NCM_TARGET_AVX512, p2::CMModel2)
 #endif
 #if HCE_NCM_NEON
-HCE_NCM_RUNNER(neon, simd::Neon, HCE_NCM_DEFAULT_TARGET)
+HCE_NCM_RUNNER(neon, simd::Neon, HCE_NCM_DEFAULT_TARGET, CMModel)
+HCE_NCM_RUNNER(p2_neon, simd::Neon, HCE_NCM_DEFAULT_TARGET, p2::CMModel2)
 #endif
 #undef HCE_NCM_RUNNER
 #undef HCE_NCM_DEFAULT_TARGET
@@ -158,6 +171,20 @@ const Runner& runner_for(SimdPath path) noexcept {
     case SimdPath::neon: return kneon;
 #endif
     default: return kscalar;
+  }
+}
+
+const Runner2& runner2_for(SimdPath path) noexcept {
+  switch (path) {
+#if HCE_NCM_X86
+    case SimdPath::sse2: return kp2_sse2;
+    case SimdPath::avx2: return kp2_avx2;
+    case SimdPath::avx512: return kp2_avx512;
+#endif
+#if HCE_NCM_NEON
+    case SimdPath::neon: return kp2_neon;
+#endif
+    default: return kp2_scalar;
   }
 }
 

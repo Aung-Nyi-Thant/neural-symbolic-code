@@ -1,4 +1,4 @@
-// Tests for the neural CM codec: exact kernels (R15), golden streams (R14/R17),
+// Tests for the neural CM codec, both profiles: exact kernels (R15), golden streams (R14/R17),
 // roundtrips across levels and geometries, hostile payloads, the encoder's
 // replay path (R12), frame independence (R20), window bounds (R21) and the
 // cost of frame resets (R19).
@@ -110,9 +110,13 @@ static Vec concat(std::initializer_list<Vec> parts) {
 
 // ------------------------------------------------------------ pipelines ---
 
+// The profile the profile-specific tests run with (main() runs them for each).
+static u32 g_prior = hce::kNeuralCMCodecId;
+
 static hce::EncodeOptions opts(u8 level, u8 window_log = 16, u8 block_log = 13, u64 frame = 64 * 1024) {
   hce::EncodeOptions o;
   o.level = level;
+  o.prior_id = g_prior;
   o.window_log = window_log;
   o.block_log = block_log;
   o.frame_bytes = frame;
@@ -250,48 +254,76 @@ static void test_node_table() {
     for (int v = 0; v < 65536; ++v)
       bad += kNodeNext[static_cast<std::size_t>(y << 16 | v)] != node_next(static_cast<std::uint16_t>(v), y);
   CHECK(bad == 0);
+  unsigned bad2 = 0;
+  for (int y = 0; y < 2; ++y)
+    for (int v = 0; v < 65536; ++v)
+      bad2 += kNodeNext2[static_cast<std::size_t>(y << 16 | v)] != node_next2(static_cast<std::uint16_t>(v), y);
+  CHECK(bad2 == 0);
+  // Profile 2's rule is profile 1's up to the rate cap, and slower to settle after it.
+  for (int v = 0; v < 65536; ++v)
+    if ((v & 15) <= kNode2RateCap) CHECK(node_next2(static_cast<std::uint16_t>(v), 1) == node_next(static_cast<std::uint16_t>(v), 1));
   // Spot values of the rule itself: from zero (p = 0.5, n = 0) one step toward each bit.
   CHECK(node_next(0, 1) == (((2048 + (((4095 - 2048) * 52429 + 32768) >> 16)) ^ 0x800) << 4 | 1));
   CHECK(node_next(0, 0) == (((2048 + (((0 - 2048) * 52429 + 32768) >> 16)) ^ 0x800) << 4 | 1));
-  std::printf("node table: %u of 131072 transitions differ from the rule\n", bad);
+  std::printf("node tables: %u and %u of 131072 transitions differ from the rules\n", bad, bad2);
 }
 
 // Accepts, memory_required and bind: the BlockCodec contract.
 static void test_contract() {
   StreamParams p;
-  p.prior_id = hce::kNeuralCMCodecId;
-  for (u8 l = 0; l <= hce::kNeuralCMMaxLevel; ++l) {
-    p.level = l;
-    CHECK(Codec::accepts(p) == Errc::ok);
+  for (const u32 id : {hce::kNeuralCMCodecId, hce::kNeuralCMCodecId2}) {
+    p.prior_id = id;
+    for (u8 l = 0; l <= hce::kNeuralCMMaxLevel; ++l) {
+      p.level = l;
+      CHECK(Codec::accepts(p) == Errc::ok);
+    }
   }
+  p.prior_id = hce::kNeuralCMCodecId;
   p.level = hce::kNeuralCMMaxLevel + 1;
   CHECK(Codec::accepts(p) == Errc::unsupported_feature);
   p.level = 2;
-  for (const u32 id : {0u, hce_test::kLegacyLzCodecId, hce::kNeuralCMFamily, hce::kNeuralCMFamily | 2u,
-                       hce::kNeuralCMCodecId ^ 0x01000000u}) {
+  for (const u32 id : {0u, hce_test::kLegacyLzCodecId, hce::kNeuralCMFamily, hce::kNeuralCMFamily | 3u,
+                       hce::kNeuralCMCodecId ^ 0x01000000u, hce::kNeuralCMCodecId2 ^ 0x01000000u}) {
     p.prior_id = id;
     CHECK(Codec::accepts(p) == Errc::unsupported_feature);
   }
   p.prior_id = hce::kNeuralCMCodecId;
 
-  // Memory depends on the level only, grows with it, and is exact: binding
-  // into one byte less fails before anything is written.
-  u64 prev = 0;
-  for (u8 l = 0; l <= hce::kNeuralCMMaxLevel; ++l) {
-    p.level = l;
-    p.window_log = 16;
-    const u64 m = Codec::memory_required(p);
-    p.window_log = 27;
-    CHECK(Codec::memory_required(p) == m);
-    CHECK(m > prev);
-    prev = m;
+  // Memory depends on the profile and the level only, grows with the level,
+  // and is exact: binding into one byte less fails before anything is
+  // written. A prior_id of no profile (a decoder sizing its workers) gets
+  // the larger of the two.
+  for (const u32 id : {hce::kNeuralCMCodecId, hce::kNeuralCMCodecId2}) {
+    u64 prev = 0;
+    for (u8 l = 0; l <= hce::kNeuralCMMaxLevel; ++l) {
+      p.prior_id = id;
+      p.level = l;
+      p.window_log = 16;
+      const u64 m = Codec::memory_required(p);
+      p.window_log = 27;
+      CHECK(Codec::memory_required(p) == m);
+      CHECK(m > prev);
+      prev = m;
+      p.prior_id = 0;
+      CHECK(Codec::memory_required(p) >= m);
+    }
   }
   p.level = 0;
   p.window_log = 16;
+  for (const u32 id : {hce::kNeuralCMCodecId, hce::kNeuralCMCodecId2}) {
+    p.prior_id = id;
+    const std::size_t need = static_cast<std::size_t>(Codec::memory_required(p));
+    std::vector<std::byte> big(need);
+    Codec c;
+    CHECK(c.bind(p, MutBytes(big).first(need - 1)) == Errc::out_of_memory);
+    CHECK(c.profile() == 0);
+    CHECK(c.bind(p, MutBytes(big)) == Errc::ok);
+    CHECK(c.profile() == static_cast<int>(id & 0xFF));
+  }
+  p.prior_id = hce::kNeuralCMCodecId;
   const std::size_t need = static_cast<std::size_t>(Codec::memory_required(p));
   std::vector<std::byte> arena(need);
   Codec c;
-  CHECK(c.bind(p, MutBytes(arena).first(need - 1)) == Errc::out_of_memory);
   StreamParams bad = p;
   bad.prior_id = hce_test::kLegacyLzCodecId;
   CHECK(c.bind(bad, MutBytes{}) == Errc::unsupported_feature);  // rejected before the arena is touched
@@ -374,11 +406,18 @@ static Vec golden_input(const char* name) {
 }
 
 static void test_golden_streams() {
-  static const Golden kGolden[] = {
+  static const Golden kGolden1[] = {
       {"log", 0, 3994, 0x7083CBB7},     {"log", 2, 3990, 0x76CC6613},     {"log", 4, 3991, 0xB9D30C08},
       {"prose", 0, 6881, 0x2C7D6B41},   {"prose", 2, 6880, 0x9EE996FF},   {"prose", 4, 6881, 0x61B9A566},
       {"binary", 0, 29072, 0xAD242307}, {"binary", 2, 29087, 0x894C7EE8}, {"binary", 4, 29075, 0xBAED65DA},
   };
+  static const Golden kGolden2[] = {
+      {"log", 0, 3836, 0xE6511F9B},     {"log", 2, 3828, 0xD8514137},     {"log", 4, 3828, 0xF9F8AD0E},
+      {"prose", 0, 6863, 0x05AB8DFD},   {"prose", 2, 6863, 0x08E06CF5},   {"prose", 4, 6865, 0xD0A0AE76},
+      {"binary", 0, 28849, 0x35DF115D}, {"binary", 2, 28841, 0x18CABB26}, {"binary", 4, 28826, 0x1A27D0B2},
+  };
+  const auto& kGolden = g_prior == hce::kNeuralCMCodecId2 ? kGolden2 : kGolden1;
+  static_assert(std::size(kGolden1) == std::size(kGolden2));
   unsigned mismatches = 0;
   for (const Golden& g : kGolden) {
     const Vec data = golden_input(g.name);
@@ -394,8 +433,8 @@ static void test_golden_streams() {
   }
   CHECK(mismatches == 0);
   if (!mismatches)
-    std::printf("golden streams: %zu/%zu identical (%s kernels)\n", std::size(kGolden), std::size(kGolden),
-                Codec::simd_path());
+    std::printf("golden streams: %zu/%zu identical (profile %u, %s kernels)\n", std::size(kGolden),
+                std::size(kGolden), static_cast<unsigned>(g_prior & 0xFF), Codec::simd_path());
 }
 
 // Hostile CM payloads with valid CRCs reach the model itself: every outcome
@@ -501,7 +540,7 @@ static void test_replay() {
 
   // Directly: the counters show the replays and the per-frame cap.
   StreamParams p;
-  p.prior_id = hce::kNeuralCMCodecId;
+  p.prior_id = g_prior;
   p.level = 0;
   p.window_log = 16;
   p.block_log = 12;
@@ -522,7 +561,7 @@ static void test_replay() {
 // helper is stopped early, then the frame replays) and at every level.
 static void test_pipeline() {
   StreamParams p;
-  p.prior_id = hce::kNeuralCMCodecId;
+  p.prior_id = g_prior;
   p.window_log = 16;
   p.block_log = 12;
   const Vec frame = concat({log_lines(9000, 100), random_bytes(4096 * 2, 101), prose(12000, 102),
@@ -644,23 +683,74 @@ static void test_reset_cost() {
   CHECK(t_tiny < 4 * t_one + 0.5);
 }
 
+// Profile 2 is the higher-ratio profile: on logs and structured data it must
+// beat profile 1, and decode with the same pipelines, any thread count. On
+// i.i.d. words (prose() draws them uniformly) its faster counters cost a
+// little: there it may lose up to 1%.
+static void test_profile2_ratio() {
+  std::string json = "[\n";
+  std::mt19937 rng(120);
+  for (int i = 0; i < 1500; ++i)
+    json += "  {\"id\": " + std::to_string(rng() % 100000) + ", \"name\": \"item" + std::to_string(rng() % 500) +
+            "\", \"tags\": [\"a\", \"b" + std::to_string(rng() % 7) + "\"], \"ok\": " + (rng() % 2 ? "true" : "false") +
+            "},\n";
+  json += "]\n";
+  std::string xml = "<items>\n";
+  for (int i = 0; i < 1200; ++i)
+    xml += "  <item id=\"" + std::to_string(rng() % 100000) + "\" kind=\"k" + std::to_string(rng() % 9) +
+           "\"><name>n" + std::to_string(rng() % 300) + "</name><v/></item>\n";
+  xml += "</items>\n";
+  const auto bytes = [](const std::string& t) {
+    Vec v(t.size());
+    std::memcpy(v.data(), t.data(), t.size());
+    return v;
+  };
+  const Vec logs = log_lines(200000, 121), words = prose(200000, 122), js = bytes(json), xm = bytes(xml);
+  for (const Vec* const dp : {&logs, &words, &js, &xm}) {
+    const Vec& d = *dp;
+    Vec s1, s2;
+    g_prior = hce::kNeuralCMCodecId;
+    CHECK(roundtrips(d, opts(2, 20, 16, u64{1} << 20), &s1));
+    g_prior = hce::kNeuralCMCodecId2;
+    CHECK(roundtrips(d, opts(2, 20, 16, u64{1} << 20), &s2));
+    CHECK(dp == &words ? s2.size() * 100 <= s1.size() * 101 : s2.size() < s1.size());
+    std::printf("profile 2 ratio: %zu -> %zu B (profile 1) -> %zu B (profile 2)\n", d.size(), s1.size(), s2.size());
+    hce::EncodeOptions o = opts(2, 20, 14, 64 * 1024);
+    o.threads = 3;
+    const Vec m = encode(d, o);
+    o.threads = 1;
+    CHECK(encode(d, o) == m);
+    const Decoded dd = decode(m, {}, 3);
+    CHECK(dd.r.status == Errc::ok && dd.out == d);
+  }
+  g_prior = hce::kNeuralCMCodecId;
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  static constexpr struct {
+  struct Test {
     const char* name;
     void (*fn)();
-  } kTests[] = {
-      {"kernel_parity", test_kernel_parity}, {"node_table", test_node_table}, {"contract", test_contract},
-      {"roundtrip_matrix", test_roundtrip_matrix}, {"simd_paths_agree", test_simd_paths_agree},
-      {"golden_streams", test_golden_streams}, {"hostile_payloads", test_hostile_payloads},
-      {"replay", test_replay}, {"pipeline", test_pipeline}, {"late_join", test_late_join},
-      {"window_bound", test_window_bound}, {"reset_cost", test_reset_cost},
+    bool per_profile;  // runs once for each codec profile
+  };
+  static constexpr Test kTests[] = {
+      {"kernel_parity", test_kernel_parity, false}, {"node_table", test_node_table, false},
+      {"contract", test_contract, false}, {"roundtrip_matrix", test_roundtrip_matrix, true},
+      {"simd_paths_agree", test_simd_paths_agree, true}, {"golden_streams", test_golden_streams, true},
+      {"hostile_payloads", test_hostile_payloads, true}, {"replay", test_replay, true},
+      {"pipeline", test_pipeline, true}, {"late_join", test_late_join, true},
+      {"window_bound", test_window_bound, true}, {"reset_cost", test_reset_cost, true},
+      {"profile2_ratio", test_profile2_ratio, false},
   };
   for (const auto& t : kTests) {
-    const auto t0 = std::chrono::steady_clock::now();
-    t.fn();
-    std::printf("  [%s: %.1fs]\n", t.name,
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    for (const u32 id : {hce::kNeuralCMCodecId, hce::kNeuralCMCodecId2}) {
+      if (!t.per_profile && id != hce::kNeuralCMCodecId) continue;
+      g_prior = id;
+      const auto t0 = std::chrono::steady_clock::now();
+      t.fn();
+      std::printf("  [%s%s: %.1fs]\n", t.name, !t.per_profile ? "" : id == hce::kNeuralCMCodecId ? ", profile 1" : ", profile 2",
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
   }
   if (g_failures) {
     std::printf("%d check(s) failed\n", g_failures);

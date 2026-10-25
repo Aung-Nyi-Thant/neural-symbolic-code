@@ -70,6 +70,33 @@ def test_info_facts():
     assert hce.info()["version"] == hce.__version__
 
 
+def test_codec_profiles():
+    facts = hce.info()
+    assert facts["max_profile"] == 2
+    assert facts["neural_cm_codec_ids"] == (0x4E434D01, 0x4E434D02)
+    data = b"2026-10-25 host=a path=/api/v1/items status=200\n" * 400 + bytes(range(256))
+    p1 = hce.compress(data, profile=1)
+    p2 = hce.compress(data, profile=2)
+    assert p1 != p2
+    assert hce.compress(data) == p2  # profile 2 is the default
+    for packed in (p1, p2):
+        assert hce.decompress(packed) == data
+        assert hce.verify(packed).verified
+    for bad in (0, 3, -1):
+        with pytest.raises(ValueError):
+            hce.compress(data, profile=bad)
+
+
+def test_compress_file_profile(tmp_path):
+    src = tmp_path / "a.log"
+    src.write_bytes(b"key=value; other=thing\n" * 300)
+    for profile in (1, 2):
+        dest = tmp_path / f"a{profile}.hce"
+        hce.compress_file(src, dest, profile=profile)
+        assert dest.read_bytes() == hce.compress(src.read_bytes(), profile=profile)
+        assert hce.decompress(dest.read_bytes()) == src.read_bytes()
+
+
 def test_languages():
     assert hce.LANGUAGES[0] == "generic"
     assert set(hce.LANGUAGES) >= {"c", "cpp", "python", "javascript", "typescript", "java", "go", "rust"}

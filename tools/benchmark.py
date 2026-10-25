@@ -4,7 +4,7 @@
 Compresses the same inputs with
 
   structural  hce --structural    the two-pass structural codec
-  ncm         hce                 the v2.1.0 byte-level neural CM codec
+  ncm         hce                 the byte-level neural CM codec (its default profile)
   zstd        zstd -19
   xz          xz -9e
 
@@ -186,7 +186,7 @@ def make_codecs(hce: Path, level: int, threads: int) -> Dict[str, Codec]:
             lambda p, o: [h, "-d", "-T", t, "-f", "-i", str(p), "-o", str(o)],
             version=hce_version),
         "ncm": Codec(
-            "ncm", f"hce -l {level} (v2.1.0 byte codec)", ".hce",
+            "ncm", f"hce -l {level} (byte codec, default profile)", ".hce",
             lambda s, o: [h, "-l", str(level), "-T", t, "-f", "-i", str(s), "-o", str(o)],
             lambda p, o: [h, "-d", "-T", t, "-f", "-i", str(p), "-o", str(o)],
             version=hce_version),

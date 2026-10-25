@@ -1,5 +1,5 @@
 {
-  "hce_version": "2.1.0",
+  "hce_version": "2.2.0",
   "vectors": [
     {
       "name": "framed-source-l2",
@@ -11,7 +11,8 @@
         "sha256": "ccf78f39417cecaf500b9effa4bff4183b5a161213324f9a62ff080c4ef841d5"
       },
       "options": {
-        "level": 2
+        "level": 2,
+        "profile": 1
       },
       "compressed_size": 3921,
       "compressed_sha256": "3c4aaa9ae57e9c57afba8ce6a02f5a0b84042c41f1bed440471e124dc0c3892d",
@@ -27,7 +28,8 @@
         "sha256": "e2a8192275054862ea74b2ae762b7c247d0bbc57724237fe84a305b8e4c01366"
       },
       "options": {
-        "level": 0
+        "level": 0,
+        "profile": 1
       },
       "compressed_size": 3611,
       "compressed_sha256": "413971a4e168be3d647b72509ebda66c849ea1fc13e1bf66c34542980f59ff4f",
@@ -43,7 +45,8 @@
         "sha256": "0692ea0105344b8062792478fe1117b8934b36efcbc5ab83c489fed2d3ed30a9"
       },
       "options": {
-        "level": 4
+        "level": 4,
+        "profile": 1
       },
       "compressed_size": 2088,
       "compressed_sha256": "acdacd95aa3defdd8c8473d04389124c1a2152604414a9ee5dab2fb2867dd990",
@@ -59,7 +62,8 @@
         "sha256": "bd24b13890b1abcb0550ac0e031e968747807134603ef28864c6e9c7b75d347b"
       },
       "options": {
-        "level": 1
+        "level": 1,
+        "profile": 1
       },
       "compressed_size": 8316,
       "compressed_sha256": "51ce8ca5146057ba04ebca40b3493706749bca8764a57c73fc3738ff2996101c",
@@ -75,10 +79,79 @@
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
       "options": {
-        "level": 2
+        "level": 2,
+        "profile": 1
       },
       "compressed_size": 64,
       "compressed_sha256": "30c92201d6c78c33de398e576d911002e8d4fc51604b48c5522cbf2a4faea85b",
+      "format": "framed"
+    },
+    {
+      "name": "framed-p2-source-l2",
+      "file": "framed-p2-source-l2.hce",
+      "input": {
+        "generator": "source",
+        "seed": 11,
+        "size": 32768,
+        "sha256": "9ffbaa9f056655b681088437c6b604395807985eba4ec18b7701532a4f849fb6"
+      },
+      "options": {
+        "level": 2,
+        "profile": 2
+      },
+      "compressed_size": 3789,
+      "compressed_sha256": "e3d461327cda426e204c7a6a3fc935d8a1e4d20524a21be2724846bf509e5989",
+      "format": "framed"
+    },
+    {
+      "name": "framed-p2-log-l0",
+      "file": "framed-p2-log-l0.hce",
+      "input": {
+        "generator": "log",
+        "seed": 12,
+        "size": 32768,
+        "sha256": "a3ad7236adef655b1f775ac9650235c679211075d859110371df52f6db92a7de"
+      },
+      "options": {
+        "level": 0,
+        "profile": 2
+      },
+      "compressed_size": 3523,
+      "compressed_sha256": "1e8fc65b6de665ef7883a86595110494113effb0cbaebe18bcb2a6483018eec8",
+      "format": "framed"
+    },
+    {
+      "name": "framed-p2-text-l4",
+      "file": "framed-p2-text-l4.hce",
+      "input": {
+        "generator": "text",
+        "seed": 13,
+        "size": 16384,
+        "sha256": "f409cdfa94c12727500cc237c0026dabc0b7acd61fba8d148f3e2f590efde031"
+      },
+      "options": {
+        "level": 4,
+        "profile": 2
+      },
+      "compressed_size": 2090,
+      "compressed_sha256": "4e9759c5419f2e9ca4c37f90756a3bca58778fb43783a14b042ef2da09269faf",
+      "format": "framed"
+    },
+    {
+      "name": "framed-p2-binary-l1",
+      "file": "framed-p2-binary-l1.hce",
+      "input": {
+        "generator": "binary",
+        "seed": 14,
+        "size": 8192,
+        "sha256": "3cd74abd80061921fc2511485a4bcb9518e654d13fdf5152e47f272080942a5a"
+      },
+      "options": {
+        "level": 1,
+        "profile": 2
+      },
+      "compressed_size": 8316,
+      "compressed_sha256": "57292e6a815d69a267b99f540a3ea6e7be054d06aee4ce5bdf2b81048a5df3d2",
       "format": "framed"
     },
     {

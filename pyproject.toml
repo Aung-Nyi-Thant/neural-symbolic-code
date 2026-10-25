@@ -13,7 +13,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "hce"
-version = "2.1.0"  # must match project(VERSION) in CMakeLists.txt: tests/python/test_api.py checks it
+version = "2.2.0"  # must match project(VERSION) in CMakeLists.txt: tests/python/test_api.py checks it
 description = "Lossless neuro-symbolic hybrid compression: neural context mixing in a hardened, parallel container"
 readme = "README.md"
 requires-python = ">=3.10"

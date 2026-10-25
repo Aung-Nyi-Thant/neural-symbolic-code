@@ -34,11 +34,15 @@ MANIFEST = HERE / "manifest.json"
 
 # name: (generator, seed, size, compress options)
 VECTORS = {
-    "framed-source-l2": ("source", 1, 32768, {"level": 2}),
-    "framed-log-l0": ("log", 2, 32768, {"level": 0}),
-    "framed-text-l4": ("text", 3, 16384, {"level": 4}),
-    "framed-binary-l1": ("binary", 4, 8192, {"level": 1}),
-    "framed-empty": ("empty", 0, 0, {"level": 2}),
+    "framed-source-l2": ("source", 1, 32768, {"level": 2, "profile": 1}),
+    "framed-log-l0": ("log", 2, 32768, {"level": 0, "profile": 1}),
+    "framed-text-l4": ("text", 3, 16384, {"level": 4, "profile": 1}),
+    "framed-binary-l1": ("binary", 4, 8192, {"level": 1, "profile": 1}),
+    "framed-empty": ("empty", 0, 0, {"level": 2, "profile": 1}),
+    "framed-p2-source-l2": ("source", 11, 32768, {"level": 2, "profile": 2}),
+    "framed-p2-log-l0": ("log", 12, 32768, {"level": 0, "profile": 2}),
+    "framed-p2-text-l4": ("text", 13, 16384, {"level": 4, "profile": 2}),
+    "framed-p2-binary-l1": ("binary", 14, 8192, {"level": 1, "profile": 2}),
     "structural-source-python": ("source", 5, 32768, {"level": 2, "structural": True, "language": "python"}),
     "structural-source-generic-l1": ("source", 6, 16384, {"level": 1, "structural": True, "language": "generic"}),
     "structural-log-generic": ("log", 7, 16384, {"level": 2, "structural": True, "language": "generic"}),

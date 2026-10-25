@@ -1,7 +1,7 @@
 // neural_cm_codec.cpp - the neural-symbolic context-mixing codec (see the header).
 //
-// The model and its bit loop live in ncm_model.hpp, the block loops for each
-// SIMD path in ncm_run.cpp; this file binds the model to its arena and holds
+// The models and their bit loops live in ncm_model.hpp (profile 1) and
+// ncm_model2.hpp (profile 2), the block loops for each SIMD path in ncm_run.cpp; this file binds the model to its arena and holds
 // the encoder-side policy.
 //
 // R12: STORED blocks reach the history (contexts are re-derived from it at
@@ -13,6 +13,7 @@
 #include "codec/ncm_kernels.hpp"
 #include "codec/ncm_model.hpp"
 #include "codec/ncm_pipe.hpp"
+#include "codec/ncm_model2.hpp"
 #include "codec/ncm_run.hpp"
 #include "encoder/parallel.hpp"
 
@@ -57,6 +58,7 @@ NeuralCMCodec::NeuralCMCodec(const hc::StreamParams& p) {
 
 NeuralCMCodec::NeuralCMCodec(NeuralCMCodec&& other) noexcept
     : m_(std::exchange(other.m_, nullptr)),
+      m2_(std::exchange(other.m2_, nullptr)),
       owned_(std::move(other.owned_)),
       pipe_(std::move(other.pipe_)),
       pipeline_(other.pipeline_),
@@ -69,6 +71,7 @@ NeuralCMCodec::NeuralCMCodec(NeuralCMCodec&& other) noexcept
 NeuralCMCodec& NeuralCMCodec::operator=(NeuralCMCodec&& other) noexcept {
   if (this != &other) {
     m_ = std::exchange(other.m_, nullptr);
+    m2_ = std::exchange(other.m2_, nullptr);
     owned_ = std::move(other.owned_);
     pipe_ = std::move(other.pipe_);
     pipeline_ = other.pipeline_;
@@ -81,33 +84,50 @@ NeuralCMCodec& NeuralCMCodec::operator=(NeuralCMCodec&& other) noexcept {
   return *this;
 }
 
-NeuralCMCodec::~NeuralCMCodec() = default;  // the model is trivially destructible
+NeuralCMCodec::~NeuralCMCodec() = default;  // the models are trivially destructible
+
+static int profile_of(const hc::StreamParams& p) noexcept {
+  if ((p.prior_id & 0xFFFFFF00u) != kNeuralCMFamily) return 0;
+  const hc::u32 profile = p.prior_id & 0xFFu;
+  return profile == kNeuralCMProfile || profile == kNeuralCMProfile2 ? static_cast<int>(profile) : 0;
+}
 
 hc::Errc NeuralCMCodec::accepts(const hc::StreamParams& p) noexcept {
-  if ((p.prior_id & 0xFFFFFF00u) != kNeuralCMFamily || (p.prior_id & 0xFFu) != kNeuralCMProfile)
-    return hc::Errc::unsupported_feature;
+  if (profile_of(p) == 0) return hc::Errc::unsupported_feature;
   if (p.level > kNeuralCMMaxLevel) return hc::Errc::unsupported_feature;
   return hc::Errc::ok;
 }
 
-// Depends on the level only: the decoder pipeline sizes workers before it has
-// seen a stream header. Levels above the maximum are rejected by accepts().
+// Depends on the profile and the level only: the decoder pipeline sizes
+// workers before it has seen a stream header, with a prior_id of no profile,
+// and so for either. Levels above the maximum are rejected by accepts().
 hc::u64 NeuralCMCodec::memory_required(const hc::StreamParams& p) noexcept {
-  return ncm::CMModel::layout(ncm::spec_for(p.level)).total + 63;  // + slack to align the arena to 64 bytes
+  const hc::u64 m1 = ncm::CMModel::layout(ncm::spec_for(p.level)).total;
+  const hc::u64 m2 = ncm::p2::CMModel2::layout(ncm::p2::spec2_for(p.level)).total;
+  const int profile = profile_of(p);
+  return (profile == 1 ? m1 : profile == 2 ? m2 : std::max(m1, m2)) + 63;  // + slack to align the arena to 64 bytes
 }
 
 hc::Errc NeuralCMCodec::bind(const hc::StreamParams& p, hc::MutBytes arena) noexcept {
   m_ = nullptr;
+  m2_ = nullptr;
   if (const hc::Errc e = accepts(p); e != hc::Errc::ok) return e;
-  const ncm::LevelSpec& s = ncm::spec_for(p.level);
   if (arena.size() < memory_required(p)) return hc::Errc::out_of_memory;
   const auto addr = reinterpret_cast<std::uintptr_t>(arena.data());
   std::byte* const base = arena.data() + ((64 - (addr & 63)) & 63);
   const ncm::Kernels* forced = g_kernels.load(std::memory_order_relaxed);
-  ncm::CMModel* const m = new (base) ncm::CMModel{};
-  m->carve(base, s, p.window_size(), forced ? *forced : ncm::active_kernels());
-  m_ = m;
-  m_->reset(true);
+  const ncm::Kernels& kern = forced ? *forced : ncm::active_kernels();
+  if (profile_of(p) == kNeuralCMProfile2) {
+    ncm::p2::CMModel2* const m = new (base) ncm::p2::CMModel2{};
+    m->carve(base, ncm::p2::spec2_for(p.level), p.window_size(), kern);
+    m2_ = m;
+    m2_->reset(true);
+  } else {
+    ncm::CMModel* const m = new (base) ncm::CMModel{};
+    m->carve(base, ncm::spec_for(p.level), p.window_size(), kern);
+    m_ = m;
+    m_->reset(true);
+  }
   return hc::Errc::ok;
 }
 
@@ -115,9 +135,15 @@ hc::Errc NeuralCMCodec::bind(const hc::StreamParams& p, hc::MutBytes arena) noex
 // (STORED data, damaged frames, headers alone) cost nothing.
 void NeuralCMCodec::reset_frame() noexcept {
   if (m_) m_->stale = true;
+  if (m2_) m2_->stale = true;
 }
 
 hc::Errc NeuralCMCodec::decode_block(hc::Bytes payload, hc::u32 usize, hc::Window& w) noexcept {
+  if (m2_) {
+    ncm::p2::CMModel2& m = *m2_;
+    if (m.stale) m.reset(false);
+    return ncm::runner2_for(m.k->path).decode(m, payload, usize, w);
+  }
   if (!m_) return hc::Errc::payload_corrupt;
   ncm::CMModel& m = *m_;
   if (m.stale) m.reset(false);
@@ -129,7 +155,9 @@ void NeuralCMCodec::reset_frame(hc::Bytes frame) noexcept {
   cm_blocks_.clear();
   replays_ = 0;
   store_rest_ = false;
-  if (m_) m_->reset(false);  // now: the pre-check reads the match table
+  // Now: the pre-check reads the match table.
+  if (m_) m_->reset(false);
+  if (m2_) m2_->reset(false);
 }
 
 // Encoder-side guess, never seen by the decoder: is this block hopeless for
@@ -173,13 +201,16 @@ static bool looks_incompressible(hc::Bytes frame, std::size_t begin, std::size_t
 
 std::size_t NeuralCMCodec::encode_block(std::size_t begin, std::size_t end, hc::MutBytes out) noexcept {
   const std::size_t n = end - begin;
-  if (!m_ || store_rest_ || n < kMinCmBlock || out.size() < n) {
+  if ((!m_ && !m2_) || store_rest_ || n < kMinCmBlock || out.size() < n) {
     ++counters_.stored_blocks;
     return 0;
   }
-  ncm::CMModel& m = *m_;
+  // Both profiles index their first match table alike.
+  const u32* const match_tab = m_ ? m_->match_tab : m2_->match_tab;
+  const int match_shift = m_ ? m_->match_shift : m2_->match_shift;
+  const u64 window = m_ ? m_->window : m2_->window;
   if (!g_force_cm.load(std::memory_order_relaxed) &&
-      looks_incompressible(frame_, begin, end, m.match_tab, m.match_shift, m.window)) {
+      looks_incompressible(frame_, begin, end, match_tab, match_shift, window)) {
     ++counters_.stored_blocks;
     return 0;
   }
@@ -194,13 +225,18 @@ std::size_t NeuralCMCodec::encode_block(std::size_t begin, std::size_t end, hc::
   }
 
   // A CM payload must be strictly smaller than its content.
-  const ncm::Runner& run = ncm::runner_for(m.k->path);
-  if (pipeline_ && !pipe_) {
-    pipe_ = ncm::Pipe::create();
-    if (!pipe_) pipeline_ = false;  // no helper: one thread, the same bits
+  std::size_t size;
+  if (m_) {
+    const ncm::Runner& run = ncm::runner_for(m_->k->path);
+    if (pipeline_ && !pipe_) {
+      pipe_ = ncm::Pipe::create();
+      if (!pipe_) pipeline_ = false;  // no helper: one thread, the same bits
+    }
+    size = pipe_ && pipeline_ ? run.encode_piped(*m_, *pipe_, frame_, begin, end, out.first(n - 1))
+                              : run.encode(*m_, frame_, begin, end, out.first(n - 1));
+  } else {  // profile 2 is not pipelined yet
+    size = ncm::runner2_for(m2_->k->path).encode(*m2_, frame_, begin, end, out.first(n - 1));
   }
-  const std::size_t size = pipe_ && pipeline_ ? run.encode_piped(m, *pipe_, frame_, begin, end, out.first(n - 1))
-                                              : run.encode(m, frame_, begin, end, out.first(n - 1));
   if (size == 0) {  // expands: store it, and rebuild the models without it (R12)
     replay();
     ++counters_.replays;
@@ -216,9 +252,13 @@ std::size_t NeuralCMCodec::encode_block(std::size_t begin, std::size_t end, hc::
 // Rebuilds the models exactly as the decoder will hold them: reset, then the
 // frame's CM blocks again, updating without coding.
 void NeuralCMCodec::replay() noexcept {
-  ncm::CMModel& m = *m_;
-  m.reset(false);
-  ncm::runner_for(m.k->path).replay(m, frame_, cm_blocks_.data(), cm_blocks_.size());
+  if (m_) {
+    m_->reset(false);
+    ncm::runner_for(m_->k->path).replay(*m_, frame_, cm_blocks_.data(), cm_blocks_.size());
+  } else {
+    m2_->reset(false);
+    ncm::runner2_for(m2_->k->path).replay(*m2_, frame_, cm_blocks_.data(), cm_blocks_.size());
+  }
 }
 
 const char* NeuralCMCodec::simd_path() noexcept {
