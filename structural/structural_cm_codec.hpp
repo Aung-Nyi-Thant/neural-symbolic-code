@@ -91,7 +91,7 @@ class StructuralCMCodec {
   void replay() noexcept;
 
   Model* m_ = nullptr;  // placement-constructed inside the arena
-  std::unique_ptr<std::byte[]> owned_;
+  hc::ArenaPtr owned_;
   const structural::GlobalModel* global_ = nullptr;
   hc::Bytes frame_;
   std::vector<std::pair<std::size_t, std::size_t>> cm_blocks_;

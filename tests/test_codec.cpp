@@ -193,8 +193,8 @@ static void test_kernel_parity() {
   const Kernels& ref = kernels_for(SimdPath::scalar);
   std::mt19937 rng(11);
   unsigned paths = 0;
-  for (const SimdPath p : {SimdPath::sse2, SimdPath::avx2, SimdPath::neon}) {
-    if (!simd_available(p)) continue;
+  for (const SimdPath p : kAllPaths) {
+    if (p == SimdPath::scalar || !simd_available(p)) continue;
     ++paths;
     const Kernels& k = kernels_for(p);
     CHECK(k.path == p);
@@ -219,7 +219,18 @@ static void test_kernel_parity() {
       k.mix(x, pb, ob);
       ref.train(x, pa, e);
       k.train(x, pb, e);
-      const bool same = std::equal(oa, oa + kSets, ob) && std::memcmp(wa, wb, sizeof wa) == 0;
+      // Layer 2: four weights over layer-1 outputs (|t| <= 2047), one error.
+      alignas(8) std::int16_t t[4], fa[4], fb[4];
+      for (int i = 0; i < 4; ++i) {
+        t[i] = x[i];
+        fa[i] = fb[i] = wa[0][i];
+      }
+      const std::int32_t e2 = e[1];
+      const bool dot_same = ref.dot4(t, fa) == k.dot4(t, fb);
+      ref.train4(t, fa, e2);
+      k.train4(t, fb, e2);
+      const bool same = std::equal(oa, oa + kSets, ob) && std::memcmp(wa, wb, sizeof wa) == 0 && dot_same &&
+                        std::memcmp(fa, fb, sizeof fa) == 0;
       CHECK(same);
       if (!same) {
         std::printf("  %s diverges from scalar at iteration %d\n", k.name, iter);
@@ -229,6 +240,20 @@ static void test_kernel_parity() {
   }
   std::printf("kernel parity: %u SIMD path(s) bit-exact with scalar (active: %s)\n", paths,
               active_kernels().name);
+}
+
+// The counter transition table is the update rule, for every state and bit.
+static void test_node_table() {
+  using namespace hce::ncm;
+  unsigned bad = 0;
+  for (int y = 0; y < 2; ++y)
+    for (int v = 0; v < 65536; ++v)
+      bad += kNodeNext[static_cast<std::size_t>(y << 16 | v)] != node_next(static_cast<std::uint16_t>(v), y);
+  CHECK(bad == 0);
+  // Spot values of the rule itself: from zero (p = 0.5, n = 0) one step toward each bit.
+  CHECK(node_next(0, 1) == (((2048 + (((4095 - 2048) * 52429 + 32768) >> 16)) ^ 0x800) << 4 | 1));
+  CHECK(node_next(0, 0) == (((2048 + (((0 - 2048) * 52429 + 32768) >> 16)) ^ 0x800) << 4 | 1));
+  std::printf("node table: %u of 131072 transitions differ from the rule\n", bad);
 }
 
 // Accepts, memory_required and bind: the BlockCodec contract.
@@ -315,13 +340,13 @@ static void test_simd_paths_agree() {
   const Vec data = concat({log_lines(40000, 21), prose(30000, 22)});
   Vec ref;
   unsigned paths = 0;
-  for (const char* name : {"scalar", "sse2", "avx2", "neon"}) {
+  for (const char* name : {"scalar", "sse2", "avx2", "avx512", "neon"}) {
     if (!Codec::test_select_simd(name)) continue;
     ++paths;
     const Vec s = encode(data, opts(1));
     if (ref.empty()) ref = s;
     CHECK(s == ref);
-    for (const char* other : {"scalar", "sse2", "avx2", "neon"}) {
+    for (const char* other : {"scalar", "sse2", "avx2", "avx512", "neon"}) {
       if (!Codec::test_select_simd(other)) continue;
       const Decoded d = decode(s);
       CHECK(d.r.status == Errc::ok && d.out == data);
@@ -574,7 +599,7 @@ int main() {
     const char* name;
     void (*fn)();
   } kTests[] = {
-      {"kernel_parity", test_kernel_parity}, {"contract", test_contract},
+      {"kernel_parity", test_kernel_parity}, {"node_table", test_node_table}, {"contract", test_contract},
       {"roundtrip_matrix", test_roundtrip_matrix}, {"simd_paths_agree", test_simd_paths_agree},
       {"golden_streams", test_golden_streams}, {"hostile_payloads", test_hostile_payloads},
       {"replay", test_replay}, {"late_join", test_late_join},

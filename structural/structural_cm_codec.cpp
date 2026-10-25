@@ -88,8 +88,8 @@ constexpr u64 hash(u64 v, u64 salt) noexcept {
   return v ^ (v >> 31);
 }
 
-// Counter: a 12-bit probability and a 4-bit count; zeroed memory is p = 0.5, n = 0.
-constexpr int node_p(u16 n) noexcept { return ((n >> 4) ^ 0x800); }
+// Counters: a 12-bit probability and a 4-bit count; zeroed memory is p = 0.5,
+// n = 0. ncm::node_next() is the update rule, applied through ncm::kNodeNext.
 
 // Units (64-byte lines) of a table written since the last reset (R19).
 struct Dirty {
@@ -252,8 +252,7 @@ struct StructuralCMCodec::Model {
 
   // Per-decision state.
   std::size_t idx[kCtx]{};
-  int np[kCtx]{};
-  int nn[kCtx]{};
+  u16 nv[kCtx]{};  // the counters' states, read once per bit
   alignas(32) i16 x[ncm::kLanes]{};
   i16* w1[ncm::kSets]{};
   i32 dots[ncm::kSets]{};
@@ -410,10 +409,8 @@ struct StructuralCMCodec::Model {
       hv = (hv ^ (hv >> 29)) * 0xBF58476D1CE4E5B9ull;
       hv ^= hv >> 32;
       idx[i] = (static_cast<std::size_t>(i) << spec.ctx_bits) | (static_cast<u32>(hv) & ctx_mask);
-      const u16 v = ctr[idx[i]];
-      np[i] = node_p(v);
-      nn[i] = v & 15;
-      x[i] = static_cast<i16>(ncm::stretch12(np[i]));
+      nv[i] = ctr[idx[i]];
+      x[i] = static_cast<i16>(ncm::node_stretch(nv[i]));
     }
     x[kCtx] = kBias;
     w1[0] = wa + node * ncm::kLanes;
@@ -429,10 +426,9 @@ struct StructuralCMCodec::Model {
   }
 
   void update(int y) noexcept {
-    const int ty = (y << 12) - y;
+    const u16* const next = ncm::kNodeNext.data() + (static_cast<std::size_t>(y) << 16);  // ncm::node_next()
     for (int i = 0; i < kCtx; ++i) {
-      const int pn = np[i] + (((ty - np[i]) * ncm::kRate[static_cast<std::size_t>(nn[i])] + (1 << 15)) >> 16);
-      ctr[idx[i]] = static_cast<u16>(((pn ^ 0x800) << 4) | (nn[i] + (nn[i] < 15)));
+      ctr[idx[i]] = next[nv[i]];
       dirty_ctr.mark(idx[i] >> 5);
     }
     for (int j = 0; j < ncm::kSets; ++j) errs[j] = (((y << 16) - ncm::squash16(t[j])) * kLr1) >> 10;
@@ -509,7 +505,8 @@ StructuralCMCodec::StructuralCMCodec() noexcept = default;
 StructuralCMCodec::StructuralCMCodec(const hc::StreamParams& p) {
   if (accepts(p) != hc::Errc::ok) return;  // no model: every block is STORED
   const u64 n = memory_required(p);
-  owned_.reset(new std::byte[static_cast<std::size_t>(n)]);
+  owned_ = hc::allocate_arena(static_cast<std::size_t>(n));
+  if (!owned_) throw std::bad_alloc();
   const auto addr = reinterpret_cast<std::uintptr_t>(owned_.get());
   std::byte* const base = owned_.get() + ((64 - (addr & 63)) & 63);
   Model* const m = new (base) Model{};
@@ -676,7 +673,7 @@ bool StructuralCMCodec::test_select_simd(const char* name) noexcept {
     g_kernels.store(nullptr, std::memory_order_relaxed);
     return true;
   }
-  for (const ncm::SimdPath p : {ncm::SimdPath::scalar, ncm::SimdPath::sse2, ncm::SimdPath::avx2, ncm::SimdPath::neon}) {
+  for (const ncm::SimdPath p : ncm::kAllPaths) {
     if (std::strcmp(ncm::kernels_for(p).name, name) == 0 && ncm::simd_available(p)) {
       g_kernels.store(&ncm::kernels_for(p), std::memory_order_relaxed);
       return true;

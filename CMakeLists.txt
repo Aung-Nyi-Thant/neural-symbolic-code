@@ -48,6 +48,40 @@ if(HCE_NATIVE)
   add_compile_options(-march=native)
 endif()
 
+# Profile-guided optimization, off by default: GENERATE builds instrumented
+# binaries that write profiles to HCE_PGO_DIR when run; USE rebuilds from
+# those profiles (branch weights and code layout of the codec's bit loops).
+# tools/pgo.sh runs the whole cycle on a training corpus. The output of a PGO
+# build is byte-identical to any other build: only code placement changes.
+set(HCE_PGO "OFF" CACHE STRING "Profile-guided optimization: OFF, GENERATE or USE")
+set_property(CACHE HCE_PGO PROPERTY STRINGS OFF GENERATE USE)
+set(HCE_PGO_DIR "${CMAKE_BINARY_DIR}/pgo-profile" CACHE PATH "Where GENERATE writes and USE reads profiles")
+if(HCE_PGO STREQUAL "GENERATE")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-fprofile-generate=${HCE_PGO_DIR})
+    add_link_options(-fprofile-generate=${HCE_PGO_DIR})
+  else()
+    # Profiles are named after object paths relative to the build tree, so the
+    # USE build finds them whatever its own directory is.
+    add_compile_options(-fprofile-generate -fprofile-dir=${HCE_PGO_DIR} -fprofile-update=atomic
+                        -fprofile-prefix-path=${CMAKE_BINARY_DIR})
+    add_link_options(-fprofile-generate -fprofile-dir=${HCE_PGO_DIR} -fprofile-update=atomic)
+  endif()
+elseif(HCE_PGO STREQUAL "USE")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Clang reads one merged file: llvm-profdata merge -o <dir>/hce.profdata <dir>/*.profraw
+    add_compile_options(-fprofile-use=${HCE_PGO_DIR}/hce.profdata -Wno-profile-instr-unprofiled
+                        -Wno-profile-instr-out-of-date)
+  else()
+    # Code the training run never reached is optimized as usual, not for size;
+    # the test suites are not part of the training run and have no profiles.
+    add_compile_options(-fprofile-use -fprofile-dir=${HCE_PGO_DIR} -fprofile-partial-training
+                        -fprofile-prefix-path=${CMAKE_BINARY_DIR} -Wno-missing-profile)
+  endif()
+elseif(NOT HCE_PGO STREQUAL "OFF")
+  message(FATAL_ERROR "HCE_PGO must be OFF, GENERATE or USE (got '${HCE_PGO}')")
+endif()
+
 # Header-only core: framing (hc_framed.hpp) and stream interfaces.
 add_library(hce_core INTERFACE)
 target_include_directories(hce_core INTERFACE ${PROJECT_SOURCE_DIR})
@@ -57,9 +91,15 @@ target_compile_features(hce_core INTERFACE cxx_std_20)
 # vectorization in every configuration but Debug.
 add_library(hce_codec STATIC
   codec/neural_cm_codec.cpp
-  codec/ncm_kernels.cpp)
+  codec/ncm_run.cpp
+  codec/ncm_kernels.cpp
+  codec/ncm_tables.cpp)
 target_link_libraries(hce_codec PUBLIC hce_core PRIVATE hce_warnings)
 target_compile_options(hce_codec PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O3 -ftree-vectorize>)
+# The 128 Ki-entry counter table is generated at compile time; Clang's default
+# constant-evaluation budget (2^20 steps) is a little short for it.
+set_source_files_properties(codec/ncm_tables.cpp PROPERTIES
+  COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-fconstexpr-steps=16777216>")
 
 # Structural compression (structural/): the Phase 1 tokenizer, the frozen
 # global model and the token-level codec. The pipelines instantiate for it.

@@ -19,6 +19,10 @@
 
 namespace hce {
 
+namespace ncm {
+struct CMModel;
+}
+
 // StreamParams::prior_id = family | profile. Profile 1: text, logs and mixed data.
 inline constexpr hc::u32 kNeuralCMFamily = 0x4E434D00u;  // "NCM"
 inline constexpr hc::u8 kNeuralCMProfile = 1;
@@ -65,11 +69,10 @@ class NeuralCMCodec {
   static bool test_select_simd(const char* name) noexcept;
 
  private:
-  struct Model;
   void replay() noexcept;
 
-  Model* m_ = nullptr;                   // placement-constructed inside the arena
-  std::unique_ptr<std::byte[]> owned_;   // encoder role: the arena it owns
+  ncm::CMModel* m_ = nullptr;            // placement-constructed inside the arena
+  hc::ArenaPtr owned_;                   // encoder role: the arena it owns
   // Encoder role: the frame being coded and the blocks of it coded with CM so far.
   hc::Bytes frame_;
   std::vector<std::pair<std::size_t, std::size_t>> cm_blocks_;

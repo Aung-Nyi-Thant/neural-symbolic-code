@@ -341,11 +341,11 @@ static void test_codec() {
               static_cast<double>(e1.data.size()) / static_cast<double>(tokens.size()));
 
   // R15: every SIMD path codes the same bits, so archives move between machines.
-  for (const char* enc_path : {"scalar", "sse2", "avx2", "neon"}) {
+  for (const char* enc_path : {"scalar", "sse2", "avx2", "avx512", "neon"}) {
     if (!hce::StructuralCMCodec::test_select_simd(enc_path)) continue;
     const Encoded e = encode_ids(ids, &m, 2, 16384);
     CHECK(e.status == Errc::ok && e.data == e1.data);
-    for (const char* dec_path : {"scalar", "sse2", "avx2", "neon"}) {
+    for (const char* dec_path : {"scalar", "sse2", "avx2", "avx512", "neon"}) {
       if (!hce::StructuralCMCodec::test_select_simd(dec_path)) continue;
       CHECK(decode_ids(e.data, &m, 2).data == ids);
     }
