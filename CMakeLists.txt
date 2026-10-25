@@ -92,9 +92,10 @@ target_compile_features(hce_core INTERFACE cxx_std_20)
 add_library(hce_codec STATIC
   codec/neural_cm_codec.cpp
   codec/ncm_run.cpp
+  codec/ncm_pipe.cpp
   codec/ncm_kernels.cpp
   codec/ncm_tables.cpp)
-target_link_libraries(hce_codec PUBLIC hce_core PRIVATE hce_warnings)
+target_link_libraries(hce_codec PUBLIC hce_core Threads::Threads PRIVATE hce_warnings)
 target_compile_options(hce_codec PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O3 -ftree-vectorize>)
 # The 128 Ki-entry counter table is generated at compile time; Clang's default
 # constant-evaluation budget (2^20 steps) is a little short for it.

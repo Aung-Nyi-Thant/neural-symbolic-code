@@ -12,6 +12,7 @@
 
 #include "codec/ncm_kernels.hpp"
 #include "codec/ncm_model.hpp"
+#include "codec/ncm_pipe.hpp"
 #include "codec/ncm_run.hpp"
 #include "encoder/parallel.hpp"
 
@@ -57,6 +58,8 @@ NeuralCMCodec::NeuralCMCodec(const hc::StreamParams& p) {
 NeuralCMCodec::NeuralCMCodec(NeuralCMCodec&& other) noexcept
     : m_(std::exchange(other.m_, nullptr)),
       owned_(std::move(other.owned_)),
+      pipe_(std::move(other.pipe_)),
+      pipeline_(other.pipeline_),
       frame_(other.frame_),
       cm_blocks_(std::move(other.cm_blocks_)),
       replays_(other.replays_),
@@ -67,6 +70,8 @@ NeuralCMCodec& NeuralCMCodec::operator=(NeuralCMCodec&& other) noexcept {
   if (this != &other) {
     m_ = std::exchange(other.m_, nullptr);
     owned_ = std::move(other.owned_);
+    pipe_ = std::move(other.pipe_);
+    pipeline_ = other.pipeline_;
     frame_ = other.frame_;
     cm_blocks_ = std::move(other.cm_blocks_);
     replays_ = other.replays_;
@@ -189,7 +194,13 @@ std::size_t NeuralCMCodec::encode_block(std::size_t begin, std::size_t end, hc::
   }
 
   // A CM payload must be strictly smaller than its content.
-  const std::size_t size = ncm::runner_for(m.k->path).encode(m, frame_, begin, end, out.first(n - 1));
+  const ncm::Runner& run = ncm::runner_for(m.k->path);
+  if (pipeline_ && !pipe_) {
+    pipe_ = ncm::Pipe::create();
+    if (!pipe_) pipeline_ = false;  // no helper: one thread, the same bits
+  }
+  const std::size_t size = pipe_ && pipeline_ ? run.encode_piped(m, *pipe_, frame_, begin, end, out.first(n - 1))
+                                              : run.encode(m, frame_, begin, end, out.first(n - 1));
   if (size == 0) {  // expands: store it, and rebuild the models without it (R12)
     replay();
     ++counters_.replays;

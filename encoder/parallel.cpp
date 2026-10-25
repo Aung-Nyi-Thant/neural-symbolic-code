@@ -46,6 +46,7 @@ struct Plan {
   std::size_t out_cap = 0;     // encoded bytes per frame in the worst case (all STORED)
   std::size_t max_blocks = 0;  // blocks per frame
   unsigned threads = 0;
+  bool pipelined = false;  // each worker's codec also runs a helper thread
   u64 memory = 0;
 };
 
@@ -69,9 +70,19 @@ Plan make_plan(const EncodeOptions& o, const hc::StreamParams& p) {
   pl.out_cap = static_cast<std::size_t>(hc::kFrameHeaderSize + blocks * hc::kBlockHeaderSize + frame);
   const u64 slot = frame + pl.out_cap + blocks * sizeof(u32) + sizeof(Slot);
   const u64 worker = Enc::memory_required(p) + sizeof(Enc);
-  for (unsigned t = std::max(1u, o.threads);; --t) {
+  // A known input size caps the workers at its frame count: an idle worker
+  // would still allocate and clear a whole model. With fewer frames than half
+  // the threads, the spare threads go to the codecs' pipelines, one helper per
+  // worker. The output is the same bytes either way.
+  const u64 frames = o.content_size ? std::max<u64>(1, (*o.content_size + o.frame_bytes - 1) / o.frame_bytes) : 0;
+  u64 helper = 0;
+  if constexpr (requires(Enc& e) { e.set_pipeline(true); }) helper = Enc::kPipelineBytes;
+  unsigned t = std::max(1u, o.threads);
+  if (frames && frames < t) t = static_cast<unsigned>(frames);
+  for (;; --t) {
     pl.threads = t;
-    pl.memory = (u64{t} + 2) * slot + u64{t} * worker;
+    pl.pipelined = helper && frames && 2 * u64{t} <= o.threads;
+    pl.memory = (u64{t} + 2) * slot + u64{t} * (worker + (pl.pipelined ? helper : 0));
     if (pl.memory <= o.max_memory || t == 1) break;
   }
   return pl;
@@ -133,6 +144,8 @@ class Pipeline {
     encoders.reserve(plan_.threads);
     for (unsigned i = 0; i < plan_.threads; ++i) encoders.emplace_back(params_);
     for (Enc& e : encoders) attach_context(e, opt_.codec_context);  // before any worker starts
+    if constexpr (requires(Enc& e) { e.set_pipeline(true); })
+      for (Enc& e : encoders) e.set_pipeline(plan_.pipelined);
 
     const std::stop_callback on_stop(opt_.stop, [this]() noexcept { fail(Errc::cancelled); });
     {

@@ -517,6 +517,57 @@ static void test_replay() {
   CHECK(cm_blocks == 2);               // the two prose blocks before the noise
 }
 
+// The encoder's two-stage pipeline (ncm_pipe.hpp) codes the same bits as the
+// single-threaded loop on every kernel path, through expanding blocks (the
+// helper is stopped early, then the frame replays) and at every level.
+static void test_pipeline() {
+  StreamParams p;
+  p.prior_id = hce::kNeuralCMCodecId;
+  p.window_log = 16;
+  p.block_log = 12;
+  const Vec frame = concat({log_lines(9000, 100), random_bytes(4096 * 2, 101), prose(12000, 102),
+                            binary(8192, 103), random_bytes(4096, 104), prose(6000, 105)});
+  unsigned paths = 0;
+  for (const char* name : {"scalar", "sse2", "avx2", "avx512", "neon"}) {
+    if (!Codec::test_select_simd(name)) continue;
+    ++paths;
+    for (const u8 level : {u8{0}, u8{2}}) {
+      p.level = level;
+      Codec one(p), two(p);
+      two.set_pipeline(true);
+      Codec::test_force_cm(true);  // the noise blocks expand: stops and replays
+      one.reset_frame(frame);
+      two.reset_frame(frame);
+      Vec o1(4096), o2(4096);
+      for (std::size_t b = 0; b < frame.size(); b += 4096) {
+        const std::size_t e = std::min(frame.size(), b + 4096);
+        const std::size_t n1 = one.encode_block(b, e, MutBytes(o1).first(e - b));
+        const std::size_t n2 = two.encode_block(b, e, MutBytes(o2).first(e - b));
+        CHECK(n1 == n2 && std::equal(o1.begin(), o1.begin() + static_cast<std::ptrdiff_t>(n1), o2.begin()));
+      }
+      Codec::test_force_cm(false);
+      CHECK(one.counters().replays > 0 && one.counters().replays == two.counters().replays);
+      CHECK(one.counters().cm_blocks == two.counters().cm_blocks);
+    }
+  }
+  Codec::test_select_simd(nullptr);
+  CHECK(paths >= 2);
+
+  // Through the parallel encoder: spare threads go to pipelines, the workers
+  // are capped at the frame count, and the stream does not change.
+  const Vec data = concat({log_lines(60000, 106), prose(50000, 107)});
+  hce::EncodeOptions o = opts(2, 16, 13, 64 * 1024);
+  o.content_size = data.size();  // the plan needs it to count frames
+  const Vec ref = encode(data, o);
+  for (const unsigned t : {2u, 4u, 5u}) {
+    o.threads = t;
+    hce::EncodeResult r{};
+    CHECK(encode(data, o, &r) == ref);
+    CHECK(r.threads == std::min(t, 2u));  // two frames
+  }
+  std::printf("pipeline: identical blocks on %u kernel set(s) and identical streams\n", paths);
+}
+
 // R20: frames are independent. Decoding from any frame header on (a late
 // join) yields exactly the original bytes of the frames that follow.
 static void test_late_join() {
@@ -602,7 +653,7 @@ int main() {
       {"kernel_parity", test_kernel_parity}, {"node_table", test_node_table}, {"contract", test_contract},
       {"roundtrip_matrix", test_roundtrip_matrix}, {"simd_paths_agree", test_simd_paths_agree},
       {"golden_streams", test_golden_streams}, {"hostile_payloads", test_hostile_payloads},
-      {"replay", test_replay}, {"late_join", test_late_join},
+      {"replay", test_replay}, {"pipeline", test_pipeline}, {"late_join", test_late_join},
       {"window_bound", test_window_bound}, {"reset_cost", test_reset_cost},
   };
   for (const auto& t : kTests) {
