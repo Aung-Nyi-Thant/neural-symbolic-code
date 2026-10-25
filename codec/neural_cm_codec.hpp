@@ -21,7 +21,8 @@ namespace hce {
 
 namespace ncm {
 struct CMModel;
-}
+class Pipe;
+}  // namespace ncm
 
 // StreamParams::prior_id = family | profile. Profile 1: text, logs and mixed data.
 inline constexpr hc::u32 kNeuralCMFamily = 0x4E434D00u;  // "NCM"
@@ -55,6 +56,12 @@ class NeuralCMCodec {
   // ---- encoding: hce::FrameEncoder ----
   void reset_frame(hc::Bytes frame) noexcept;
   std::size_t encode_block(std::size_t begin, std::size_t end, hc::MutBytes out) noexcept;
+  // Encoder role: code blocks on two threads (ncm_pipe.hpp), the counter half
+  // of the model on a helper this codec starts at its first block. Encoder side
+  // only: the output is the same bytes either way. Falls back to one thread
+  // when the helper cannot be had.
+  void set_pipeline(bool on) noexcept { pipeline_ = on; }
+  static constexpr hc::u64 kPipelineBytes = hc::u64{256} << 10;  // the helper's ring
 
   // ---- diagnostics and tests ----
   struct Counters {
@@ -73,6 +80,8 @@ class NeuralCMCodec {
 
   ncm::CMModel* m_ = nullptr;            // placement-constructed inside the arena
   hc::ArenaPtr owned_;                   // encoder role: the arena it owns
+  std::unique_ptr<ncm::Pipe> pipe_;      // encoder role, set_pipeline(true): the helper
+  bool pipeline_ = false;
   // Encoder role: the frame being coded and the blocks of it coded with CM so far.
   hc::Bytes frame_;
   std::vector<std::pair<std::size_t, std::size_t>> cm_blocks_;

@@ -60,6 +60,11 @@ constexpr int kApmRate = 6;
 constexpr std::size_t kApmRow = 33;
 constexpr u32 kWordMul = 0x2F0F3D33u;
 
+// Pipeline records (produce_byte): the inputs in lanes [0, kInputs), then the
+// match state, (c1 << 8) | c0, and bitpos | y << 3 | kRecFast.
+constexpr int kRecFast = 16;  // a fast-path decision: P(hit) in lane 0
+static_assert(kInputs + 3 <= kLanes);
+
 struct LevelSpec {
   u8 bucket_bits;  // log2 of the buckets per hashed expert
   u8 match_bits;   // log2 of the match-table entries
@@ -159,6 +164,18 @@ struct Dirty {
     forget();
   }
 };
+
+// The hash of a hashed expert's bucket for a nibble: its context alone for
+// the first nibble (bitpos 0), mixed with the partial byte c0 for the second.
+constexpr u64 nibble_hash(u64 ctx, u32 c0, int bitpos) noexcept {
+  u64 hv = ctx;
+  if (bitpos) {
+    hv = (hv + (u64{c0} + 1) * 0x9E3779B97F4A7C15ull);
+    hv = (hv ^ (hv >> 29)) * 0xBF58476D1CE4E5B9ull;
+    hv ^= hv >> 32;
+  }
+  return hv;
+}
 
 // ----------------------------------------------------------------- model ---
 // Placement-constructed at the start of the arena the codec is bound to.
@@ -456,12 +473,7 @@ struct CMModel {
   // counter), ties evict way 0: deterministic replacement (R21).
   void lookup_nibble() noexcept {
     for (int i = 0; i < kHashed; ++i) {
-      u64 hv = ctx[i];
-      if (bitpos) {
-        hv = (hv + (u64{c0} + 1) * 0x9E3779B97F4A7C15ull);
-        hv = (hv ^ (hv >> 29)) * 0xBF58476D1CE4E5B9ull;
-        hv ^= hv >> 32;
-      }
+      const u64 hv = nibble_hash(ctx[i], c0, bitpos);
       Bucket* const base = buckets + (static_cast<std::size_t>(i) << spec.bucket_bits);
       const u32 idx = static_cast<u32>(hv) & bucket_mask;
       const u16 tag = static_cast<u16>(hv >> 48);
@@ -481,58 +493,92 @@ struct CMModel {
     }
   }
 
-  // One bit: predict, code, learn. The per-bit state lives in locals, which
-  // stores through the table pointers cannot alias, so it stays in registers.
-  // K: the mixer kernels (ncm_simd.hpp).
-  template <class K, class IO>
-  int code_bit(IO& io, int actual) noexcept {
-    const u32 c1 = static_cast<u32>(c8 & 0xFF);
+  // One bit in three steps. gather() reads the counters into the mixer's
+  // inputs; mix_code() mixes, codes and trains the mixers and APMs; learn()
+  // updates the counters with the coded bit. The first and last touch only
+  // the counter tables, the middle one only the mixer and APM tables, so the
+  // encoder can run them on two threads (ncm_pipe.hpp) and code the same bits.
+  // The per-bit state lives in locals, which stores through the table pointers
+  // cannot alias, so it stays in registers. K: the mixer kernels (ncm_simd.hpp).
+  struct Gathered {
     u16* node[kNodes];
-    for (int i = 0; i < kHashed; ++i) node[i] = &cur[i]->s[nib];
-    node[kHashed] = &o1[(c1 << 8) | c0];
-    node[kHashed + 1] = &o0[c0];
     u16 nv[kNodes];
-    simd::Lanes x{};
-    for (int i = 0; i < kNodes; ++i) {
-      nv[i] = *node[i];
-      x[i] = static_cast<i16>(node_stretch(nv[i]));
-    }
+    int ebit = -1, msi = 0;
+  };
 
-    int ms = 0, ebit = -1, msi = 0;
+  // x: zeroed by the caller. Returns the match state, which selects wb's set.
+  // kRaw: lanes [0, kNodes) get the counters themselves, for the pipeline's
+  // second stage to stretch (stretch_nodes).
+  template <bool kRaw = false>
+  int gather(Gathered& g, simd::Lanes& x) const noexcept {
+    const u32 c1 = static_cast<u32>(c8 & 0xFF);
+    for (int i = 0; i < kHashed; ++i) g.node[i] = &cur[i]->s[nib];
+    g.node[kHashed] = &o1[(c1 << 8) | c0];
+    g.node[kHashed + 1] = &o0[c0];
+    for (int i = 0; i < kNodes; ++i) {
+      g.nv[i] = *g.node[i];
+      x[i] = static_cast<i16>(kRaw ? g.nv[i] : node_stretch(g.nv[i]));
+    }
+    int ms = 0;
     if (expected >= 0 && static_cast<u32>((expected | 256) >> (8 - bitpos)) == c0) {
-      ebit = (expected >> (7 - bitpos)) & 1;
+      g.ebit = (expected >> (7 - bitpos)) & 1;
       ms = len_bucket(mlen);
-      msi = ms * 2 + ebit;
-      const int st = stretch16(std::min(counter_p(msm[msi]), 65535));
+      g.msi = ms * 2 + g.ebit;
+      const int st = stretch16(std::min(counter_p(msm[g.msi]), 65535));
       const int l = static_cast<int>(std::min<u32>(mlen, 32)) * 32;
-      x[kNodes] = static_cast<i16>(ebit ? st : -st);
-      x[kNodes + 1] = static_cast<i16>(ebit ? l : -l);
+      x[kNodes] = static_cast<i16>(g.ebit ? st : -st);
+      x[kNodes + 1] = static_cast<i16>(g.ebit ? l : -l);
     }
     x[kNodes + 2] = kBias;
+    return ms;
+  }
 
-    i16* const w1[kSets] = {wa + c0 * kLanes, wb + static_cast<u32>(ms) * kLanes, wc + c1 * kLanes};
+  void learn(const Gathered& g, int y) noexcept {
+    const u16* const next = kNodeNext.data() + (static_cast<std::size_t>(y) << 16);
+    for (int i = 0; i < kNodes; ++i) *g.node[i] = next[g.nv[i]];
+    if (g.ebit >= 0) counter_update(msm[g.msi], y == g.ebit);
+    c0 = c0 * 2 + static_cast<u32>(y);
+    nib = nib * 2 + static_cast<u32>(y);
+    if (++bitpos == 4) {
+      nib = 1;
+      lookup_nibble();
+    }
+  }
+
+  static void stretch_nodes(simd::Lanes& x) noexcept {
+    for (int i = 0; i < kNodes; ++i) x[i] = static_cast<i16>(node_stretch(static_cast<u16>(x[i])));
+  }
+
+  // The tables mix_code() reads and writes, and nothing else of the model.
+  struct MixTables {
+    i16 *wa, *wb, *wc, *wf;
+    u16 *apm1, *apm2;
+    Dirty dirty_apm;
+  };
+  MixTables mix_tables() const noexcept { return {wa, wb, wc, wf, apm1, apm2, dirty_apm}; }
+
+  template <class K, class IO>
+  static int mix_code(const MixTables& mt, IO& io, const simd::Lanes& x, u32 c0, u32 c1, int ms, int bitpos,
+                      int actual) noexcept {
+    i16* const w1[kSets] = {mt.wa + c0 * kLanes, mt.wb + static_cast<u32>(ms) * kLanes, mt.wc + c1 * kLanes};
     i32 dots[kSets];
     K::mix(x, w1, dots);
     alignas(8) i16 t[4]{};  // layer 2's inputs; the fourth weight of every set stays 0
     static_assert(kSets == 3);
     for (int j = 0; j < kSets; ++j)
       t[j] = static_cast<i16>(std::clamp(dots[j] >> 14, -kStretchMax, kStretchMax));
-    i16* const f = wf + bitpos * 4;
+    i16* const f = mt.wf + bitpos * 4;
     const i32 d2 = K::dot4(t, f);
     const int pm = std::max(squash16(std::clamp(d2 >> 14, -kLogitMax, kLogitMax)), 1);
 
     const int s = stretch16(pm) + 2048;  // 1..4095
     const int alo = s >> 7, awt = s & 127;
-    u16* const a1 = apm1 + c0 * kApmRow;
+    u16* const a1 = mt.apm1 + c0 * kApmRow;
     const std::size_t arow = (c1 << 8) | c0;
-    u16* const a2 = apm2 + arow * kApmRow;
+    u16* const a2 = mt.apm2 + arow * kApmRow;
     const int q1 = (a1[alo] * (128 - awt) + a1[alo + 1] * awt) >> 7;
     const int q2 = (a2[alo] * (128 - awt) + a2[alo + 1] * awt) >> 7;
     const int y = io.bit(std::clamp((pm + q1 + 2 * q2 + 2) >> 2, kPMin, kPMax), actual);
-
-    const u16* const next = kNodeNext.data() + (static_cast<std::size_t>(y) << 16);
-    for (int i = 0; i < kNodes; ++i) *node[i] = next[nv[i]];
-    if (ebit >= 0) counter_update(msm[msi], y == ebit);
 
     i32 errs[kSets];
     for (int j = 0; j < kSets; ++j) errs[j] = (((y << 16) - squash16(t[j])) * kLr1) >> 10;
@@ -542,19 +588,23 @@ struct CMModel {
     K::train4(t, f, (((y << 16) - pm) * kLr2) >> 10);
 
     const int target = y ? 65535 : 0;
-    dirty_apm.mark(arow);
+    Dirty da = mt.dirty_apm;
+    da.mark(arow);
     for (u16* a : {a1, a2}) {
       const int v0 = a[alo], v1 = a[alo + 1];
       a[alo] = static_cast<u16>(v0 + (((target - v0) * (128 - awt)) >> (7 + kApmRate)));
       a[alo + 1] = static_cast<u16>(v1 + (((target - v1) * awt) >> (7 + kApmRate)));
     }
+    return y;
+  }
 
-    c0 = c0 * 2 + static_cast<u32>(y);
-    nib = nib * 2 + static_cast<u32>(y);
-    if (++bitpos == 4) {
-      nib = 1;
-      lookup_nibble();
-    }
+  template <class K, class IO>
+  int code_bit(IO& io, int actual) noexcept {
+    Gathered g;
+    simd::Lanes x{};
+    const int ms = gather(g, x);
+    const int y = mix_code<K>(mix_tables(), io, x, c0, static_cast<u32>(c8 & 0xFF), ms, bitpos, actual);
+    learn(g, y);
     return y;
   }
 
@@ -573,6 +623,47 @@ struct CMModel {
     lookup_nibble();
     for (int i = 7; i >= 0; --i) code_bit<K>(io, (actual >> i) & 1);
     return static_cast<int>(c0 & 0xFF);
+  }
+
+  // The encoder's first pipeline stage: code_byte() without the mixing. For
+  // every coded decision it hands sink.put() the record the second stage
+  // needs (ncm_pipe.hpp); false when the sink was closed.
+  template <class Sink>
+  bool produce_byte(Sink& sink, int c) noexcept {
+    if (expected >= 0 && mlen >= spec.fast_len) {
+      const u32 fb = std::min<u32>(15, static_cast<u32>(std::bit_width(mlen - spec.fast_len)));
+      u32& f = flags[(fb << 8) | static_cast<u32>(expected)];
+      const int hit = c == expected;
+      simd::Lanes* const r = sink.slot();
+      if (!r) return false;
+      *r = simd::Lanes{};
+      (*r)[0] = static_cast<i16>(std::clamp(counter_p(f), kPMin, kPMax));
+      (*r)[kLanes - 1] = static_cast<i16>(kRecFast | (hit << 3));
+      sink.commit();
+      counter_update(f, hit);
+      if (hit) return true;
+      mlen = 0;
+      expected = -1;
+    }
+    for (int i = 0; i < kHashed; ++i) {  // the byte is known: its second nibble's buckets
+      const Bucket* const region = buckets + (static_cast<std::size_t>(i) << spec.bucket_bits);
+      __builtin_prefetch(region + (static_cast<u32>(nibble_hash(ctx[i], static_cast<u32>(c | 256) >> 4, 4)) & bucket_mask));
+    }
+    lookup_nibble();
+    for (int i = 7; i >= 0; --i) {
+      const int y = (c >> i) & 1;
+      simd::Lanes* const r = sink.slot();
+      if (!r) return false;
+      *r = simd::Lanes{};
+      Gathered g;
+      const int ms = gather<true>(g, *r);
+      (*r)[kLanes - 3] = static_cast<i16>(ms);
+      (*r)[kLanes - 2] = static_cast<i16>(((c8 & 0xFF) << 8) | c0);
+      (*r)[kLanes - 1] = static_cast<i16>(bitpos | (y << 3));
+      sink.commit();
+      learn(g, y);
+    }
+    return true;
   }
 };
 

@@ -171,46 +171,13 @@ struct Avx2 {
   static void train4(const i16* t, i16* f, i32 e) noexcept { train4_sse2(t, f, e); }
 };
 
-// AVX-512BW: sets 0 and 1 share one 512-bit register; set 2 uses AVX2.
-struct Avx512 {
+// AVX-512BW/VL: the AVX2 kernels, compiled into loops built for AVX-512
+// (ncm_run.cpp), so they get EVEX encodings, one-uop broadcasts and 32 vector
+// registers, but stay 256 bits wide: no 512-bit frequency licence. Each bit
+// mixes one 16-lane vector per set on a serial chain, so 512-bit registers
+// have nothing to fill: pairing sets in them measured 5-10% slower.
+struct Avx512 : Avx2 {
   static constexpr SimdPath kPath = SimdPath::avx512;
-  HCE_NCM_TARGET_AVX512 static void mix(const Lanes& x, i16* const* w, i32* out) noexcept {
-    mix256(reinterpret_cast<__m256i>(x), w, out);
-  }
-  HCE_NCM_TARGET_AVX512 static void mix(const i16* x, i16* const* w, i32* out) noexcept {
-    mix256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x)), w, out);
-  }
-  HCE_NCM_TARGET_AVX512 static void mix256(__m256i xv, i16* const* w, i32* out) noexcept {
-    const __m512i x2 = _mm512_inserti64x4(_mm512_castsi256_si512(xv), xv, 1);
-    const __m512i w01 = _mm512_inserti64x4(
-        _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[0]))),
-        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[1])), 1);
-    const __m512i m01 = _mm512_madd_epi16(x2, w01);
-    const __m256i m2 = _mm256_madd_epi16(xv, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w[2])));
-    const __m256i lo = _mm512_castsi512_si256(m01), hi = _mm512_extracti64x4_epi64(m01, 1);
-    store3(out, hsum3(_mm_add_epi32(_mm256_castsi256_si128(lo), _mm256_extracti128_si256(lo, 1)),
-                      _mm_add_epi32(_mm256_castsi256_si128(hi), _mm256_extracti128_si256(hi, 1)),
-                      _mm_add_epi32(_mm256_castsi256_si128(m2), _mm256_extracti128_si256(m2, 1))));
-  }
-  HCE_NCM_TARGET_AVX512 static void train(const i16* x, i16* const* w, const i32* e) noexcept {
-    const __m256i xs = _mm256_slli_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x)), 4);
-    const __m512i xs2 = _mm512_inserti64x4(_mm512_castsi256_si512(xs), xs, 1);
-    const __m512i e01 = _mm512_inserti64x4(_mm512_set1_epi16(static_cast<short>(e[0])),
-                                           _mm256_set1_epi16(static_cast<short>(e[1])), 1);
-    const __m512i d01 =
-        _mm512_srai_epi16(_mm512_add_epi16(_mm512_mulhi_epi16(xs2, e01), _mm512_set1_epi16(1)), 1);
-    auto* w0 = reinterpret_cast<__m256i*>(w[0]);
-    auto* w1 = reinterpret_cast<__m256i*>(w[1]);
-    _mm256_storeu_si256(w0, _mm256_adds_epi16(_mm256_loadu_si256(w0), _mm512_castsi512_si256(d01)));
-    _mm256_storeu_si256(w1, _mm256_adds_epi16(_mm256_loadu_si256(w1), _mm512_extracti64x4_epi64(d01, 1)));
-    auto* w2 = reinterpret_cast<__m256i*>(w[2]);
-    const __m256i d2 = _mm256_srai_epi16(
-        _mm256_add_epi16(_mm256_mulhi_epi16(xs, _mm256_set1_epi16(static_cast<short>(e[2]))), _mm256_set1_epi16(1)),
-        1);
-    _mm256_storeu_si256(w2, _mm256_adds_epi16(_mm256_loadu_si256(w2), d2));
-  }
-  static i32 dot4(const i16* t, const i16* f) noexcept { return dot4_sse2(t, f); }
-  static void train4(const i16* t, i16* f, i32 e) noexcept { train4_sse2(t, f, e); }
 };
 #endif
 
