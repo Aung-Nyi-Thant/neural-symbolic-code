@@ -7,9 +7,16 @@
 #   mingw-wine   a MinGW-w64 cross build for Windows, run under Wine
 #   benchmark    tools/benchmark.py on three source-code corpora: a smoke test of
 #                the CLI and the script, with the tables in the job summary
+#   python       the hce package on the oldest and newest supported Pythons: an
+#                sdist, a wheel built from it with -Werror, the pytest suite
+#                against the installed wheel and its hce command
+#   conda        environment.yml as written: the CMake/CTest path (python
+#                preset) and an editable install, each running the pytest suite
 #
-# Each job is a CMake preset (CMakePresets.json), so every run reproduces
-# locally with: cmake --preset P && cmake --build --preset P && ctest --preset P
+# Each C++ job is a CMake preset (CMakePresets.json), so every run reproduces
+# locally with: cmake --preset P && cmake --build --preset P && ctest --preset P.
+# The Python jobs install only the exact versions in constraints.txt and
+# environment.yml; README, "Python package", has the same steps.
 name: CI
 
 on:
@@ -182,4 +189,99 @@ jobs:
           path: |
             benchmark.md
             benchmark.csv
+          if-no-files-found: ignore
+
+  python:
+    name: python ${{ matrix.python }} (sdist, wheel, pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    env:
+      PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt  # also pins the isolated build environment
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build liburing-dev pkg-config
+
+      - name: Install the pinned build front end
+        run: python -m pip install build==1.2.2
+
+      # The sdist is built first and the wheel from it, so a file missing from
+      # the sdist fails here rather than for a user.
+      - name: Build the sdist and the wheel
+        run: >-
+          python -m build --outdir dist
+          -C cmake.define.HCE_WERROR=ON -C cmake.define.HCE_AIO_URING=ON
+
+      - name: Install the wheel with the test and lint tools
+        run: python -m pip install "$(ls dist/hce-*.whl)[dev]"
+
+      - name: Lint the Python sources
+        run: python -m pyflakes python/hce tests/python tools
+
+      - name: Check the golden vectors (R17)
+        run: python tests/python/golden/regenerate.py --check
+
+      # The checkout has no importable hce at its root (the sources are under
+      # python/), so the tests import the installed wheel and run its hce command.
+      - name: Run the test suite
+        run: |
+          python -c "import hce, sys; print(hce.__file__); sys.exit('site-packages' not in hce.__file__)"
+          hce --version
+          python -m pytest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-python${{ matrix.python }}
+          path: dist/
+          if-no-files-found: error
+
+  conda:
+    name: conda (environment.yml, CMake + pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash -el {0}  # a login shell activates the environment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+
+      - name: Describe the environment
+        run: |
+          micromamba list
+          "$CXX" --version
+
+      - name: Configure, build and test with CMake (python preset)
+        run: |
+          cmake --preset python -DHCE_WERROR=ON -DHCE_AIO_URING=ON
+          cmake --build --preset python
+          ctest --preset python
+
+      - name: Editable install and the test suite
+        run: |
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pytest
+
+      - name: Keep the test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-conda
+          path: build/python/Testing/Temporary/LastTest.log
           if-no-files-found: ignore

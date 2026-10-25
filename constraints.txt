@@ -1,0 +1,36 @@
+# Exact versions of every Python package HCE builds, tests or benchmarks with,
+# direct and transitive. pyproject.toml pins the direct ones; this file pins
+# the rest, so an install today and one in a year resolve to the same set.
+#
+#   PIP_CONSTRAINT=constraints.txt python -m pip install ".[test]"
+#
+# PIP_CONSTRAINT (rather than -c) also reaches the isolated build environment,
+# where scikit-build-core, pybind11 and, if the system's are too old, cmake and
+# ninja are installed. Updating: README, "Updating the pinned versions".
+
+# build backend and bindings
+scikit-build-core==0.10.7
+pybind11==2.13.6
+packaging==26.3
+pathspec==1.1.1
+cmake==3.30.5
+ninja==1.11.1.1
+
+# tests
+pytest==8.3.3
+pytest-timeout==2.3.1
+hypothesis==6.112.1
+iniconfig==2.3.1
+pluggy==1.7.0
+attrs==26.1.0
+sortedcontainers==2.4.0
+
+# development tools
+build==1.2.2
+pyproject_hooks==1.3.3
+pyflakes==3.2.0
+
+# Python 3.10 only (pytest, scikit-build-core and build backport these)
+exceptiongroup==1.3.1 ; python_version < "3.11"
+tomli==2.5.0 ; python_version < "3.11"
+typing_extensions==4.16.0 ; python_version < "3.11"

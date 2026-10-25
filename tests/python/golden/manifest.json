@@ -1,0 +1,175 @@
+{
+  "hce_version": "2.1.0",
+  "vectors": [
+    {
+      "name": "framed-source-l2",
+      "file": "framed-source-l2.hce",
+      "input": {
+        "generator": "source",
+        "seed": 1,
+        "size": 32768,
+        "sha256": "ccf78f39417cecaf500b9effa4bff4183b5a161213324f9a62ff080c4ef841d5"
+      },
+      "options": {
+        "level": 2
+      },
+      "compressed_size": 3921,
+      "compressed_sha256": "3c4aaa9ae57e9c57afba8ce6a02f5a0b84042c41f1bed440471e124dc0c3892d",
+      "format": "framed"
+    },
+    {
+      "name": "framed-log-l0",
+      "file": "framed-log-l0.hce",
+      "input": {
+        "generator": "log",
+        "seed": 2,
+        "size": 32768,
+        "sha256": "e2a8192275054862ea74b2ae762b7c247d0bbc57724237fe84a305b8e4c01366"
+      },
+      "options": {
+        "level": 0
+      },
+      "compressed_size": 3611,
+      "compressed_sha256": "413971a4e168be3d647b72509ebda66c849ea1fc13e1bf66c34542980f59ff4f",
+      "format": "framed"
+    },
+    {
+      "name": "framed-text-l4",
+      "file": "framed-text-l4.hce",
+      "input": {
+        "generator": "text",
+        "seed": 3,
+        "size": 16384,
+        "sha256": "0692ea0105344b8062792478fe1117b8934b36efcbc5ab83c489fed2d3ed30a9"
+      },
+      "options": {
+        "level": 4
+      },
+      "compressed_size": 2088,
+      "compressed_sha256": "acdacd95aa3defdd8c8473d04389124c1a2152604414a9ee5dab2fb2867dd990",
+      "format": "framed"
+    },
+    {
+      "name": "framed-binary-l1",
+      "file": "framed-binary-l1.hce",
+      "input": {
+        "generator": "binary",
+        "seed": 4,
+        "size": 8192,
+        "sha256": "bd24b13890b1abcb0550ac0e031e968747807134603ef28864c6e9c7b75d347b"
+      },
+      "options": {
+        "level": 1
+      },
+      "compressed_size": 8316,
+      "compressed_sha256": "51ce8ca5146057ba04ebca40b3493706749bca8764a57c73fc3738ff2996101c",
+      "format": "framed"
+    },
+    {
+      "name": "framed-empty",
+      "file": "framed-empty.hce",
+      "input": {
+        "generator": "empty",
+        "seed": 0,
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "options": {
+        "level": 2
+      },
+      "compressed_size": 64,
+      "compressed_sha256": "30c92201d6c78c33de398e576d911002e8d4fc51604b48c5522cbf2a4faea85b",
+      "format": "framed"
+    },
+    {
+      "name": "structural-source-python",
+      "file": "structural-source-python.hcs",
+      "input": {
+        "generator": "source",
+        "seed": 5,
+        "size": 32768,
+        "sha256": "39241d6baf503165b5b309e26f819cd9e21fd183c1b0a5b8b839ce662c6c75a0"
+      },
+      "options": {
+        "level": 2,
+        "structural": true,
+        "language": "python"
+      },
+      "compressed_size": 4949,
+      "compressed_sha256": "2a18bb178ecffb9e818f9e222460aa50f11a5853e335aad56b05355a86f1bb9c",
+      "format": "structural"
+    },
+    {
+      "name": "structural-source-generic-l1",
+      "file": "structural-source-generic-l1.hcs",
+      "input": {
+        "generator": "source",
+        "seed": 6,
+        "size": 16384,
+        "sha256": "82fd53bd8c297d7ec01936588be232606c1e6c64b3ce7f68e66038b184423da9"
+      },
+      "options": {
+        "level": 1,
+        "structural": true,
+        "language": "generic"
+      },
+      "compressed_size": 3216,
+      "compressed_sha256": "8193407fc1cc0d45d05d17ca41630d2be054ed52e69b4e5568be9a4656dbe230",
+      "format": "structural"
+    },
+    {
+      "name": "structural-log-generic",
+      "file": "structural-log-generic.hcs",
+      "input": {
+        "generator": "log",
+        "seed": 7,
+        "size": 16384,
+        "sha256": "c5e8b4fdb2a208a1daf64c9c75ee27b639587df91053f827f3da8bfdfc941991"
+      },
+      "options": {
+        "level": 2,
+        "structural": true,
+        "language": "generic"
+      },
+      "compressed_size": 3223,
+      "compressed_sha256": "4c8a72f73cffa5b56926d9dd7d0821c30cc070d987256e7ce9334991eefb22c8",
+      "format": "structural"
+    },
+    {
+      "name": "structural-binary",
+      "file": "structural-binary.hcs",
+      "input": {
+        "generator": "binary",
+        "seed": 8,
+        "size": 4096,
+        "sha256": "dfcb46e439e53ed14b6f053644450996baca75b43e5c1e1bef7040b01c80abf2"
+      },
+      "options": {
+        "level": 2,
+        "structural": true,
+        "language": "generic"
+      },
+      "compressed_size": 5068,
+      "compressed_sha256": "dd5c2530ab2d43d5c1f1163bae49ba0cafa7403cb6e0f1e21e920b686f61a103",
+      "format": "structural"
+    },
+    {
+      "name": "structural-empty",
+      "file": "structural-empty.hcs",
+      "input": {
+        "generator": "empty",
+        "seed": 0,
+        "size": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "options": {
+        "level": 2,
+        "structural": true,
+        "language": "generic"
+      },
+      "compressed_size": 237,
+      "compressed_sha256": "c7db6757f1e307c05cd5f690c93f122134507b56c11205eab71c8a8f7c4cfcc3",
+      "format": "structural"
+    }
+  ]
+}

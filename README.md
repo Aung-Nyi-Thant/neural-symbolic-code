@@ -14,10 +14,11 @@ zero sanitizer findings across GCC and Clang
 [![Architectures](https://img.shields.io/badge/arch-x86--64%20%C2%B7%20AArch64%20NEON-informational)](#determinism-r11r17)
 [![Ratio vs zstd -19](https://img.shields.io/badge/vs%20zstd%20--19-21%E2%80%9345%25%20smaller-2ea44f)](#performance-and-benchmarks)
 [![CMake](https://img.shields.io/badge/CMake-%E2%89%A5%203.20-064F8C?logo=cmake&logoColor=white)](#quick-start)
+[![Python](https://img.shields.io/badge/Python-3.10%E2%80%933.13-3776AB?logo=python&logoColor=white)](#python-package)
 
 [Overview](#overview) · [Architecture](#architecture) · [Hardening](#hardening-and-security-r11r21) ·
 [Quality](#quality-assurance) · [Benchmarks](#performance-and-benchmarks) · [Quick start](#quick-start) ·
-[Tooling](#tooling-and-automation) · [License](#license)
+[Python](#python-package) · [Tooling](#tooling-and-automation) · [License](#license)
 
 </div>
 
@@ -232,6 +233,7 @@ preset, so any of them reproduces locally (see [Tooling and automation](#tooling
 | `clang-tsan` | Clang 18 | TSan | 6 |
 | `aarch64-qemu` | GCC 13 cross, `armv8.2-a+dotprod` | QEMU user mode, `-cpu max` | 6 |
 | `mingw-wine` | MinGW-w64 GCC 13 cross, static | Wine 9 | 5 (the CLI is POSIX-only) |
+| `python` | GCC 13 `-O3`, `HCE_BUILD_PYTHON=ON` | — | 7 (the six, plus pytest) |
 
 | Suite | Scope | Highlights |
 |---|---|---|
@@ -241,6 +243,7 @@ preset, so any of them reproduces locally (see [Tooling and automation](#tooling
 | `aio` | Asynchronous file I/O | Every backend present (io_uring, worker threads): the engine contract, round trips across sizes, queue depths and `O_DIRECT`, interrupts and errors, and the pipelines over async files. |
 | `structural` | Structural codec | Tokenizer fuzzing for losslessness, hostile token and model images, deterministic models, round trips across thread counts and SIMD paths, archives on every aio backend, damaged archives. |
 | `cli` | `hce` binary | Exit codes, atomic output files, pipes, SIGINT and EPIPE, gap reports, limits, legacy-stream rejection, structural mode and format detection. |
+| `python` | Python package ([pytest](#run-the-test-suite)) | Round trips over codecs × corpora × levels × languages, Hypothesis properties, every truncation and sampled bit flips rejected, limits and the exception hierarchy, ten golden archives (R17), bindings ≡ CLI byte for byte. |
 
 **Cross-architecture bit-exactness.** The same nine golden streams, compared by size and CRC-32C, are
 reproduced on x86-64 with the scalar, SSE2 and AVX2 kernels and on AArch64 with NEON, from GCC and Clang
@@ -378,6 +381,7 @@ ctest --test-dir build -j4 --output-on-failure
 | `HCE_WERROR` | `ON` | Treat warnings as errors; set `OFF` for packaging on newer compilers. |
 | `HCE_BUILD_TESTS` | `ON` | Build the test suites. |
 | `HCE_AIO_URING` | `AUTO` | io_uring backend of `aio/`: `AUTO` builds it when pkg-config finds liburing ≥ 2.2, `ON` requires it, `OFF` builds the thread backend only. |
+| `HCE_BUILD_PYTHON` | `OFF` | Build the Python extension `hce._hce` (needs Python ≥ 3.10 with headers and pybind11) and register the pytest suite with CTest. See [Python package](#python-package). |
 
 The codec library always builds with `-O3 -ftree-vectorize`, except in `Debug` builds.
 
@@ -551,6 +555,136 @@ add_subdirectory(third_party/hce)
 target_link_libraries(my_app PRIVATE hce_pipeline)
 ```
 
+## Python package
+
+The `hce` Python package wraps the engine through [pybind11](https://pybind11.readthedocs.io) bindings
+([`bindings/hce_python.cpp`](bindings/hce_python.cpp)) and a typed API ([`python/hce/`](python/hce/__init__.py)).
+It is built by the same CMake project, through [scikit-build-core](https://scikit-build-core.readthedocs.io),
+and a wheel also installs the `hce` command. Python 3.10–3.13 on Linux is tested.
+
+```python
+import hce
+
+packed = hce.compress(data, level=2, threads=4)          # byte codec; identical output for any thread count
+packed = hce.compress(src, structural=True, language="python")   # structural codec for source code
+data = hce.decompress(packed, max_output=64 << 20)         # either format; bound the output on untrusted input
+stats = hce.verify(packed)                                 # Stats(format, input_bytes, output_bytes, ..., verified=True)
+
+hce.compress_file("big.log", "big.log.hce", threads=8)    # files go through the io_uring aio layer
+hce.decompress_file("big.log.hce", "big.log")             # on failure the output file is removed
+
+try:
+    hce.decompress(untrusted, max_output=1 << 30)
+except hce.CorruptInputError as e:                         # also a ValueError
+    print(e.code)                                          # "payload_corrupt", "truncated", "bad_magic", ...
+except hce.LimitExceededError:                             # max_output / max_memory
+    ...
+```
+
+Every function decodes completely and checks every CRC before it returns, releases the GIL while it works,
+and raises an `HceError` subclass rather than returning damaged bytes: `CorruptInputError`,
+`LimitExceededError`, `UnsupportedFormatError`, or `HceIOError` (an `OSError` with `errno`). Bad arguments
+raise `ValueError` or `TypeError`. `hce.tokenize()` exposes the structural tokenizer, and `hce.info()`
+reports the version, codec IDs, SIMD kernels and I/O backend.
+
+### Set up a development environment
+
+Every Python dependency is pinned to an exact version: the direct ones in
+[`pyproject.toml`](pyproject.toml), every transitive one in [`constraints.txt`](constraints.txt), and the
+whole conda toolchain in [`environment.yml`](environment.yml). Pick one of three routes.
+
+**A. pip and a virtual environment** (system compiler)
+
+1. Install a C++20 compiler, Ninja and, for the io_uring backend, liburing:
+   ```bash
+   sudo apt install build-essential ninja-build python3-dev python3-venv liburing-dev pkg-config
+   ```
+2. Create and activate a virtual environment:
+   ```bash
+   python3 -m venv .venv && . .venv/bin/activate
+   ```
+3. Build and install the package with its test tools. `PIP_CONSTRAINT` pins every package, including
+   those of the isolated build environment (scikit-build-core, pybind11, and CMake if yours is older than 3.25):
+   ```bash
+   PIP_CONSTRAINT=constraints.txt python -m pip install ".[test]"     # or ".[dev]" for build and pyflakes too
+   ```
+4. Check it: `python -c "import hce; print(hce.info())"` and `hce --version`.
+
+**B. conda** (compiler, CMake, liburing and Python packages from conda-forge)
+
+1. Create and activate the environment (`mamba` or `micromamba` work the same):
+   ```bash
+   conda env create -f environment.yml
+   conda activate hce
+   ```
+2. Install the package from the checkout, using the environment's packages only:
+   ```bash
+   python -m pip install --no-deps --no-build-isolation -e .
+   ```
+   The editable install rebuilds the extension on the next `pip install`, not on import.
+
+**C. CMake and CTest** (no installation; with route A's or B's packages)
+
+```bash
+cmake --preset python             # Release + HCE_BUILD_PYTHON=ON
+cmake --build --preset python     # stages the package in build/python/python/hce
+ctest --preset python             # the six C++ suites, then pytest against the staged package
+```
+
+CMake finds the first Python on `PATH`; pass `-DPython_EXECUTABLE=/path/to/python` to choose another.
+The pytest suite is registered with CTest only when that Python can import pytest and Hypothesis.
+
+### Run the test suite
+
+```bash
+python -m pytest                                  # the installed package (routes A and B)
+PYTHONPATH=build/python/python python -m pytest   # the CMake build tree (route C)
+python -m pytest -m "not slow"                    # skip the largest inputs
+python -m pytest -k golden -v                     # one area
+HYPOTHESIS_PROFILE=thorough python -m pytest      # 1,000 random examples per property instead of 60 fixed ones
+```
+
+The suite ([`tests/python/`](tests/python)) runs in about 75 seconds on four cores. Warnings are errors,
+markers are strict, and every test has a 10-minute timeout. Tests marked `cli` compare the bindings with
+the `hce` command: they look for `HCE_CLI`, then the interpreter's scripts directory, `PATH` and
+`build/release/hce`, and are skipped when none exists.
+
+| Module | What it checks |
+|---|---|
+| `test_api.py` | Exports, stubs and `py.typed`, `info()`, `Stats`, format detection; the version agrees across the module, `pyproject.toml` and `CMakeLists.txt` |
+| `test_roundtrip.py` | Both codecs × five corpora × five levels × nine languages; output independent of thread count; buffer types; concurrent calls from threads; Hypothesis properties on arbitrary bytes and text |
+| `test_errors.py` | Argument validation; every truncation, trailing bytes, sampled single-bit flips and random damage must raise; foreign formats; `max_output` and `max_memory` limits; the exception hierarchy and its `code`, `stage` and `errno` |
+| `test_golden.py` | Ten golden archives (five per codec): each decompresses and verifies to its regenerated input, and re-encoding reproduces it byte for byte with one and three threads |
+| `test_files.py` | `compress_file` / `decompress_file`: language by extension, Unicode paths, replacement of existing files, no output left behind on failure, OS errors with `errno` |
+| `test_tokenize.py` | Lossless tokenization in every language, keyword tables, line numbers and token IDs |
+| `test_cli.py` | The bindings and the CLI write identical archives, decode each other's, and agree on exit status and exception for corrupt, limited and unsupported input |
+| `test_benchmark_tool.py` | `tools/benchmark.py`: corpus assembly, argument errors, an end-to-end run with Markdown and CSV output |
+
+### Golden vectors
+
+[`tests/python/golden/`](tests/python/golden) holds ten archives with a `manifest.json` of their options,
+sizes and SHA-256 digests; their inputs come from the deterministic generators in
+[`tests/python/testdata.py`](tests/python/testdata.py). Under R17 they are never edited:
+
+```bash
+tests/python/golden/regenerate.py --check    # exit 1 if the encoder no longer reproduces every vector
+tests/python/golden/regenerate.py            # add vectors newly listed in VECTORS; refuses to change recorded ones
+```
+
+A change to any coded bit ships as a new codec profile with new vectors; `--force` (rewrite everything) is
+reserved for that.
+
+### Updating the pinned versions
+
+1. Edit the versions in `pyproject.toml` (direct dependencies) and `environment.yml`.
+2. Resolve the transitive set in a fresh environment and copy every version into `constraints.txt`:
+   ```bash
+   python3 -m venv /tmp/pins && /tmp/pins/bin/pip install "scikit-build-core==X" "pybind11==Y" ".[dev]"
+   /tmp/pins/bin/pip freeze --exclude hce
+   ```
+   Keep the `python_version < "3.11"` markers for the backports Python 3.10 needs.
+3. Run routes A and B and the full suite; CI repeats them on Python 3.10 and 3.13 and with the conda environment.
+
 ## Tooling and automation
 
 ### Benchmark script
@@ -588,9 +722,12 @@ status: 0 when every round trip verified, 1 when a command failed or an output d
 | `aarch64 (QEMU)` | The `aarch64-qemu` preset: a static cross build, every suite under `qemu-aarch64 -cpu max` |
 | `windows (MinGW-w64 + Wine)` | The `mingw-wine` preset: a static Windows build, five suites under Wine |
 | `benchmark (smoke)` | `tools/benchmark.py` on the three corpora; tables in the job summary and as an artifact |
+| `python (3.10, 3.13)` | An sdist, then a wheel built from it with `-Werror`, installed with the pinned test tools; pyflakes, `regenerate.py --check`, and pytest against the installed wheel and its `hce` command. The sdist and wheel are kept as artifacts |
+| `conda` | `environment.yml` as written: `ctest --preset python` with `-Werror`, then an editable install and pytest |
 
-Failed test jobs upload `LastTest.log`. Each job is a preset, so `cmake --preset P && cmake --build
---preset P && ctest --preset P` reproduces it locally.
+Failed test jobs upload `LastTest.log`. Each C++ job is a preset, so `cmake --preset P && cmake --build
+--preset P && ctest --preset P` reproduces it locally; the Python jobs follow
+[Set up a development environment](#set-up-a-development-environment).
 
 ---
 
@@ -626,12 +763,17 @@ io/stream.hpp                     Stream interfaces and in-memory implementation
 aio/                              Asynchronous file I/O: io_uring and worker-thread backends, stream adapters
 structural/                       Structural codec: tokenizer, frozen global model, token-level CM, HCS archives
 cli/hce.cpp, cli/posix_io.hpp     The hce command-line tool
+bindings/hce_python.cpp           pybind11 bindings: the hce._hce extension module
+python/hce/                       The typed Python package (__init__.py, _hce.pyi stubs, py.typed)
 test_hc_framed.cpp                Container suite with mutation fuzzing
 tests/                            Codec, pipeline, aio, structural and CLI suites; legacy-stream fixture
+tests/python/                     pytest suite; golden/ holds the frozen archives and regenerate.py
 tools/benchmark.py                Multi-corpus benchmark against zstd and xz, Markdown and CSV output
+pyproject.toml, constraints.txt   Python packaging (scikit-build-core) and the exact pins of every dependency
+environment.yml                   Pinned conda-forge development environment
 cmake/aarch64-linux-gnu.cmake     AArch64 cross toolchain; tests run under QEMU
 cmake/x86_64-w64-mingw32.cmake    Windows cross toolchain (MinGW-w64); tests run under Wine
-.github/workflows/ci.yml          CI: the preset matrix, cross targets and the benchmark
+.github/workflows/ci.yml          CI: the preset matrix, cross targets, the benchmark, the Python package
 ```
 
 ---
@@ -668,11 +810,14 @@ cmake/x86_64-w64-mingw32.cmake    Windows cross toolchain (MinGW-w64); tests run
 Changes are welcome. The bar matches the guarantees above:
 
 1. **Zero warnings** under the project's `-Werror` flag set, on GCC and Clang.
-2. **All eight configurations pass:** `release`, `clang-release`, `gcc-asan`, `clang-asan`, `gcc-tsan`,
-   `clang-tsan`, `aarch64-qemu` and `mingw-wine`. CI checks them on every pull request.
+2. **All nine configurations pass:** `release`, `clang-release`, `gcc-asan`, `clang-asan`, `gcc-tsan`,
+   `clang-tsan`, `aarch64-qemu`, `mingw-wine` and `python` (with the pytest suite). CI checks them, and
+   the Python package on 3.10 and 3.13, on every pull request.
 3. **No floating point in the codec**, and every kernel path stays bit-exact with the scalar reference.
-4. **R17:** golden streams are never edited. A change to any coded bit ships as a new codec profile with
-   new golden vectors.
+4. **R17:** golden streams are never edited (`tests/python/golden/regenerate.py --check` must pass). A
+   change to any coded bit ships as a new codec profile with new golden vectors.
+5. **Python changes** keep `python -m pyflakes python/hce tests/python tools` clean and the
+   `_hce.pyi` stubs in step with the bindings.
 
 Please report suspected security issues privately, for example through the repository's private
 vulnerability reporting, rather than in a public issue.

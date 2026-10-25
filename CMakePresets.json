@@ -21,6 +21,12 @@
       "cacheVariables": { "CMAKE_CXX_COMPILER": "clang++", "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "python",
+      "inherits": "base",
+      "displayName": "Release with the Python package; ctest also runs the pytest suite",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "HCE_BUILD_PYTHON": "ON" }
+    },
+    {
       "name": "gcc-asan",
       "inherits": "base",
       "displayName": "GCC, AddressSanitizer + UndefinedBehaviorSanitizer",
@@ -78,6 +84,7 @@
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "clang-release", "configurePreset": "clang-release" },
+    { "name": "python", "configurePreset": "python" },
     { "name": "gcc-asan", "configurePreset": "gcc-asan" },
     { "name": "clang-asan", "configurePreset": "clang-asan" },
     { "name": "gcc-tsan", "configurePreset": "gcc-tsan" },
@@ -88,6 +95,7 @@
   "testPresets": [
     { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
     { "name": "clang-release", "configurePreset": "clang-release", "output": { "outputOnFailure": true } },
+    { "name": "python", "configurePreset": "python", "output": { "outputOnFailure": true } },
     { "name": "gcc-asan", "configurePreset": "gcc-asan", "output": { "outputOnFailure": true } },
     { "name": "clang-asan", "configurePreset": "clang-asan", "output": { "outputOnFailure": true } },
     { "name": "gcc-tsan", "configurePreset": "gcc-tsan", "output": { "outputOnFailure": true } },
