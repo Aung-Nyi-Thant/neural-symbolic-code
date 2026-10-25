@@ -194,6 +194,16 @@ static void test_roundtrips() {
   CHECK(hce("-d -T 1 -i t4.hce -o s.log").code == 0 && hce("-d -T 4 -i t4.hce -o p.log").code == 0);
   CHECK(read_file("s.log") == data && read_file("p.log") == data);
 
+  // Profile 2 is the default; --codec-profile 1 writes what hce 2.1 wrote.
+  // Either decodes without being told which it is.
+  CHECK(hce("--codec-profile 2 -i data.log -o p2.hce").code == 0);
+  CHECK(read_file("p2.hce") == read_file("data.hce"));
+  CHECK(hce("--codec-profile 1 -i data.log -o p1.hce").code == 0);
+  CHECK(read_file("p1.hce") != read_file("data.hce"));
+  CHECK(hce("-d -i p1.hce -o p1.log").code == 0 && read_file("p1.log") == data);
+  const Run v = hce("-v --codec-profile 1 -i data.log -o p1v.hce");
+  CHECK(v.code == 0 && v.err.find("profile 1") != std::string::npos);
+
   // Test mode verifies without writing anything.
   const Run t = hce("-t -i data.hce --stats=json");
   CHECK(t.code == 0 && t.err.find("\"verified\":1") != std::string::npos && t.err.find("\"exit\":0") != std::string::npos);
@@ -269,7 +279,9 @@ static void test_files_and_sizes() {
 static void test_usage_errors() {
   for (const char* args : {"--bogus", "-l 9", "--window 1000", "--block 16M", "--frame 10", "-T 0",
                            "--report r.jsonl -i data.log", "-t -i data.hce -o x", "--recovery maybe -d",
-                           "--fill 300 -d", "--stats=xml", "-i a -i b", "--keep-partial -d -i data.hce"})
+                           "--fill 300 -d", "--stats=xml", "-i a -i b", "--keep-partial -d -i data.hce",
+                           "--codec-profile 3", "--codec-profile 0", "-d --codec-profile 1 -i data.hce",
+                           "--structural --codec-profile 1 -i data.log"})
     CHECK(hce(args).code == 1);
   CHECK(hce("--help", "> help.txt").code == 0);
   CHECK(text(read_file("help.txt")).find("Exit status") != std::string::npos);

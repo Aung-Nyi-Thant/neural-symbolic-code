@@ -128,6 +128,11 @@ hc::u8 check_level(int level) {
   return static_cast<hc::u8>(level);
 }
 
+hc::u32 check_profile(int profile) {
+  if (profile < 1 || profile > hce::kNeuralCMMaxProfile) throw py::value_error("profile must be 1 or 2");
+  return hce::kNeuralCMFamily | static_cast<hc::u32>(profile);
+}
+
 unsigned check_threads(int threads) {
   if (threads < 1 || threads > static_cast<int>(hce::kMaxThreads)) throw py::value_error("threads must be 1..256");
   return static_cast<unsigned>(threads);
@@ -245,7 +250,8 @@ struct Encoded {
   Vec data;
 };
 
-Encoded encode(const Vec& input, hc::u8 level, unsigned threads, bool structural, st::Language lang) {
+Encoded encode(const Vec& input, hc::u8 level, hc::u32 prior_id, unsigned threads, bool structural,
+               st::Language lang) {
   Encoded e;
   hce::MemoryInput in(input);
   hce::MemoryOutput out;
@@ -258,6 +264,7 @@ Encoded encode(const Vec& input, hc::u8 level, unsigned threads, bool structural
   } else {
     hce::EncodeOptions o;
     o.level = level;
+    o.prior_id = prior_id;
     o.threads = threads;
     o.content_size = input.size();  // as the CLI records a regular file's size
     e.framed = hce::encode_parallel<hce::NeuralCMCodec>(in, out, o);
@@ -325,8 +332,10 @@ void remove_quietly(const fs::path& p) noexcept {
 
 // ------------------------------------------------------- module functions ---
 
-py::bytes py_compress(const py::buffer& data, int level, int threads, bool structural, const std::string& language) {
+py::bytes py_compress(const py::buffer& data, int level, int profile, int threads, bool structural,
+                      const std::string& language) {
   const hc::u8 lvl = check_level(level);
+  const hc::u32 prior = check_profile(profile);
   const unsigned t = check_threads(threads);
   if (language == "auto") throw py::value_error("language 'auto' needs a file name: use compress_file(), or name the language");
   const st::Language lang = check_language(language);
@@ -334,7 +343,7 @@ py::bytes py_compress(const py::buffer& data, int level, int threads, bool struc
   Encoded e;
   {
     py::gil_scoped_release nogil;
-    e = encode(input, lvl, t, structural, lang);
+    e = encode(input, lvl, prior, t, structural, lang);
   }
   if (structural && e.structural.status != Errc::ok)
     raise_errc(e.structural.status, "compress", e.structural.stage, e.structural.sys_error);
@@ -377,9 +386,10 @@ py::dict py_verify(const py::buffer& data, int threads, u64 max_memory) {
   return check_decoded(d, "verify");
 }
 
-py::dict py_compress_file(const fs::path& source, const fs::path& dest, int level, int threads, bool structural,
-                          const std::string& language) {
+py::dict py_compress_file(const fs::path& source, const fs::path& dest, int level, int profile, int threads,
+                          bool structural, const std::string& language) {
   const hc::u8 lvl = check_level(level);
+  const hc::u32 prior = check_profile(profile);
   const unsigned t = check_threads(threads);
   const st::Language lang = file_language(language, source);
   if (structural) {
@@ -412,6 +422,7 @@ py::dict py_compress_file(const fs::path& source, const fs::path& dest, int leve
     } else {
       hce::EncodeOptions o;
       o.level = lvl;
+      o.prior_id = prior;
       o.threads = t;
       o.content_size = in->size();
       r = hce::encode_parallel<hce::NeuralCMCodec>(*in, *out, o);
@@ -506,6 +517,8 @@ py::dict py_info() {
   py::dict d;
   d["version"] = HCE_VERSION;
   d["neural_cm_codec_id"] = hce::kNeuralCMCodecId;
+  d["neural_cm_codec_ids"] = py::make_tuple(hce::kNeuralCMCodecId, hce::kNeuralCMCodecId2);
+  d["max_profile"] = static_cast<int>(hce::kNeuralCMMaxProfile);
   d["structural_codec_id"] = hce::kStructuralCMCodecId;
   d["max_level"] = static_cast<int>(hce::kNeuralCMMaxLevel);
   d["simd_path"] = hce::NeuralCMCodec::simd_path();
@@ -536,14 +549,16 @@ PYBIND11_MODULE(_hce, m) {
   m.attr("__version__") = HCE_VERSION;
   m.attr("DEFAULT_MAX_MEMORY") = kDefaultMaxMemory;
 
-  m.def("compress", &py_compress, py::arg("data"), py::kw_only(), py::arg("level") = 2, py::arg("threads") = 1,
+  m.def("compress", &py_compress, py::arg("data"), py::kw_only(), py::arg("level") = 2,
+        py::arg("profile") = static_cast<int>(hce::kNeuralCMProfile2), py::arg("threads") = 1,
         py::arg("structural") = false, py::arg("language") = "generic");
   m.def("decompress", &py_decompress, py::arg("data"), py::kw_only(), py::arg("threads") = 1,
         py::arg("max_memory") = kDefaultMaxMemory, py::arg("max_output") = py::none());
   m.def("verify", &py_verify, py::arg("data"), py::kw_only(), py::arg("threads") = 1,
         py::arg("max_memory") = kDefaultMaxMemory);
   m.def("compress_file", &py_compress_file, py::arg("source"), py::arg("dest"), py::kw_only(), py::arg("level") = 2,
-        py::arg("threads") = 1, py::arg("structural") = false, py::arg("language") = "auto");
+        py::arg("profile") = static_cast<int>(hce::kNeuralCMProfile2), py::arg("threads") = 1,
+        py::arg("structural") = false, py::arg("language") = "auto");
   m.def("decompress_file", &py_decompress_file, py::arg("source"), py::arg("dest"), py::kw_only(),
         py::arg("threads") = 1, py::arg("max_memory") = kDefaultMaxMemory);
   m.def("detect_format", &py_detect_format, py::arg("data"));

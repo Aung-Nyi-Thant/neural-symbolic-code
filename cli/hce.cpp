@@ -48,7 +48,7 @@ using hce::cli::FdOutput;
 using hce::cli::OutputFile;
 namespace st = hce::structural;
 
-constexpr std::string_view kVersion = "2.1.0";
+constexpr std::string_view kVersion = "2.2.0";
 
 enum Exit : int { kSuccess = 0, kUsageOrIo = 1, kCorrupt = 2, kDataLoss = 3, kLimit = 4, kUnsupported = 5 };
 
@@ -76,7 +76,10 @@ Input and output:
 
 Compression:
   -l, --level N           effort 0..4 (default 2); model memory per thread
-                          21M, 38M, 40M, 76M, 149M; decoding needs the same
+                          21M, 38M, 40M, 76M, 149M with --codec-profile 1,
+                          20M, 37M, 41M, 76M, 149M with 2; decoding needs the same
+      --codec-profile N   byte codec profile: 2 (default) is about 5% smaller,
+                          1 is faster and what hce 2.0 and 2.1 write
       --window SIZE       history window, power of two 64K..1G (default 8M)
       --block SIZE        block size, power of two 1K..8M (default 256K)
       --frame SIZE        frame length / sync interval, block..1G (default 8M)
@@ -139,6 +142,8 @@ struct Options {
   std::optional<std::string> spool_dir;
   // Compression.
   hc::u8 level = 2, window_log = 23, block_log = 18;
+  hc::u8 codec_profile = hce::kNeuralCMProfile2;
+  bool codec_profile_given = false;
   u64 frame_bytes = u64{8} << 20;
   unsigned threads = 0;  // 0: one per hardware thread
   std::optional<u64> expect_size;
@@ -259,6 +264,12 @@ Options parse(int argc, char** argv) {
       const auto n = parse_uint(v);
       if (!n || *n > 4) bad_value(a, v, "0..4");
       o.level = static_cast<hc::u8>(*n);
+    } else if (a == "--codec-profile") {
+      const std::string_view v = value();
+      const auto n = parse_uint(v);
+      if (!n || *n < 1 || *n > hce::kNeuralCMMaxProfile) bad_value(a, v, "1 or 2");
+      o.codec_profile = static_cast<hc::u8>(*n);
+      o.codec_profile_given = true;
     } else if (a == "--window") {
       o.window_log = parse_log2(a, value(), hc::kMinWindowLog, hc::kMaxWindowLog);
       layout_given = true;
@@ -340,6 +351,8 @@ Options parse(int argc, char** argv) {
   if (o.keep_partial && (!o.output || *o.output == "-")) throw UsageError("--keep-partial needs -o FILE");
   if (o.report && o.output && *o.report == *o.output) throw UsageError("--report and -o name the same file");
   if (!o.structural && (lang_given || o.spool_dir)) throw UsageError("--lang and --spool-dir need --structural");
+  if (o.codec_profile_given && (decoding || o.structural))
+    throw UsageError("--codec-profile applies to byte-codec compression only; -d and -t read it from the stream");
   if (o.structural && decoding && (lang_given || o.spool_dir))
     throw UsageError("--lang and --spool-dir apply to compression only");
   if (o.structural && !decoding && (layout_given || !o.record_size))
@@ -609,6 +622,7 @@ Outcome run_compress(const Options& o, const Input& in, const std::string& out_n
                      std::stop_token stop, Telemetry& t) {
   hce::EncodeOptions eo;
   eo.level = o.level;
+  eo.prior_id = hce::kNeuralCMFamily | o.codec_profile;
   eo.window_log = o.window_log;
   eo.block_log = o.block_log;
   eo.frame_bytes = o.frame_bytes;
@@ -625,6 +639,7 @@ Outcome run_compress(const Options& o, const Input& in, const std::string& out_n
 
   const hce::EncodeResult r = hce::encode_parallel<hce::NeuralCMCodec>(io.in, io.out, eo);
   t.add("mode", "compress");
+  t.add("codec_profile", o.codec_profile);
   t.add("status", hc::to_string(r.status));
   t.add("in_bytes", r.bytes_in);
   t.add("out_bytes", r.bytes_out);
@@ -641,7 +656,7 @@ Outcome run_compress(const Options& o, const Input& in, const std::string& out_n
       Outcome ok;
       ok.raw_bytes = r.bytes_in;
       ok.packed_bytes = r.bytes_out;
-      ok.detail = "byte codec, level " + num(o.level) + ", " + num(r.threads) + (r.threads == 1 ? " thread" : " threads");
+      ok.detail = "byte codec, profile " + num(o.codec_profile) + ", level " + num(o.level) + ", " + num(r.threads) + (r.threads == 1 ? " thread" : " threads");
       return ok;
     }
     case Errc::content_mismatch:
@@ -929,9 +944,10 @@ int run(int argc, char** argv) {
     return kSuccess;
   }
   if (o.version) {
-    std::printf("hce %.*s (container v3 FRAMED, neural CM codec 0x%08X, structural codec 0x%08X, levels 0-%u, "
-                "%s kernels, %s aio)\n",
-                static_cast<int>(kVersion.size()), kVersion.data(), hce::kNeuralCMCodecId, hce::kStructuralCMCodecId,
+    std::printf("hce %.*s (container v3 FRAMED, neural CM codec 0x%08X and 0x%08X, structural codec 0x%08X, "
+                "levels 0-%u, %s kernels, %s aio)\n",
+                static_cast<int>(kVersion.size()), kVersion.data(), hce::kNeuralCMCodecId, hce::kNeuralCMCodecId2,
+                hce::kStructuralCMCodecId,
                 static_cast<unsigned>(hce::kNeuralCMMaxLevel), hce::NeuralCMCodec::simd_path(),
                 hce::aio::to_string(hce::aio::resolve(hce::aio::Backend::automatic)));
     return kSuccess;

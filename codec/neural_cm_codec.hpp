@@ -4,7 +4,9 @@
 // and a long-range match model) predict every bit; a two-layer integer neural
 // mixer combines their logits; two adaptive probability maps refine the
 // result; an exact binary arithmetic coder codes it. During long matches the
-// coder switches to one decision per byte. All arithmetic is integer with
+// coder switches to one decision per byte. Profile 2 adds indirect, order-5
+// and order-8, word-pair and structure (JSON, XML, code) experts, a second,
+// longer match model and a wider mixer (ncm_model2.hpp). All arithmetic is integer with
 // fixed tables (R14), the SIMD kernels are bit-exact (R15), every table lives
 // in the arena the caller provides (R21) and resets completely at each frame
 // (R20), at a cost proportional to what the frame touched (R19).
@@ -22,12 +24,22 @@ namespace hce {
 namespace ncm {
 struct CMModel;
 class Pipe;
+namespace p2 {
+struct CMModel2;
+}
 }  // namespace ncm
 
-// StreamParams::prior_id = family | profile. Profile 1: text, logs and mixed data.
+// StreamParams::prior_id = family | profile. Profile 1: text, logs and mixed
+// data, frozen since 2.0 (R17). Profile 2: the same data, about 5% smaller at
+// a cost in speed (2.2). Both decode everywhere; codec_id() stays profile 1,
+// so streams written by the library are unchanged unless a caller opts in
+// through EncodeOptions::prior_id (the CLI and the Python package do).
 inline constexpr hc::u32 kNeuralCMFamily = 0x4E434D00u;  // "NCM"
 inline constexpr hc::u8 kNeuralCMProfile = 1;
+inline constexpr hc::u8 kNeuralCMProfile2 = 2;
+inline constexpr hc::u8 kNeuralCMMaxProfile = kNeuralCMProfile2;
 inline constexpr hc::u32 kNeuralCMCodecId = kNeuralCMFamily | kNeuralCMProfile;
+inline constexpr hc::u32 kNeuralCMCodecId2 = kNeuralCMFamily | kNeuralCMProfile2;
 inline constexpr hc::u8 kNeuralCMMaxLevel = 4;
 
 class NeuralCMCodec {
@@ -45,8 +57,12 @@ class NeuralCMCodec {
   static hc::u32 codec_id() noexcept { return kNeuralCMCodecId; }
   // Codec family, profile and level; checked before anything is allocated.
   static hc::Errc accepts(const hc::StreamParams& p) noexcept;
-  // Exact arena size for these parameters: tables, model state, alignment slack.
+  // Exact arena size for these parameters: tables, model state, alignment
+  // slack. A prior_id of no known profile (a decoder sizing its workers
+  // before it has read a header) gets the largest profile's size.
   static hc::u64 memory_required(const hc::StreamParams& p) noexcept;
+  // The profile a bound or constructed codec runs: 1, 2, or 0 for none.
+  int profile() const noexcept { return m_ ? 1 : m2_ ? 2 : 0; }
 
   // ---- decoding: hc::BlockCodec ----
   hc::Errc bind(const hc::StreamParams& p, hc::MutBytes arena) noexcept;
@@ -78,7 +94,9 @@ class NeuralCMCodec {
  private:
   void replay() noexcept;
 
-  ncm::CMModel* m_ = nullptr;            // placement-constructed inside the arena
+  // Placement-constructed inside the arena: at most one of them is set.
+  ncm::CMModel* m_ = nullptr;        // profile 1
+  ncm::p2::CMModel2* m2_ = nullptr;  // profile 2
   hc::ArenaPtr owned_;                   // encoder role: the arena it owns
   std::unique_ptr<ncm::Pipe> pipe_;      // encoder role, set_pipeline(true): the helper
   bool pipeline_ = false;

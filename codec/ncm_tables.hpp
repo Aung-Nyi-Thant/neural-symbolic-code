@@ -99,6 +99,18 @@ constexpr std::uint16_t node_next(std::uint16_t v, int y) noexcept {
   return static_cast<std::uint16_t>(((pn ^ 0x800) << 4) | (n + (n < 15)));
 }
 extern const std::array<std::uint16_t, 2 * 65536> kNodeNext;
+// Profile 2's rule: the same counters, but the rate stops falling at
+// kRate[7] (1/6.5), so contexts keep tracking nonstationary data; the count
+// still runs to 15, for the confidence the mixer and the replacement read.
+inline constexpr int kNode2RateCap = 7;
+constexpr std::uint16_t node_next2(std::uint16_t v, int y) noexcept {
+  const int p = (v >> 4) ^ 0x800;
+  const int n = v & 15;
+  const int ty = (y << 12) - y;
+  const int pn = p + (((ty - p) * kRate[static_cast<std::size_t>(std::min(n, kNode2RateCap))] + (1 << 15)) >> 16);
+  return static_cast<std::uint16_t>(((pn ^ 0x800) << 4) | (n + (n < 15)));
+}
+extern const std::array<std::uint16_t, 2 * 65536> kNodeNext2;
 // The logit (Q8) of a counter state: stretch12 of its probability.
 constexpr int node_stretch(std::uint16_t v) noexcept { return kStretch[static_cast<std::size_t>((v >> 4) ^ 0x800)]; }
 

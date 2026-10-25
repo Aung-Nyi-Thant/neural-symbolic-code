@@ -379,8 +379,14 @@ EncodeResult encode_parallel(InputStream& in, OutputStream& out, const EncodeOpt
   p.level = opt.level;
   p.window_log = opt.window_log;
   p.block_log = opt.block_log;
-  p.prior_id = Enc::codec_id();
+  p.prior_id = opt.prior_id ? opt.prior_id : Enc::codec_id();
   p.content_size = opt.content_size;
+  if constexpr (requires { Enc::accepts(p); }) {
+    if (Enc::accepts(p) != Errc::ok) {
+      r.status = Errc::unsupported_feature;
+      return r;
+    }
+  }
   const Plan plan = make_plan<Enc>(opt, p);
   r.memory_bound = plan.memory;
   r.threads = plan.threads;

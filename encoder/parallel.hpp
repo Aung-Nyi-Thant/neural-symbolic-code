@@ -29,6 +29,9 @@ inline constexpr hc::u64 kMaxFrameBytes = hc::u64{1} << 30;
 
 struct EncodeOptions {
   hc::u8 level = 2;
+  // StreamParams::prior_id to write; 0 means Enc::codec_id(). Selects a codec
+  // profile (kNeuralCMCodecId2, say); rejected unless Enc accepts it.
+  hc::u32 prior_id = 0;
   hc::u8 window_log = 23;                     // 8 MiB history
   hc::u8 block_log = 18;                      // 256 KiB blocks
   hc::u64 frame_bytes = hc::u64{8} << 20;     // sync interval: the unit of parallelism and recovery
