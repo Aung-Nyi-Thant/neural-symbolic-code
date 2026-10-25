@@ -85,6 +85,23 @@ consteval std::array<std::int32_t, 1024> make_rates() {
 }
 inline constexpr std::array<std::int32_t, 1024> kRate = make_rates();
 
+// Bit-history counters (a 12-bit probability over a 4-bit count, the
+// probability stored XOR 0x800 so that zero is p = 0.5, n = 0): the state
+// after observing bit y in state v, by the update rule of both codecs:
+//   p' = p + (((4095 y - p) * kRate[n] + 2^15) >> 16),  n' = min(n + 1, 15).
+// node_next() is the rule itself; kNodeNext[(y << 16) | v] holds it for every
+// state, so an update is one load (ncm_tables.cpp, checked against the rule).
+constexpr std::uint16_t node_next(std::uint16_t v, int y) noexcept {
+  const int p = (v >> 4) ^ 0x800;
+  const int n = v & 15;
+  const int ty = (y << 12) - y;
+  const int pn = p + (((ty - p) * kRate[static_cast<std::size_t>(n)] + (1 << 15)) >> 16);
+  return static_cast<std::uint16_t>(((pn ^ 0x800) << 4) | (n + (n < 15)));
+}
+extern const std::array<std::uint16_t, 2 * 65536> kNodeNext;
+// The logit (Q8) of a counter state: stretch12 of its probability.
+constexpr int node_stretch(std::uint16_t v) noexcept { return kStretch[static_cast<std::size_t>((v >> 4) ^ 0x800)]; }
+
 static_assert(squash(0) == 32768 && squash(-3072) == 0 && squash(3071) == 65536);
 static_assert(squash16(0) == 32768 && squash16(-3072) == 0 && squash16(3071) == 65535);
 static_assert(stretch16(32768) >= 0 && stretch16(32767) <= 0);
