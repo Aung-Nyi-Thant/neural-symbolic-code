@@ -199,6 +199,53 @@ static void test_roundtrips() {
   CHECK(t.code == 0 && t.err.find("\"verified\":1") != std::string::npos && t.err.find("\"exit\":0") != std::string::npos);
 }
 
+static void test_structural_mode() {
+  // Source code with an extension the language detection knows.
+  std::string py;
+  for (int i = 0; i < 400; ++i)
+    py += "def handler_" + std::to_string(i % 37) + "(request, retries=" + std::to_string(i % 5) +
+          "):\n    if request.ok:\n        return request.json()\n    raise ValueError(\"bad request\")\n\n";
+  write_file("code.py", Vec(reinterpret_cast<const std::byte*>(py.data()), reinterpret_cast<const std::byte*>(py.data()) + py.size()));
+
+  // Compress, then -d and -t recognize the archive by its first bytes.
+  Run c = hce("--structural -T 2 -i code.py -o code.hcs --stats=json");
+  CHECK(c.code == 0 && c.err.find("\"codec\":\"structural\"") != std::string::npos);
+  CHECK(c.err.find("\"language\":\"python\"") != std::string::npos);
+  CHECK(read_file("code.hcs").size() < py.size() / 3);
+  CHECK(hce("-d -i code.hcs -o code.out").code == 0 && text(read_file("code.out")) == py);
+  const Run t = hce("-t -i code.hcs --stats=json");
+  CHECK(t.code == 0 && t.err.find("\"verified\":1") != std::string::npos && t.err.find("\"language\":\"python\"") != std::string::npos);
+
+  // -v: one readable line with the ratio, time and speed.
+  const Run v = hce("-d -v -f -i code.hcs -o code.out");
+  CHECK(v.code == 0 && v.err.find("% of the original") != std::string::npos && v.err.find("MB/s") != std::string::npos &&
+        v.err.find("verified") != std::string::npos);
+  const Run vb = hce("-v -i data.log -o data_v.hce");
+  CHECK(vb.code == 0 && vb.err.find("byte codec") != std::string::npos && vb.err.find("MB/s") != std::string::npos);
+
+  // An explicit language, and pipes at both ends.
+  CHECK(hce("--structural --lang=cpp -i code.py -o code_cpp.hcs --stats=json").err.find("\"language\":\"cpp\"") != std::string::npos);
+  CHECK(shell("cat code.py | " + hce_cmd() + " --structural 2>/dev/null | " + hce_cmd() + " -d 2>/dev/null | cmp -s - code.py") == 0);
+  CHECK(shell(hce_cmd() + " --structural -i data.log 2>/dev/null | " + hce_cmd() + " -d 2>/dev/null | cmp -s - data.log") == 0);
+
+  // Misuse, damage and wrong formats.
+  for (const char* args : {"--lang=cpp -i code.py -o a.hce", "--spool-dir . -i code.py -o a.hce",
+                           "--structural --window 1M -i code.py -o a.hcs", "--structural --lang=cobol -i code.py -o a.hcs",
+                           "--structural --no-content-size -i code.py -o a.hcs", "-d --structural --lang=py -i code.hcs -o a.out"})
+    CHECK(hce(args).code == 1);
+  CHECK(hce("-d --recovery skip -i code.hcs -o r.out").code == 1 && !exists("r.out"));
+  CHECK(hce("-d --structural -i data.hce -o s.out").code == 2 && !exists("s.out"));
+  Vec bad = read_file("code.hcs");
+  bad[bad.size() - bad.size() / 3] ^= std::byte{0x08};
+  write_file("bad.hcs", bad);
+  CHECK(hce("-d -i bad.hcs -o bad.out").code == 2 && !exists("bad.out"));
+  Vec cut = read_file("code.hcs");
+  cut.resize(cut.size() / 2);
+  write_file("cut.hcs", cut);
+  CHECK(hce("-t -i cut.hcs").code == 2);
+  CHECK(!temp_files_left());  // no spool and no temporary output left behind
+}
+
 static void test_files_and_sizes() {
   const Vec before = read_file("data.hce");
   CHECK(hce("-i data.log -o data.hce").code == 1);  // exists
@@ -228,6 +275,7 @@ static void test_usage_errors() {
   CHECK(text(read_file("help.txt")).find("Exit status") != std::string::npos);
   CHECK(hce("--version", "> version.txt").code == 0);
   CHECK(text(read_file("version.txt")).find("neural CM codec 0x4E434D01") != std::string::npos);
+  CHECK(text(read_file("version.txt")).find("structural codec 0x53434D01") != std::string::npos);
 }
 
 static void test_corruption_and_recovery() {
@@ -361,6 +409,7 @@ int main(int argc, char** argv) {
   g_dir = tmpl;
 
   test_roundtrips();
+  test_structural_mode();
   test_files_and_sizes();
   test_usage_errors();
   test_corruption_and_recovery();

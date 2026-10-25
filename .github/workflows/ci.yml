@@ -1,0 +1,287 @@
+# Continuous integration for HCE.
+#
+# Every push and pull request builds the engine with -Werror and runs every
+# test suite on:
+#   linux        GCC and Clang release builds; ASan+UBSan and TSan under both compilers
+#   aarch64      a cross build run under QEMU user mode (NEON kernels)
+#   mingw-wine   a MinGW-w64 cross build for Windows, run under Wine
+#   benchmark    tools/benchmark.py on three source-code corpora: a smoke test of
+#                the CLI and the script, with the tables in the job summary
+#   python       the hce package on the oldest and newest supported Pythons: an
+#                sdist, a wheel built from it with -Werror, the pytest suite
+#                against the installed wheel and its hce command
+#   conda        environment.yml as written: the CMake/CTest path (python
+#                preset) and an editable install, each running the pytest suite
+#
+# Each C++ job is a CMake preset (CMakePresets.json), so every run reproduces
+# locally with: cmake --preset P && cmake --build --preset P && ctest --preset P.
+# The Python jobs install only the exact versions in constraints.txt and
+# environment.yml; README, "Python package", has the same steps.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+  CTEST_PARALLEL_LEVEL: "1"  # the suites spawn their own worker threads
+
+jobs:
+  linux:
+    name: linux (${{ matrix.preset }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [release, clang-release, gcc-asan, clang-asan, gcc-tsan, clang-tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build clang liburing-dev pkg-config
+
+      # The runners randomize mmap with 32 bits; the sanitizers' shadow memory
+      # layouts need at most 28 ("ThreadSanitizer: unexpected memory mapping").
+      - name: Limit address-space randomization for the sanitizers
+        if: contains(matrix.preset, 'san')
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Describe the runner
+        run: |
+          uname -a
+          ulimit -a
+          for k in io_uring_disabled io_uring_group; do
+            [ -r /proc/sys/kernel/$k ] && echo "kernel.$k = $(cat /proc/sys/kernel/$k)"
+          done
+          true
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DHCE_AIO_URING=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+      - name: Keep the test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.preset }}
+          path: build/${{ matrix.preset }}/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  aarch64:
+    name: aarch64 (QEMU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the cross toolchain and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++-aarch64-linux-gnu qemu-user
+
+      - name: Configure
+        run: cmake --preset aarch64-qemu
+
+      - name: Build
+        run: cmake --build --preset aarch64-qemu
+
+      - name: Test under qemu-aarch64
+        run: ctest --preset aarch64-qemu
+
+      - name: Keep the test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-aarch64-qemu
+          path: build/aarch64-qemu/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  mingw-wine:
+    name: windows (MinGW-w64 + Wine)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      WINEDEBUG: "-all"
+      WINEDLLOVERRIDES: "mscoree,mshtml="  # no Mono or Gecko install prompts in a headless prefix
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 and Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++-mingw-w64-x86-64-posix wine64
+
+      - name: Create the Wine prefix
+        run: timeout 300 /usr/lib/wine/wine64 wineboot --init
+
+      - name: Configure
+        run: cmake --preset mingw-wine
+
+      - name: Build
+        run: cmake --build --preset mingw-wine
+
+      - name: Test under Wine
+        run: ctest --preset mingw-wine
+
+      - name: Keep the test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-mingw-wine
+          path: build/mingw-wine/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  benchmark:
+    name: benchmark (smoke)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain and the baselines
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build liburing-dev pkg-config zstd xz-utils
+
+      - name: Build hce
+        run: |
+          cmake --preset release -DHCE_AIO_URING=ON -DHCE_BUILD_TESTS=OFF
+          cmake --build --preset release --target hce
+
+      - name: Lint the script
+        run: |
+          python3 -m py_compile tools/benchmark.py
+          python3 tools/benchmark.py --help > /dev/null
+
+      # Shared runners are noisy: the speeds are indicative, the sizes exact.
+      # Every result is decompressed and compared; a mismatch fails the job.
+      - name: Run the benchmark
+        run: python3 tools/benchmark.py --threads "$(nproc)" --md benchmark.md --csv benchmark.csv
+
+      - name: Publish the tables
+        if: always()
+        run: |
+          if [ -f benchmark.md ]; then cat benchmark.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark
+          path: |
+            benchmark.md
+            benchmark.csv
+          if-no-files-found: ignore
+
+  python:
+    name: python ${{ matrix.python }} (sdist, wheel, pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    env:
+      PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt  # also pins the isolated build environment
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build liburing-dev pkg-config
+
+      - name: Install the pinned build front end
+        run: python -m pip install build==1.2.2
+
+      # The sdist is built first and the wheel from it, so a file missing from
+      # the sdist fails here rather than for a user.
+      - name: Build the sdist and the wheel
+        run: >-
+          python -m build --outdir dist
+          -C cmake.define.HCE_WERROR=ON -C cmake.define.HCE_AIO_URING=ON
+
+      - name: Install the wheel with the test and lint tools
+        run: python -m pip install "$(ls dist/hce-*.whl)[dev]"
+
+      - name: Lint the Python sources
+        run: python -m pyflakes python/hce tests/python tools
+
+      - name: Check the golden vectors (R17)
+        run: python tests/python/golden/regenerate.py --check
+
+      # The checkout has no importable hce at its root (the sources are under
+      # python/), so the tests import the installed wheel and run its hce command.
+      - name: Run the test suite
+        run: |
+          python -c "import hce, sys; print(hce.__file__); sys.exit('site-packages' not in hce.__file__)"
+          hce --version
+          python -m pytest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-python${{ matrix.python }}
+          path: dist/
+          if-no-files-found: error
+
+  conda:
+    name: conda (environment.yml, CMake + pytest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash -el {0}  # a login shell activates the environment
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          cache-environment: true
+
+      - name: Describe the environment
+        run: |
+          micromamba list
+          "$CXX" --version
+
+      - name: Configure, build and test with CMake (python preset)
+        run: |
+          cmake --preset python -DHCE_WERROR=ON -DHCE_AIO_URING=ON
+          cmake --build --preset python
+          ctest --preset python
+
+      - name: Editable install and the test suite
+        run: |
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pytest
+
+      - name: Keep the test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-conda
+          path: build/python/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

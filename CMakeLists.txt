@@ -19,6 +19,14 @@ option(HCE_BUILD_TESTS "Build the test suites" ON)
 # the compiler's own auto-vectorization of the scalar parts.
 option(HCE_NATIVE "Tune for the build machine (-march=native); the binary may not run elsewhere" OFF)
 set(HCE_SANITIZE "" CACHE STRING "Sanitizers to build with: address,undefined | thread | empty")
+# The Python package: the extension module hce._hce (bindings/) and the hce
+# package around it (python/hce). pip builds it through scikit-build-core
+# (pyproject.toml); -DHCE_BUILD_PYTHON=ON builds it here and stages an
+# importable package in <build>/python, which the python test runs against.
+option(HCE_BUILD_PYTHON "Build the Python extension module (needs pybind11 >= 2.13)" OFF)
+if(HCE_BUILD_PYTHON)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)  # the static libraries end up inside a shared module
+endif()
 
 find_package(Threads REQUIRED)
 
@@ -107,12 +115,48 @@ message(STATUS "hce_aio backends: ${HCE_AIO_BACKENDS}")
 add_library(hce_structural STATIC structural/archive.cpp)
 target_link_libraries(hce_structural PUBLIC hce_pipeline hce_aio PRIVATE hce_warnings)
 
-# Command-line tool (POSIX).
-add_executable(hce cli/hce.cpp)
-target_link_libraries(hce PRIVATE hce_pipeline hce_warnings)
+# Command-line tool (POSIX: file descriptors, signals, atomic renames). Windows
+# builds (mingw-wine preset) cover the libraries and their suites.
+if(NOT WIN32)
+  add_executable(hce cli/hce.cpp)
+  target_link_libraries(hce PRIVATE hce_pipeline hce_structural hce_warnings)
 
-include(GNUInstallDirs)
-install(TARGETS hce RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  if(SKBUILD)  # pip install: the tool lands in the environment's bin/ next to python
+    install(TARGETS hce RUNTIME DESTINATION "${SKBUILD_SCRIPTS_DIR}")
+  else()
+    include(GNUInstallDirs)
+    install(TARGETS hce RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
+endif()
+
+if(HCE_BUILD_PYTHON)
+  find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
+  find_package(pybind11 2.13 CONFIG QUIET)
+  if(NOT pybind11_FOUND)  # installed by pip: ask it where its CMake files are
+    execute_process(COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
+                    OUTPUT_VARIABLE HCE_PYBIND11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+                    RESULT_VARIABLE HCE_PYBIND11_RC ERROR_QUIET)
+    if(NOT HCE_PYBIND11_RC EQUAL 0)
+      message(FATAL_ERROR "HCE_BUILD_PYTHON=ON needs pybind11 >= 2.13: pip install pybind11==2.13.6")
+    endif()
+    find_package(pybind11 2.13 CONFIG REQUIRED PATHS "${HCE_PYBIND11_DIR}" NO_DEFAULT_PATH)
+  endif()
+
+  pybind11_add_module(hce_python MODULE NO_EXTRAS bindings/hce_python.cpp)  # no LTO: the engine libraries are not LTO objects
+  set_target_properties(hce_python PROPERTIES
+    OUTPUT_NAME _hce
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/hce")
+  target_link_libraries(hce_python PRIVATE hce_structural hce_warnings)
+  target_compile_definitions(hce_python PRIVATE HCE_VERSION="${PROJECT_VERSION}")
+  # The pure-Python files beside the module: PYTHONPATH=<build>/python imports the package.
+  file(GLOB HCE_PYTHON_FILES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/python/hce/*")
+  add_custom_command(TARGET hce_python POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${HCE_PYTHON_FILES} "$<TARGET_FILE_DIR:hce_python>"
+    VERBATIM)
+  if(SKBUILD)
+    install(TARGETS hce_python LIBRARY DESTINATION hce)
+  endif()
+endif()
 
 if(HCE_BUILD_TESTS)
   enable_testing()
@@ -129,9 +173,13 @@ if(HCE_BUILD_TESTS)
   target_link_libraries(test_pipeline PRIVATE hce_pipeline hce_warnings)
   add_test(NAME pipeline COMMAND test_pipeline)
 
-  add_executable(test_cli tests/test_cli.cpp)
-  target_link_libraries(test_cli PRIVATE hce_core hce_warnings)
-  add_test(NAME cli COMMAND test_cli $<TARGET_FILE:hce>)
+  set(HCE_TESTS framing codec pipeline aio structural)
+  if(TARGET hce)
+    add_executable(test_cli tests/test_cli.cpp)
+    target_link_libraries(test_cli PRIVATE hce_core hce_warnings)
+    add_test(NAME cli COMMAND test_cli $<TARGET_FILE:hce>)
+    list(APPEND HCE_TESTS cli)
+  endif()
 
   add_executable(test_aio tests/test_aio.cpp)
   target_link_libraries(test_aio PRIVATE hce_aio hce_pipeline hce_warnings)
@@ -139,7 +187,13 @@ if(HCE_BUILD_TESTS)
 
   add_executable(test_structural tests/test_structural.cpp)
   target_link_libraries(test_structural PRIVATE hce_structural hce_warnings)
-  target_compile_definitions(test_structural PRIVATE HCE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  # The suite reads this repository's sources as a corpus. Under Wine, drive Z: is the host's root.
+  if(WIN32 AND CMAKE_CROSSCOMPILING)
+    set(HCE_CORPUS_DIR "Z:${PROJECT_SOURCE_DIR}")
+  else()
+    set(HCE_CORPUS_DIR "${PROJECT_SOURCE_DIR}")
+  endif()
+  target_compile_definitions(test_structural PRIVATE HCE_SOURCE_DIR="${HCE_CORPUS_DIR}")
   add_test(NAME structural COMMAND test_structural)
 
   # Sanitizer failures get exit codes of their own, so the CLI tests can never
@@ -151,10 +205,32 @@ if(HCE_BUILD_TESTS)
   if(HCE_SANITIZE MATCHES "thread")
     list(APPEND HCE_TEST_ENV "HCE_FUZZ_ITERS=24")  # every byte costs ~10x under TSan
   endif()
+  if(WIN32 AND CMAKE_CROSSCOMPILING)
+    list(APPEND HCE_TEST_ENV "WINEDEBUG=-all")  # Wine's own diagnostics would drown the test output
+  endif()
   if(CMAKE_CROSSCOMPILING_EMULATOR)
     # The CLI test runs hce itself; without binfmt_misc it needs the emulator spelled out.
     list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " HCE_WRAPPER)
     list(APPEND HCE_TEST_ENV "HCE_TEST_WRAPPER=${HCE_WRAPPER}")
   endif()
-  set_tests_properties(framing codec pipeline cli aio structural PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
+  set_tests_properties(${HCE_TESTS} PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
+
+  # The pytest suite (tests/python), against the staged package and the CLI.
+  if(HCE_BUILD_PYTHON)
+    execute_process(COMMAND "${Python_EXECUTABLE}" -c "import pytest, hypothesis"
+                    RESULT_VARIABLE HCE_PYTEST_RC OUTPUT_QUIET ERROR_QUIET)
+    if(HCE_PYTEST_RC EQUAL 0)
+      add_test(NAME python
+               COMMAND "${Python_EXECUTABLE}" -m pytest "${PROJECT_SOURCE_DIR}/tests/python" -p no:cacheprovider
+               WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+      set(HCE_PYTHON_ENV "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+      if(TARGET hce)
+        list(APPEND HCE_PYTHON_ENV "HCE_CLI=$<TARGET_FILE:hce>")
+      endif()
+      set_tests_properties(python PROPERTIES TIMEOUT 1800 ENVIRONMENT "${HCE_TEST_ENV};${HCE_PYTHON_ENV}")
+    else()
+      message(STATUS "pytest or hypothesis not importable: the python test is not registered "
+                     "(pip install -c constraints.txt -e .[test], or see README)")
+    endif()
+  endif()
 endif()

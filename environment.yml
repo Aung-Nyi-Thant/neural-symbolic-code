@@ -1,0 +1,35 @@
+# Conda development environment for HCE: compiler, build tools, liburing and
+# every Python package the build, tests and benchmarks use, pinned to exact
+# conda-forge versions (the same Python package versions as constraints.txt).
+#
+#   conda env create -f environment.yml     # or: mamba / micromamba create -f environment.yml
+#   conda activate hce
+#   python -m pip install --no-deps --no-build-isolation -e . # or a CMake build: README, "Python package"
+#   python -m pytest
+#
+# Linux x86-64 and aarch64. Updating: README, "Updating the pinned versions".
+name: hce
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # interpreter and toolchain
+  - python=3.12.15
+  - pip=24.2
+  - gxx_linux-64=13.4.0
+  - cmake=3.30.5
+  - ninja=1.12.1
+  - pkg-config=0.29.2
+  - liburing=2.15          # io_uring backend of aio/ (without it, the thread-pool backend)
+  # build backend and bindings
+  - scikit-build-core=0.10.7
+  - pybind11=2.13.6
+  # tests
+  - pytest=8.3.3
+  - pytest-timeout=2.3.1
+  - hypothesis=6.112.1
+  # development tools and the benchmark's reference codecs
+  - python-build=1.2.2.post1
+  - pyflakes=3.2.0
+  - zstd=1.5.7
+  - xz=5.8.3

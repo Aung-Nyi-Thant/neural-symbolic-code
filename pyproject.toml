@@ -1,0 +1,88 @@
+# Python packaging for HCE: the hce package (python/hce) around the compiled
+# engine module hce._hce (bindings/hce_python.cpp), built by CMake through
+# scikit-build-core. A wheel also installs the hce command-line tool.
+#
+# Every Python dependency is pinned to an exact version here or, for
+# transitive ones, in constraints.txt. Reproducible install (see README):
+#   PIP_CONSTRAINT=constraints.txt python -m pip install ".[test]"
+#   python -m pytest
+
+[build-system]
+requires = ["scikit-build-core==0.10.7", "pybind11==2.13.6"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "hce"
+version = "2.1.0"  # must match project(VERSION) in CMakeLists.txt: tests/python/test_api.py checks it
+description = "Lossless neuro-symbolic hybrid compression: neural context mixing in a hardened, parallel container"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Aung Nyi Nyi Thant" }]
+keywords = ["compression", "context-mixing", "lossless", "source-code", "io_uring"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Archiving :: Compression",
+  "Typing :: Typed",
+]
+dependencies = []  # the package needs nothing beyond the standard library at run time
+
+[project.optional-dependencies]
+test = [
+  "pytest==8.3.3",
+  "pytest-timeout==2.3.1",
+  "hypothesis==6.112.1",
+]
+dev = [
+  "hce[test]",
+  "build==1.2.2",
+  "pyflakes==3.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Aung-Nyi-Thant/neural-symbolic-code"
+Source = "https://github.com/Aung-Nyi-Thant/neural-symbolic-code"
+Issues = "https://github.com/Aung-Nyi-Thant/neural-symbolic-code/issues"
+
+# ------------------------------------------------------------------- build ---
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.25"           # the system's when new enough, else the pinned PyPI wheel
+ninja.version = ">=1.11"
+cmake.build-type = "Release"
+build-dir = "build/wheel/{wheel_tag}"
+wheel.packages = ["python/hce"]
+wheel.license-files = ["LICENSE"]
+# The sdist takes the tracked sources: .gitignore'd paths are left out, and so are these.
+sdist.exclude = ["build/", "dist/", ".venv/", "venv/", ".github/", "**/__pycache__/", ".hypothesis/"]
+
+[tool.scikit-build.cmake.define]
+HCE_BUILD_PYTHON = "ON"
+HCE_BUILD_TESTS = "OFF"
+# Distributors build with compilers newer than CI's; CI passes HCE_WERROR=ON.
+HCE_WERROR = "OFF"
+
+# ------------------------------------------------------------------- tests ---
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests/python"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+filterwarnings = ["error"]
+timeout = 600
+markers = [
+  "cli: needs the hce command-line tool (HCE_CLI, build/release/hce, or PATH); skipped without it",
+  "slow: larger inputs; deselect with -m 'not slow'",
+]

@@ -5,7 +5,7 @@
 // at kMaxTokenBytes:
 //   STRUCTURE    "\n", "\r\n", ( ) [ ] { } , ;
 //   INDENTATION  runs of spaces, tabs, \f, \v and lone \r
-//   KEYWORD      identifier-shaped words in kKeywords (C, C++, Python, JS/TS, Rust, Go, Java)
+//   KEYWORD      identifier-shaped words in the language's keyword table
 //   IDENTIFIER   [A-Za-z_\x80-\xFF][A-Za-z0-9_\x80-\xFF]*
 //   LITERAL      numbers, '...' "..." `...` strings, // and /* */ comments
 //   OPERATOR     the longest of the multi-byte operators below, else any single byte
@@ -14,6 +14,8 @@
 #include "structural/token_stream.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -29,7 +31,8 @@ constexpr std::array<std::string_view, N> sorted(std::array<std::string_view, N>
   return a;
 }
 
-constexpr auto kKeywords = sorted(std::to_array<std::string_view>({
+// The union of the tables below: what tokenize() without a language uses.
+constexpr auto kGeneric = sorted(std::to_array<std::string_view>({
     "False", "None", "True", "abstract", "alignas", "alignof", "and", "as", "assert", "async",
     "auto", "await", "bool", "break", "case", "catch", "char", "class", "co_await", "co_return", "co_yield",
     "const", "const_cast", "consteval", "constexpr", "constinit", "continue", "crate", "decltype", "def",
@@ -43,6 +46,80 @@ constexpr auto kKeywords = sorted(std::to_array<std::string_view>({
     "this", "throw", "throws", "trait", "true", "try", "type", "typedef", "typeid", "typename", "typeof",
     "undefined", "union", "unsafe", "unsigned", "use", "using", "var", "virtual", "void", "volatile", "where",
     "while", "with", "yield"}));
+
+constexpr auto kC = sorted(std::to_array<std::string_view>({
+    "_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic", "_Noreturn", "_Static_assert",
+    "_Thread_local", "alignas", "alignof", "auto", "bool", "break", "case", "char", "const", "constexpr",
+    "continue", "default", "do", "double", "else", "enum", "extern", "false", "float", "for", "goto", "if",
+    "inline", "int", "long", "nullptr", "register", "restrict", "return", "short", "signed", "sizeof", "static",
+    "static_assert", "struct", "switch", "thread_local", "true", "typedef", "typeof", "union", "unsigned", "void",
+    "volatile", "while"}));
+
+constexpr auto kCpp = sorted(std::to_array<std::string_view>({
+    "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool", "break", "case", "catch",
+    "char", "char16_t", "char32_t", "char8_t", "class", "co_await", "co_return", "co_yield", "compl", "concept",
+    "const", "const_cast", "consteval", "constexpr", "constinit", "continue", "decltype", "default", "delete", "do",
+    "double", "dynamic_cast", "else", "enum", "explicit", "export", "extern", "false", "final", "float", "for",
+    "friend", "goto", "if", "import", "inline", "int", "long", "module", "mutable", "namespace", "new", "noexcept",
+    "not", "not_eq", "nullptr", "operator", "or", "or_eq", "override", "private", "protected", "public", "register",
+    "reinterpret_cast", "requires", "return", "short", "signed", "sizeof", "static", "static_assert", "static_cast",
+    "struct", "switch", "template", "this", "thread_local", "throw", "true", "try", "typedef", "typeid", "typename",
+    "union", "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while", "xor", "xor_eq"}));
+
+constexpr auto kPython = sorted(std::to_array<std::string_view>({
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "case", "class", "continue", "def",
+    "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda",
+    "match", "nonlocal", "not", "or", "pass", "raise", "return", "try", "type", "while", "with", "yield"}));
+
+constexpr auto kJavaScript = sorted(std::to_array<std::string_view>({
+    "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do",
+    "else", "export", "extends", "false", "finally", "for", "function", "get", "if", "import", "in", "instanceof",
+    "let", "new", "null", "of", "return", "set", "static", "super", "switch", "this", "throw", "true", "try",
+    "typeof", "undefined", "var", "void", "while", "with", "yield"}));
+
+constexpr auto kTypeScript = sorted(std::to_array<std::string_view>({
+    "abstract", "any", "as", "asserts", "async", "await", "bigint", "boolean", "break", "case", "catch", "class",
+    "const", "continue", "debugger", "declare", "default", "delete", "do", "else", "enum", "export", "extends",
+    "false", "finally", "for", "function", "get", "if", "implements", "import", "in", "infer", "instanceof",
+    "interface", "is", "keyof", "let", "module", "namespace", "never", "new", "null", "number", "object", "of",
+    "private", "protected", "public", "readonly", "return", "satisfies", "set", "static", "string", "super",
+    "switch", "symbol", "this", "throw", "true", "try", "type", "typeof", "undefined", "unique", "unknown", "var",
+    "void", "while", "with", "yield"}));
+
+constexpr auto kJava = sorted(std::to_array<std::string_view>({
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue",
+    "default", "do", "double", "else", "enum", "extends", "false", "final", "finally", "float", "for", "goto", "if",
+    "implements", "import", "instanceof", "int", "interface", "long", "native", "new", "null", "package", "permits",
+    "private", "protected", "public", "record", "return", "sealed", "short", "static", "strictfp", "super",
+    "switch", "synchronized", "this", "throw", "throws", "transient", "true", "try", "var", "void", "volatile",
+    "while", "yield"}));
+
+constexpr auto kGo = sorted(std::to_array<std::string_view>({
+    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "false", "for", "func",
+    "go", "goto", "if", "import", "interface", "iota", "map", "nil", "package", "range", "return", "select",
+    "struct", "switch", "true", "type", "var"}));
+
+constexpr auto kRust = sorted(std::to_array<std::string_view>({
+    "Self", "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
+    "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self",
+    "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while"}));
+
+using Keywords = std::span<const std::string_view>;
+
+Keywords keywords_for(Language lang) noexcept {
+  switch (lang) {
+    case Language::c: return kC;
+    case Language::cpp: return kCpp;
+    case Language::python: return kPython;
+    case Language::javascript: return kJavaScript;
+    case Language::typescript: return kTypeScript;
+    case Language::java: return kJava;
+    case Language::go: return kGo;
+    case Language::rust: return kRust;
+    case Language::generic: break;
+  }
+  return kGeneric;
+}
 
 constexpr std::array<std::string_view, 9> kOps3{"<<=", ">>=", "...", "->*", "<=>", "**=", ">>>", "===", "!=="};
 constexpr std::array<std::string_view, 28> kOps2{"::", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=",
@@ -59,10 +136,10 @@ constexpr bool is_structure(unsigned c) noexcept {
   return c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == ',' || c == ';';
 }
 
-bool is_keyword(std::string_view w) noexcept { return std::binary_search(kKeywords.begin(), kKeywords.end(), w); }
+bool is_keyword(Keywords kw, std::string_view w) noexcept { return std::binary_search(kw.begin(), kw.end(), w); }
 
 // One token starting at i (i < s.size()); advances i by 1..kMaxTokenBytes.
-TokenType scan(std::string_view s, std::size_t& i) noexcept {
+TokenType scan(std::string_view s, std::size_t& i, Keywords kw) noexcept {
   const std::size_t n = s.size(), start = i;
   const std::size_t cap = std::min(n, start + kMaxTokenBytes);
   const auto at = [s](std::size_t k) { return static_cast<unsigned char>(s[k]); };
@@ -82,7 +159,7 @@ TokenType scan(std::string_view s, std::size_t& i) noexcept {
   }
   if (is_ident_start(c)) {
     while (i < cap && is_ident(at(i))) ++i;
-    return is_keyword(s.substr(start, i - start)) ? TokenType::KEYWORD : TokenType::IDENTIFIER;
+    return is_keyword(kw, s.substr(start, i - start)) ? TokenType::KEYWORD : TokenType::IDENTIFIER;
   }
   if (is_digit(c) || (c == '.' && i + 1 < n && is_digit(at(i + 1)))) {
     ++i;
@@ -155,26 +232,7 @@ constexpr std::int64_t unzigzag(u64 v) noexcept {
 // ------------------------------------------------------------- Phase 1 API ---
 
 std::vector<StructuralToken> StructuralPreprocessor::tokenize(const std::string& source_code) {
-  if (source_code.size() > kMaxSourceBytes)
-    throw std::length_error("hce::structural::tokenize: input larger than kMaxSourceBytes");
-  const std::string_view s(source_code);
-  std::vector<StructuralToken> out;
-  out.reserve(s.size() / 4 + 1);
-  std::unordered_map<std::string, u32> ids;  // key: type byte, then the value
-  std::string key;
-  u32 line = 1;
-  for (std::size_t i = 0; i < s.size();) {
-    const std::size_t start = i;
-    const TokenType type = scan(s, i);
-    const std::string_view value = s.substr(start, i - start);
-    key.assign(1, static_cast<char>(type));
-    key.append(value);
-    // At most one entry per token and kMaxSourceBytes < 2^32 tokens: the IDs fit.
-    const auto [it, fresh] = ids.try_emplace(key, static_cast<u32>(ids.size()));
-    out.push_back(StructuralToken{type, std::string(value), line, it->second});
-    line += static_cast<u32>(std::count(value.begin(), value.end(), '\n'));
-  }
-  return out;
+  return structural::tokenize(source_code, Language::generic);
 }
 
 std::vector<uint8_t> StructuralPreprocessor::serialize_tokens(const std::vector<StructuralToken>& tokens) {
@@ -197,6 +255,75 @@ std::vector<uint8_t> StructuralPreprocessor::serialize_tokens(const std::vector<
 }
 
 // ------------------------------------------------------- Phase 2 additions ---
+
+std::vector<StructuralToken> tokenize(std::string_view s, Language lang) {
+  if (s.size() > kMaxSourceBytes) throw std::length_error("hce::structural::tokenize: input larger than kMaxSourceBytes");
+  const Keywords kw = keywords_for(lang);
+  std::vector<StructuralToken> out;
+  out.reserve(s.size() / 4 + 1);
+  std::unordered_map<std::string, u32> ids;  // key: type byte, then the value
+  std::string key;
+  u32 line = 1;
+  for (std::size_t i = 0; i < s.size();) {
+    const std::size_t start = i;
+    const TokenType type = scan(s, i, kw);
+    const std::string_view value = s.substr(start, i - start);
+    key.assign(1, static_cast<char>(type));
+    key.append(value);
+    // At most one entry per token and kMaxSourceBytes < 2^32 tokens: the IDs fit.
+    const auto [it, fresh] = ids.try_emplace(key, static_cast<u32>(ids.size()));
+    out.push_back(StructuralToken{type, std::string(value), line, it->second});
+    line += static_cast<u32>(std::count(value.begin(), value.end(), '\n'));
+  }
+  return out;
+}
+
+const char* to_string(Language lang) noexcept {
+  switch (lang) {
+    case Language::generic: return "generic";
+    case Language::c: return "c";
+    case Language::cpp: return "cpp";
+    case Language::python: return "python";
+    case Language::javascript: return "javascript";
+    case Language::typescript: return "typescript";
+    case Language::java: return "java";
+    case Language::go: return "go";
+    case Language::rust: return "rust";
+  }
+  return "unknown";
+}
+
+std::optional<Language> parse_language(std::string_view n) noexcept {
+  if (n == "generic") return Language::generic;
+  if (n == "c") return Language::c;
+  if (n == "cpp" || n == "c++" || n == "cxx") return Language::cpp;
+  if (n == "python" || n == "py") return Language::python;
+  if (n == "javascript" || n == "js") return Language::javascript;
+  if (n == "typescript" || n == "ts") return Language::typescript;
+  if (n == "java") return Language::java;
+  if (n == "go") return Language::go;
+  if (n == "rust" || n == "rs") return Language::rust;
+  return std::nullopt;
+}
+
+Language language_for_path(const std::filesystem::path& path) noexcept {
+  try {
+    std::string ext = path.extension().string();
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (ext == ".c") return Language::c;
+    if (ext == ".h" || ext == ".hh" || ext == ".hpp" || ext == ".hxx" || ext == ".cc" || ext == ".cpp" ||
+        ext == ".cxx" || ext == ".ipp" || ext == ".inl" || ext == ".tcc")
+      return Language::cpp;
+    if (ext == ".py" || ext == ".pyi") return Language::python;
+    if (ext == ".js" || ext == ".mjs" || ext == ".cjs" || ext == ".jsx") return Language::javascript;
+    if (ext == ".ts" || ext == ".tsx" || ext == ".mts" || ext == ".cts") return Language::typescript;
+    if (ext == ".java") return Language::java;
+    if (ext == ".go") return Language::go;
+    if (ext == ".rs") return Language::rust;
+  } catch (...) {  // path conversion: fall back to the generic table
+  }
+  return Language::generic;
+}
 
 void put_varint(std::vector<std::uint8_t>& out, u64 v) {
   while (v >= 0x80) {

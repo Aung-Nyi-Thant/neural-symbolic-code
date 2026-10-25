@@ -15,6 +15,18 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "clang-release",
+      "inherits": "base",
+      "displayName": "Release (Clang)",
+      "cacheVariables": { "CMAKE_CXX_COMPILER": "clang++", "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "python",
+      "inherits": "base",
+      "displayName": "Release with the Python package; ctest also runs the pytest suite",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "HCE_BUILD_PYTHON": "ON" }
+    },
+    {
       "name": "gcc-asan",
       "inherits": "base",
       "displayName": "GCC, AddressSanitizer + UndefinedBehaviorSanitizer",
@@ -60,22 +72,35 @@
       "displayName": "AArch64 (NEON) cross build, tests under qemu-aarch64",
       "toolchainFile": "${sourceDir}/cmake/aarch64-linux-gnu.cmake",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "mingw-wine",
+      "inherits": "base",
+      "displayName": "Windows x64 (MinGW-w64) cross build, tests under Wine",
+      "toolchainFile": "${sourceDir}/cmake/x86_64-w64-mingw32.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
+    { "name": "clang-release", "configurePreset": "clang-release" },
+    { "name": "python", "configurePreset": "python" },
     { "name": "gcc-asan", "configurePreset": "gcc-asan" },
     { "name": "clang-asan", "configurePreset": "clang-asan" },
     { "name": "gcc-tsan", "configurePreset": "gcc-tsan" },
     { "name": "clang-tsan", "configurePreset": "clang-tsan" },
-    { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu" }
+    { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu" },
+    { "name": "mingw-wine", "configurePreset": "mingw-wine" }
   ],
   "testPresets": [
     { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "clang-release", "configurePreset": "clang-release", "output": { "outputOnFailure": true } },
+    { "name": "python", "configurePreset": "python", "output": { "outputOnFailure": true } },
     { "name": "gcc-asan", "configurePreset": "gcc-asan", "output": { "outputOnFailure": true } },
     { "name": "clang-asan", "configurePreset": "clang-asan", "output": { "outputOnFailure": true } },
     { "name": "gcc-tsan", "configurePreset": "gcc-tsan", "output": { "outputOnFailure": true } },
     { "name": "clang-tsan", "configurePreset": "clang-tsan", "output": { "outputOnFailure": true } },
-    { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu", "output": { "outputOnFailure": true } }
+    { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu", "output": { "outputOnFailure": true } },
+    { "name": "mingw-wine", "configurePreset": "mingw-wine", "output": { "outputOnFailure": true } }
   ]
 }

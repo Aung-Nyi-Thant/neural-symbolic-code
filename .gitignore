@@ -37,3 +37,13 @@ build.ninja
 *.swp
 *~
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+/dist/
+*.egg-info/
+.pytest_cache/
+.hypothesis/
