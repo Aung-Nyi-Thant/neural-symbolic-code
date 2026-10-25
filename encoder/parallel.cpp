@@ -9,6 +9,7 @@
 #include "encoder/parallel.hpp"
 
 #include "codec/neural_cm_codec.hpp"
+#include "structural/structural_cm_codec.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +34,12 @@ using hc::u32;
 using hc::u64;
 
 constexpr std::size_t kStreamIdSample = 64 * 1024;
+
+// EncodeOptions::codec_context, for codecs that take shared read-only state.
+template <class C>
+void attach_context(C& codec, const void* ctx) noexcept {
+  if constexpr (requires { codec.set_context(ctx); }) codec.set_context(ctx);
+}
 
 struct Plan {
   std::size_t frame_cap = 0;   // input bytes per frame
@@ -125,6 +132,7 @@ class Pipeline {
     std::vector<Enc> encoders;
     encoders.reserve(plan_.threads);
     for (unsigned i = 0; i < plan_.threads; ++i) encoders.emplace_back(params_);
+    for (Enc& e : encoders) attach_context(e, opt_.codec_context);  // before any worker starts
 
     const std::stop_callback on_stop(opt_.stop, [this]() noexcept { fail(Errc::cancelled); });
     {
@@ -377,5 +385,6 @@ EncodeResult encode_parallel(InputStream& in, OutputStream& out, const EncodeOpt
 }
 
 template EncodeResult encode_parallel<NeuralCMCodec>(InputStream&, OutputStream&, const EncodeOptions&);
+template EncodeResult encode_parallel<StructuralCMCodec>(InputStream&, OutputStream&, const EncodeOptions&);
 
 }  // namespace hce

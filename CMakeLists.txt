@@ -53,12 +53,21 @@ add_library(hce_codec STATIC
 target_link_libraries(hce_codec PUBLIC hce_core PRIVATE hce_warnings)
 target_compile_options(hce_codec PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O3 -ftree-vectorize>)
 
+# Structural compression (structural/): the Phase 1 tokenizer, the frozen
+# global model and the token-level codec. The pipelines instantiate for it.
+add_library(hce_structural_codec STATIC
+  structural/structural_parser.cpp
+  structural/global_model.cpp
+  structural/structural_cm_codec.cpp)
+target_link_libraries(hce_structural_codec PUBLIC hce_core hce_codec PRIVATE hce_warnings)
+target_compile_options(hce_structural_codec PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O3>)
+
 # Parallel encoder and decoder pipelines.
 add_library(hce_pipeline STATIC
   encoder/parallel.cpp
   decoder/pipeline.cpp)
 target_link_libraries(hce_pipeline
-  PUBLIC hce_core hce_codec Threads::Threads
+  PUBLIC hce_core hce_codec hce_structural_codec Threads::Threads
   PRIVATE hce_warnings)
 
 # Asynchronous file I/O (aio/): io_uring on Linux when liburing is available,
@@ -94,6 +103,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT HCE_AIO_URING STREQUAL "OFF")
 endif()
 message(STATUS "hce_aio backends: ${HCE_AIO_BACKENDS}")
 
+# Two-pass structural archives: token spool and both passes over aio.
+add_library(hce_structural STATIC structural/archive.cpp)
+target_link_libraries(hce_structural PUBLIC hce_pipeline hce_aio PRIVATE hce_warnings)
+
 # Command-line tool (POSIX).
 add_executable(hce cli/hce.cpp)
 target_link_libraries(hce PRIVATE hce_pipeline hce_warnings)
@@ -124,6 +137,11 @@ if(HCE_BUILD_TESTS)
   target_link_libraries(test_aio PRIVATE hce_aio hce_pipeline hce_warnings)
   add_test(NAME aio COMMAND test_aio)
 
+  add_executable(test_structural tests/test_structural.cpp)
+  target_link_libraries(test_structural PRIVATE hce_structural hce_warnings)
+  target_compile_definitions(test_structural PRIVATE HCE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  add_test(NAME structural COMMAND test_structural)
+
   # Sanitizer failures get exit codes of their own, so the CLI tests can never
   # mistake one for an hce exit status.
   set(HCE_TEST_ENV
@@ -138,5 +156,5 @@ if(HCE_BUILD_TESTS)
     list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " HCE_WRAPPER)
     list(APPEND HCE_TEST_ENV "HCE_TEST_WRAPPER=${HCE_WRAPPER}")
   endif()
-  set_tests_properties(framing codec pipeline cli aio PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
+  set_tests_properties(framing codec pipeline cli aio structural PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
 endif()

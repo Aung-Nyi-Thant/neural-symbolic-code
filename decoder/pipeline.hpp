@@ -18,6 +18,9 @@ struct DecodeOptions {
   unsigned threads = 1;                        // 1 = sequential decoder, no extra threads
   hc::u64 chunk_bytes = hc::u64{4} << 20;      // decoded bytes per work unit (raised to the block limit)
   std::stop_token stop;                        // external cancellation; never requested by the pipeline
+  // Read-only state shared by every worker's codec (see EncodeOptions), handed
+  // to Codec::set_context() when the codec has one.
+  const void* codec_context = nullptr;
 };
 
 struct DecodeResult {
