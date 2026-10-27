@@ -18,6 +18,7 @@
 
 #include "common.hpp"
 #include "rans_static.hpp"
+#include "sws_model.hpp"
 #include "word_filter.hpp"
 #include "ultracodec/engine.hpp"
 
@@ -319,6 +320,35 @@ void test_tier4_primer() {
   }
 }
 
+// Every table layout round-trips, is recorded in the archive and changes the coded bits; the
+// auto choice follows the memory budget, not the thread count.
+void test_tier4_layouts() {
+  const Bytes data = text_bytes(slow_env() ? 150000 : 400000, 33);
+  EngineOptions o;
+  o.block_size = 64 * 1024;
+  o.threads = 2;
+  std::vector<Bytes> archives;
+  for (int l = 0; l < 4; ++l) {
+    o.tier4_tables = l;
+    archives.push_back(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data));
+    CHECK(decompress(archives.back()) == data);
+  }
+  CHECK(peek_header(archives[0]).model_param == detail::sws::primer_crc());
+  CHECK(archives[0] != archives[3] && peek_header(archives[0]).model_param != peek_header(archives[3]).model_param);
+  o.tier4_tables = -1;
+  o.memory_budget = std::size_t{4} << 30;
+  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[0]);
+  o.memory_budget = std::size_t{1} << 20;  // nothing fits: Small, one worker
+  o.threads = 4;
+  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[3]);
+  o.tier4_tables = 4;
+  try {
+    create_engine(TierLevel::Tier4_Enterprise, o);
+    CHECK(false);
+  } catch (const Error&) {
+  }
+}
+
 void test_corruption() {
   const int iters = fuzz_iters(150);
   std::mt19937 rng(1234);
@@ -455,6 +485,8 @@ int main() {
   test_engine_rules();
   std::printf("tier 4 primer\n");
   test_tier4_primer();
+  std::printf("tier 4 table layouts\n");
+  test_tier4_layouts();
   std::printf("word filter\n");
   test_word_filter();
   std::printf("corruption\n");

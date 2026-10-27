@@ -44,8 +44,22 @@ u32 squash(const Tables& t, std::int64_t logit) noexcept {
 // Table sizes follow the bytes a model will see (`capacity`), up to the caps. Order 0 sees 17
 // nibble contexts and order 1 at most 4352; larger tables would stay empty. Four slots per bucket:
 // 2^(log2(capacity) - 1) buckets hold the two nibble contexts of every byte.
-unsigned table_bits(std::size_t capacity, std::size_t context) noexcept {
-  const unsigned cap = context == 0 ? 6u : context == 1 ? 12u : kBucketBits;
+// The layout lowers the caps of the contexts that lose least from smaller tables (TableLayout).
+unsigned layout_cap(TableLayout layout, std::size_t context) noexcept {
+  const bool low = context >= 2 && context <= 4;     // orders 2-4
+  const bool mid = context >= 5 && context <= 9;     // orders 5, 6, 8, 10, 12
+  const bool high = context >= 10 && context <= 12;  // orders 16, 24, 32
+  switch (layout) {
+    case TableLayout::Full: return kBucketBits;
+    case TableLayout::Balanced: return low || high ? 15u : kBucketBits;
+    case TableLayout::Compact: return low || high ? 15u : mid ? 16u : kBucketBits;
+    case TableLayout::Small: return 15u;
+  }
+  return kBucketBits;
+}
+
+unsigned table_bits(std::size_t capacity, std::size_t context, TableLayout layout) noexcept {
+  const unsigned cap = context == 0 ? 6u : context == 1 ? 12u : layout_cap(layout, context);
   const unsigned wanted = capacity <= 1 ? 0u : static_cast<unsigned>(std::bit_width(capacity - 1));
   return std::clamp(wanted ? wanted - 1 : 0u, std::min(10u, cap), cap);
 }
@@ -379,9 +393,9 @@ void Frontend::contexts(const History& h, std::array<u64, kContexts>& out) const
 
 // ---- Contexts -----------------------------------------------------------------
 
-void Contexts::reset(std::size_t capacity) {
+void Contexts::reset(std::size_t capacity, TableLayout layout) {
   for (std::size_t k = 0; k < kContexts; ++k) {
-    tables_[k].reset(table_bits(capacity, k));
+    tables_[k].reset(table_bits(capacity, k, layout));
     maps_[k] = StateMap(*t_);
   }
   slots_.fill(nullptr);
@@ -569,7 +583,7 @@ void Calibration::update(u32 bit) noexcept {
 
 // ---- Model ----------------------------------------------------------------------
 
-Model::Model(std::size_t capacity) : buffer_(capacity) { reset(); }
+Model::Model(std::size_t capacity, TableLayout layout) : buffer_(capacity), layout_(layout) { reset(); }
 
 Model::Model(const Model& o) { *this = o; }
 
@@ -577,6 +591,7 @@ Model& Model::operator=(const Model& o) {
   if (this == &o) return *this;
   // Arrays of equal size copy in place, so a worker's model is refreshed without reallocating.
   copy_big(buffer_, o.buffer_);
+  layout_ = o.layout_;
   history_ = {buffer_.data(), o.history_.position};
   bits_ = o.bits_;
   frontend_ = o.frontend_;
@@ -599,16 +614,16 @@ void Model::reset() {
   inputs_.fill(0);
   hits_ = 0;
   frontend_.reset();
-  contexts_.reset(buffer_.size());
+  contexts_.reset(buffer_.size(), layout_);
   match_.reset(buffer_.size());
   mixer_.reset();
   calibration_.reset();
   next_contexts();
 }
 
-std::size_t Model::bytes(std::size_t capacity) noexcept {
+std::size_t Model::bytes(std::size_t capacity, TableLayout layout) noexcept {
   std::size_t b = capacity + (std::size_t{4} << match_bits(capacity)) + (256 + 65536) * 2;
-  for (std::size_t k = 0; k < kContexts; ++k) b += std::size_t{68} << table_bits(capacity, k);
+  for (std::size_t k = 0; k < kContexts; ++k) b += std::size_t{68} << table_bits(capacity, k, layout);
   b += kMixRows * kLanes * 4 + 256 * (kSets + 1) * 4;
   b += (kApmRows0 + kApmRows1 + kApmRows2 + kApmRows3) * 33 * 2;
   return b + sizeof(Model);

@@ -162,10 +162,32 @@ Archives are byte-identical on both machines and for any thread count.
 Separate files run slower (0.86 MB/s on the M4 at 4 threads) because a
 4-8 MiB file has only 1-3 blocks after the serial block 0.
 
-Memory: each model is ~200 MiB (twenty 8 MiB context tables, a 16 MiB
-match table, mixers, APMs and its history), and a call holds the snapshot
-plus one copy per worker. `memory_budget` (default 4 GiB) caps the
-workers; archives do not depend on it. Small inputs get smaller tables,
+Memory: a call holds the snapshot plus one model per worker. The context
+tables dominate, and the archive records one of four table layouts
+(`EngineOptions::tier4_tables`). Measured 2026-10-27 on 2 MiB blocks after
+a 2 MiB snapshot:
+
+| Layout | Model | Size vs Full | Note |
+|---|---|---|---|
+| 0 Full | ~204 MiB | 0 | all contexts 2^17 buckets (the original design) |
+| 1 Balanced | ~165 MiB | +0.20% | orders 2-4 and 16/24/32 at 2^15 |
+| 2 Compact | ~144 MiB | +0.52% | Balanced, plus orders 5-12 at 2^16 |
+| 3 Small | ~76 MiB | +2.2% | every context at 2^15 |
+
+Speed does not change with the layout: the model is bound by instructions,
+not cache misses. By default (`tier4_tables = -1`) the encoder picks the
+largest layout whose snapshot plus four workers fit `memory_budget`
+(default 900 MiB), which is Balanced for inputs over ~4 MiB. That choice
+does not depend on the thread count, so archives stay identical for any
+`threads`. `memory_budget` also caps the workers, as before.
+
+On the 26.97 MB mixed corpus (x86 VM, 4 threads, concatenation): Full under
+a 900 MiB budget runs 3 workers, 0.74 MB/s, 889 MiB peak RSS; Balanced runs
+4 workers, 0.93 MB/s, 909 MiB, +0.35% size (4,374,909 vs 4,359,652 bytes).
+
+Sharing the snapshot copy-on-write does not help: after one 256 KiB block a
+worker has written 99-100% of its 4 KiB table pages (100% at 16 KiB), because
+hashed contexts scatter their writes. Small inputs get smaller tables,
 because tables are sized from the bytes a model will see.
 
 Not done: block 0 is serial in decode, so speed grows with the number of

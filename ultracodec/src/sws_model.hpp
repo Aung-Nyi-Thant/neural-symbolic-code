@@ -43,6 +43,16 @@ inline constexpr std::array<std::size_t, kSets> kSetRows{256, 64 * 256, 256 * 8,
 inline constexpr std::size_t kMixRows = kSetRows[0] + kSetRows[1] + kSetRows[2] + kSetRows[3];
 inline constexpr std::int32_t kWeightLimit = std::int32_t{1} << 19;
 inline constexpr unsigned kBucketBits = 17;  // per-context table cap: 2^17 x 64 B = 8 MiB
+
+// Per-context table caps. The archive records the layout, because table sizes change the coded
+// bits. Measured on 2 MiB blocks after a 2 MiB snapshot (Python, Perl, prose, XML):
+//   Full      all contexts 2^17 buckets                          ~204 MiB per model
+//   Balanced  orders 2-4 and 16/24/32 at 2^15                     ~165 MiB, +0.20% size
+//   Compact   Balanced, plus orders 5-12 at 2^16                  ~144 MiB, +0.52% size
+//   Small     every context at 2^15                               ~76 MiB,  +2.2% size
+// Speed is the same for all four: the model is bound by instructions, not by cache misses.
+enum class TableLayout : u8 { Full = 0, Balanced = 1, Compact = 2, Small = 3 };
+inline constexpr unsigned kTableLayouts = 4;
 inline constexpr std::int32_t kLearningRate = 6;
 
 // Static tables of the model arithmetic, built once by integer-only code.
@@ -141,7 +151,7 @@ class Frontend {
 
 class Contexts {
  public:
-  void reset(std::size_t capacity);
+  void reset(std::size_t capacity, TableLayout layout);
   void lookup(const std::array<u64, kContexts>& hashes, u32 c0) noexcept;
   // Writes stretch(p) for each context; returns how many contexts have history.
   u32 predict(std::int32_t* inputs) noexcept;
@@ -243,7 +253,7 @@ class Calibration {
 // one model ever sees (primer + block 0 + one later block) and sizes its tables.
 class Model {
  public:
-  explicit Model(std::size_t capacity);
+  explicit Model(std::size_t capacity, TableLayout layout = TableLayout::Full);
   Model(const Model& o);
   Model& operator=(const Model& o);
 
@@ -259,7 +269,7 @@ class Model {
 
   std::size_t position() const noexcept { return history_.position; }
   // Bytes of heap memory one model holds (tables, history, mixers, APMs).
-  static std::size_t bytes(std::size_t capacity) noexcept;
+  static std::size_t bytes(std::size_t capacity, TableLayout layout = TableLayout::Full) noexcept;
 
  private:
   u16 predict() noexcept;
@@ -268,6 +278,7 @@ class Model {
   void next_contexts() noexcept;
 
   BigArray<u8> buffer_;
+  TableLayout layout_ = TableLayout::Full;
   History history_;
   Bits bits_;
   Frontend frontend_;

@@ -80,6 +80,10 @@ struct EngineOptions {
   std::size_t prime_bytes = SIZE_MAX;   // wavefront prefix; SIZE_MAX = tier default, 0 = off
   std::uint64_t max_output_bytes = std::uint64_t{1} << 36;  // decompress refuses larger archives
   bool tier4_primer = true;             // Tier 4: model the built-in primer first (archive records it)
+  // Tier 4 context-table layout, recorded in the archive: 0 full (~204 MiB per model), 1 balanced
+  // (~165 MiB, +0.2% size), 2 compact (~144 MiB, +0.5%), 3 small (~76 MiB, +2.2%). -1 picks the
+  // largest layout whose snapshot plus four workers fit memory_budget.
+  int tier4_tables = -1;
 };
 
 // What one compress/decompress call measured (filled when requested).
