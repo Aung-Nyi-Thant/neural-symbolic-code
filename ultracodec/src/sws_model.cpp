@@ -154,13 +154,13 @@ Tables build_tables() {
 // ---- mixer kernels ------------------------------------------------------------
 // |input| <= 3071 and |weight| <= 2^19: each product and the 32-lane sum fit in int64.
 
-std::int64_t dot_scalar(const std::int32_t* x, const std::int32_t* w) noexcept {
+[[maybe_unused]] std::int64_t dot_scalar(const std::int32_t* x, const std::int32_t* w) noexcept {
   std::int64_t sum = 0;
   for (std::size_t i = 0; i < kLanes; ++i) sum += std::int64_t{x[i]} * w[i];
   return sum;
 }
 // |input * error| <= 3071 * 4095 * 16 < 2^31.
-void train_scalar(const std::int32_t* x, std::int32_t* w, std::int32_t error) noexcept {
+[[maybe_unused]] void train_scalar(const std::int32_t* x, std::int32_t* w, std::int32_t error) noexcept {
   for (std::size_t i = 0; i < kLanes; ++i)
     w[i] = std::clamp(w[i] + ((x[i] * error + 8192) >> 14), -kWeightLimit, kWeightLimit);
 }
