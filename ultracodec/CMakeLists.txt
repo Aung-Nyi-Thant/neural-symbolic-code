@@ -25,6 +25,7 @@ add_library(ultracodec STATIC
   src/rans_static.cpp
   src/tier1_hyperspeed.cpp
   src/tier2_consumer.cpp
+  src/word_filter.cpp
   src/tier3_balanced.cpp
   src/tier4_enterprise.cpp)
 target_include_directories(ultracodec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
