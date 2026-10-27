@@ -46,10 +46,10 @@ inline constexpr unsigned kBucketBits = 17;  // per-context table cap: 2^17 x 64
 
 // Per-context table caps. The archive records the layout, because table sizes change the coded
 // bits. Measured on 2 MiB blocks after a 2 MiB snapshot (Python, Perl, prose, XML):
-//   Full      all contexts 2^17 buckets                          ~204 MiB per model
-//   Balanced  orders 2-4 and 16/24/32 at 2^15                     ~165 MiB, +0.20% size
-//   Compact   Balanced, plus orders 5-12 at 2^16                  ~144 MiB, +0.52% size
-//   Small     every context at 2^15                               ~76 MiB,  +2.2% size
+//   Full      all contexts 2^17 buckets                          ~194 MiB per model
+//   Balanced  orders 2-4 and 16/24/32 at 2^15                     ~158 MiB, +0.20% size
+//   Compact   Balanced, plus orders 5-12 at 2^16                  ~138 MiB, +0.52% size
+//   Small     every context at 2^15                               ~74 MiB,  +2.2% size
 // Speed is the same for all four: the model is bound by instructions, not by cache misses.
 enum class TableLayout : u8 { Full = 0, Balanced = 1, Compact = 2, Small = 3 };
 inline constexpr unsigned kTableLayouts = 4;
@@ -119,7 +119,6 @@ class SlotTable {
   SlotTable(const SlotTable& o) { *this = o; }
   SlotTable& operator=(const SlotTable& o) {
     copy_big(buckets_, o.buckets_);
-    copy_big(tags_, o.tags_);
     bits_ = o.bits_;
     return *this;
   }
@@ -130,7 +129,6 @@ class SlotTable {
 
  private:
   BigArray<Bucket> buckets_;
-  BigArray<u32> tags_;  // the four check bytes of each bucket, for a one-compare probe
   unsigned bits_ = 0;
 };
 
@@ -186,6 +184,8 @@ class Match {
   void observe(const History& h) noexcept;
   u32 length() const noexcept { return length_; }
   u32 expected() const noexcept { return expected_; }
+  // The byte the current match predicts; valid while length() > 0.
+  u8 next_byte(const History& h) const noexcept { return h.data[pointer_]; }
 
  private:
   const Tables* t_ = &tables();
@@ -267,6 +267,13 @@ class Model {
   // Decodes exactly out.size() bytes; throws Error on a malformed payload.
   void decode(std::span<const u8> payload, std::span<u8> out);
 
+  // Long-match bypass: at a byte boundary where the match model's match is at least
+  // `min_length` bytes long, one adaptive binary flag (by match length and predicted byte) says
+  // whether the predicted byte is right; a right byte skips the 8 context-mixing steps and the
+  // tables do not learn it. 0 = off. Set before the model sees data; the archive records it.
+  // Measured at 32 on a 27 MB mixed archive: 1.11x speed, +0.70% size (xml +3.5%, prose 0).
+  void set_bypass(u32 min_length) noexcept { bypass_min_ = min_length; }
+
   std::size_t position() const noexcept { return history_.position; }
   // Bytes of heap memory one model holds (tables, history, mixers, APMs).
   static std::size_t bytes(std::size_t capacity, TableLayout layout = TableLayout::Full) noexcept;
@@ -276,6 +283,11 @@ class Model {
   void update(u32 bit) noexcept;
   void append(u8 byte) noexcept;
   void next_contexts() noexcept;
+  bool bypass_ready() const noexcept { return bypass_min_ && match_.length() >= bypass_min_; }
+  u32 bypass_bucket() const noexcept;
+  void bypass_update(u32 bucket, u32 hit) noexcept;
+  void skip_byte(u8 byte) noexcept;
+  void ensure_contexts() noexcept { if (pending_) { next_contexts(); pending_ = false; } }
 
   BigArray<u8> buffer_;
   TableLayout layout_ = TableLayout::Full;
@@ -289,6 +301,9 @@ class Model {
   std::array<u64, kContexts> hashes_{};
   alignas(64) std::array<std::int32_t, kLanes> inputs_{};
   u32 hits_ = 0;
+  u32 bypass_min_ = 0;
+  bool pending_ = false;  // bytes were skipped since the last context lookup
+  std::array<u16, 16 * 256> bypass_p_{};  // P(predicted byte is right), 16-bit, by log2 match length and that byte
 };
 
 // The built-in primer (third_party/sws_primer/NOTICE.md) and its CRC-32C.

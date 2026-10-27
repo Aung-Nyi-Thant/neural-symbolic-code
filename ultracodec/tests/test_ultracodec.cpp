@@ -341,6 +341,30 @@ void test_tier4_layouts() {
   o.memory_budget = std::size_t{1} << 20;  // nothing fits: Small, one worker
   o.threads = 4;
   CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[3]);
+  // Long-match bypass: deterministic across thread counts, recorded, and every primer x layout x
+  // bypass combination gets its own model_param.
+  o.tier4_tables = -1;
+  o.memory_budget = 0;
+  o.tier4_bypass = true;
+  o.threads = 1;
+  const Bytes by1 = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
+  o.threads = 3;
+  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == by1);
+  CHECK(by1 != archives[0] && decompress(by1) == data);
+  const Bytes small = text_bytes(20000, 34);
+  std::vector<std::uint32_t> params;
+  for (int l = 0; l < 4; ++l)
+    for (const bool primer : {false, true})
+      for (const bool bypass : {false, true}) {
+        o.tier4_tables = l;
+        o.tier4_primer = primer;
+        o.tier4_bypass = bypass;
+        const Bytes a = create_engine(TierLevel::Tier4_Enterprise, o)->compress(small);
+        CHECK(decompress(a) == small);
+        params.push_back(peek_header(a).model_param);
+      }
+  std::sort(params.begin(), params.end());
+  CHECK(std::adjacent_find(params.begin(), params.end()) == params.end());
   o.tier4_tables = 4;
   try {
     create_engine(TierLevel::Tier4_Enterprise, o);

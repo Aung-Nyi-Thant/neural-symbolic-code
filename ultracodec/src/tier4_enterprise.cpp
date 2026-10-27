@@ -39,9 +39,30 @@ constexpr std::size_t kDefaultBudget = std::size_t{900} << 20;  // all models of
 // so the archive does not depend on the machine that wrote it.
 constexpr std::size_t kPlannedModels = 5;
 
-// model_param = primer CRC (0 without primer) XOR a per-layout salt; Full has salt 0, so archives
-// written before layouts existed still read as Full.
+// What the archive records about the model in model_param: primer CRC (0 without primer) XOR a
+// per-layout salt XOR a bypass salt. Full without bypass has salt 0, so archives written before
+// layouts existed still read as Full. Tests check that all 16 values are distinct.
 constexpr std::array<u32, sws::kTableLayouts> kLayoutSalt{0, 0x4C415931u, 0x4C415932u, 0x4C415933u};
+constexpr u32 kBypassSalt = 0x0B790000u;
+constexpr u32 kBypassLength = 32;
+
+struct SwsConfig {
+  bool primed = true;
+  sws::TableLayout layout = sws::TableLayout::Full;
+  bool bypass = false;
+  u32 param() const noexcept {
+    return (primed ? sws::primer_crc() : 0) ^ kLayoutSalt[static_cast<unsigned>(layout)] ^ (bypass ? kBypassSalt : 0);
+  }
+  static SwsConfig from_param(u32 param) {
+    for (unsigned l = 0; l < sws::kTableLayouts; ++l)
+      for (const bool p : {false, true})
+        for (const bool b : {false, true}) {
+          const SwsConfig c{p, static_cast<sws::TableLayout>(l), b};
+          if (c.param() == param) return c;
+        }
+    throw Error("ultracodec: unknown Tier 4 primer, table layout or bypass");
+  }
+};
 
 // History one model needs: primer, block 0 and the longest later block. It
 // also sizes the model's tables, so small inputs get small models.
@@ -50,9 +71,10 @@ std::size_t capacity(std::size_t size, std::size_t block, bool primed) noexcept 
 }
 
 // A model that has read the primer (when enabled), ready for block 0.
-sws::Model start_model(std::size_t capacity, bool primed, sws::TableLayout layout) {
-  sws::Model m(capacity, layout);
-  if (primed) m.train(sws::primer());
+sws::Model start_model(std::size_t capacity, const SwsConfig& c) {
+  sws::Model m(capacity, c.layout);
+  m.set_bypass(c.bypass ? kBypassLength : 0);
+  if (c.primed) m.train(sws::primer());
   return m;
 }
 
@@ -127,11 +149,12 @@ std::vector<u8> SwsEngine::compress(std::span<const u8> input, EngineStats* stat
   std::vector<std::vector<u8>> payloads(blocks);
   std::vector<u32> crcs(blocks);
   std::atomic<std::size_t> stored{0};
-  sws::TableLayout layout = sws::TableLayout::Full;
+  SwsConfig config{primed, sws::TableLayout::Full, options_.tier4_bypass};
+  const sws::TableLayout& layout = config.layout;
   if (blocks) {
     const std::size_t cap = capacity(input.size(), bs, primed);
-    layout = layout_for(cap);
-    sws::Model snapshot = start_model(cap, primed, layout);
+    config.layout = layout_for(cap);
+    sws::Model snapshot = start_model(cap, config);
     crcs[0] = crc32c(block(0));
     if (code_block(snapshot, block(0), payloads[0])) stored.fetch_add(1);
     if (blocks > 1) {
@@ -156,7 +179,7 @@ std::vector<u8> SwsEngine::compress(std::span<const u8> input, EngineStats* stat
   h.uncompressed_size = input.size();
   h.block_count = static_cast<u32>(blocks);
   h.prime_bytes = 0;
-  h.model_param = (primed ? sws::primer_crc() : 0) ^ kLayoutSalt[static_cast<unsigned>(layout)];
+  h.model_param = config.param();
 
   std::size_t total = ArchiveHeader::kSize + blocks * 8 + 4;
   for (auto& p : payloads) total += p.size();
@@ -188,13 +211,9 @@ std::vector<u8> SwsEngine::decompress(std::span<const u8> archive, EngineStats* 
   const ArchiveHeader h = ArchiveHeader::parse(archive);
   if (h.tier != TierLevel::Tier4_Enterprise) throw Error("ultracodec: archive belongs to another tier");
   if (h.uncompressed_size > options_.max_output_bytes) throw Error("ultracodec: archive exceeds max_output_bytes");
-  std::optional<sws::TableLayout> found;
-  bool primed = false;
-  for (unsigned l = 0; l < sws::kTableLayouts && !found; ++l)
-    for (const bool p : {false, true})
-      if (h.model_param == ((p ? sws::primer_crc() : 0) ^ kLayoutSalt[l])) { found = static_cast<sws::TableLayout>(l); primed = p; break; }
-  if (!found) throw Error("ultracodec: unknown Tier 4 primer or table layout");
-  const sws::TableLayout layout = *found;
+  const SwsConfig config = SwsConfig::from_param(h.model_param);
+  const bool primed = config.primed;
+  const sws::TableLayout layout = config.layout;
   const std::size_t blocks = h.block_count;
   const std::size_t bs = h.block_size();
 
@@ -235,7 +254,7 @@ std::vector<u8> SwsEngine::decompress(std::span<const u8> archive, EngineStats* 
 
   if (blocks) {
     const std::size_t cap = capacity(out.size(), bs, primed);
-    sws::Model snapshot = start_model(cap, primed, layout);
+    sws::Model snapshot = start_model(cap, config);
     decode_block(0, &snapshot);
     if (blocks > 1) {
       const unsigned workers = workers_for(blocks - 1, cap, layout);

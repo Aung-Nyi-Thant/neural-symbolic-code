@@ -169,10 +169,10 @@ a 2 MiB snapshot:
 
 | Layout | Model | Size vs Full | Note |
 |---|---|---|---|
-| 0 Full | ~204 MiB | 0 | all contexts 2^17 buckets (the original design) |
-| 1 Balanced | ~165 MiB | +0.20% | orders 2-4 and 16/24/32 at 2^15 |
-| 2 Compact | ~144 MiB | +0.52% | Balanced, plus orders 5-12 at 2^16 |
-| 3 Small | ~76 MiB | +2.2% | every context at 2^15 |
+| 0 Full | ~194 MiB | 0 | all contexts 2^17 buckets (the original design) |
+| 1 Balanced | ~158 MiB | +0.20% | orders 2-4 and 16/24/32 at 2^15 |
+| 2 Compact | ~138 MiB | +0.52% | Balanced, plus orders 5-12 at 2^16 |
+| 3 Small | ~74 MiB | +2.2% | every context at 2^15 |
 
 Speed does not change with the layout: the model is bound by instructions,
 not cache misses. By default (`tier4_tables = -1`) the encoder picks the
@@ -184,6 +184,19 @@ does not depend on the thread count, so archives stay identical for any
 On the 26.97 MB mixed corpus (x86 VM, 4 threads, concatenation): Full under
 a 900 MiB budget runs 3 workers, 0.74 MB/s, 889 MiB peak RSS; Balanced runs
 4 workers, 0.93 MB/s, 909 MiB, +0.35% size (4,374,909 vs 4,359,652 bytes).
+
+Each bucket's four check bytes are read from the bucket's own cache line
+(there used to be a separate tag array), so a lookup touches one line, not
+two: +13% speed with byte-identical archives (0.86 -> 0.97 MB/s on the
+concatenation, 4 threads), and ~10 MiB less per model.
+
+`tier4_bypass` (off by default, recorded in the archive) adds a long-match
+bypass: inside a match of 32+ bytes, one flag (adaptive by match length and
+predicted byte) says whether the predicted byte is right, and a right byte
+skips the model. Measured on the same corpus: 0.97 -> 1.08 MB/s (1.11x),
++0.70% size (xml +3.5%, code +1.5%, prose 0). Variants that were worse: a
+16 or 24 byte threshold (+1.3-3.9% size), and still training the context
+tables on skipped bytes (slower and larger).
 
 Sharing the snapshot copy-on-write does not help: after one 256 KiB block a
 worker has written 99-100% of its 4 KiB table pages (100% at 16 KiB), because

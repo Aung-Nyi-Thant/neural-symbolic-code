@@ -275,7 +275,6 @@ void StateMap::update(u8 state, u32 bit, const Tables& t) noexcept {
 
 void SlotTable::reset(unsigned bits) {
   buckets_.reset(std::size_t{1} << bits);  // zeroed: every slot empty
-  tags_.reset(std::size_t{1} << bits);
   bits_ = bits;
 }
 
@@ -283,7 +282,10 @@ u8* SlotTable::find(u64 hash, const Tables& t) noexcept {
   const auto index = static_cast<std::size_t>(hash >> (64 - bits_));
   auto& bucket = buckets_[index];
   const auto check = static_cast<u8>(static_cast<u8>(hash >> 8) | 1u);  // 0 marks an empty slot
-  const u32 difference = tags_[index] ^ (u32{check} * 0x01010101u);
+  // The four check bytes sit at offsets 0/16/32/48 of the bucket's one cache line.
+  const u32 tags = u32{bucket.slots[0].check} | u32{bucket.slots[1].check} << 8 |
+                   u32{bucket.slots[2].check} << 16 | u32{bucket.slots[3].check} << 24;
+  const u32 difference = tags ^ (u32{check} * 0x01010101u);
   const u32 equal = (difference - 0x01010101u) & ~difference & 0x80808080u;
   if (equal) return bucket.slots[static_cast<std::size_t>(std::countr_zero(equal)) / 8].states.data();
   std::size_t victim = 0;
@@ -303,14 +305,11 @@ u8* SlotTable::find(u64 hash, const Tables& t) noexcept {
   auto& slot = bucket.slots[victim];
   slot = Slot{};
   slot.check = check;
-  const auto shift = static_cast<unsigned>(victim * 8);
-  tags_[index] = (tags_[index] & ~(255u << shift)) | (u32{check} << shift);
   return slot.states.data();
 }
 
 void SlotTable::prefetch(u64 hash) const noexcept {
   const auto index = static_cast<std::size_t>(hash >> (64 - bits_));
-  ULTRA_PREFETCH(&tags_[index]);
   ULTRA_PREFETCH(&buckets_[index]);
 }
 
@@ -602,9 +601,12 @@ Model& Model::operator=(const Model& o) {
   hashes_ = o.hashes_;
   inputs_ = o.inputs_;
   hits_ = o.hits_;
+  bypass_min_ = o.bypass_min_;
+  pending_ = o.pending_;
+  bypass_p_ = o.bypass_p_;
   // The copied slot pointers still point into o's tables: look them up again in ours. Snapshots
   // are taken on byte boundaries, where the lookup uses c0 = 1.
-  contexts_.lookup(hashes_, bits_.c0);
+  if (!pending_) contexts_.lookup(hashes_, bits_.c0);
   return *this;
 }
 
@@ -613,6 +615,8 @@ void Model::reset() {
   bits_ = {};
   inputs_.fill(0);
   hits_ = 0;
+  pending_ = false;
+  bypass_p_.fill(60000);
   frontend_.reset();
   contexts_.reset(buffer_.size(), layout_);
   match_.reset(buffer_.size());
@@ -623,7 +627,7 @@ void Model::reset() {
 
 std::size_t Model::bytes(std::size_t capacity, TableLayout layout) noexcept {
   std::size_t b = capacity + (std::size_t{4} << match_bits(capacity)) + (256 + 65536) * 2;
-  for (std::size_t k = 0; k < kContexts; ++k) b += std::size_t{68} << table_bits(capacity, k, layout);
+  for (std::size_t k = 0; k < kContexts; ++k) b += std::size_t{64} << table_bits(capacity, k, layout);
   b += kMixRows * kLanes * 4 + 256 * (kSets + 1) * 4;
   b += (kApmRows0 + kApmRows1 + kApmRows2 + kApmRows3) * 33 * 2;
   return b + sizeof(Model);
@@ -661,13 +665,41 @@ void Model::append(u8 byte) noexcept {
   next_contexts();
 }
 
+u32 Model::bypass_bucket() const noexcept {
+  return std::min(static_cast<u32>(std::bit_width(match_.length())), 15u) * 256 + match_.next_byte(history_);
+}
+
+void Model::bypass_update(u32 bucket, u32 hit) noexcept {
+  const std::int32_t p = bypass_p_[bucket];
+  bypass_p_[bucket] = static_cast<u16>(p + (((hit ? 65535 : 0) - p) >> 5));
+}
+
+// A byte the bypass flag confirmed: history, byte state, frontend and match model advance; the
+// context tables, mixers and APMs do not see it, and the context lookup waits for the next coded byte.
+void Model::skip_byte(u8 byte) noexcept {
+  buffer_[history_.position++] = byte;
+  bits_.c2 = bits_.c1;
+  bits_.c1 = byte;
+  frontend_.observe(history_, byte);
+  match_.observe(history_);
+  pending_ = true;
+}
+
 void Model::train(std::span<const u8> bytes) {
   if (bytes.size() > buffer_.size() - history_.position) throw Error("ultracodec: Tier 4 history overflow");
-  for (const u8 c : bytes)
+  for (const u8 c : bytes) {
+    if (bypass_ready()) {
+      const u32 hit = c == match_.next_byte(history_);
+      bypass_update(bypass_bucket(), hit);
+      if (hit) { skip_byte(c); continue; }
+    }
+    ensure_contexts();
     for (unsigned b = 0; b < 8; ++b) {
       (void)predict();
       update((u32{c} >> (7 - b)) & 1u);
     }
+  }
+  ensure_contexts();
 }
 
 bool Model::encode(std::span<const u8> raw, std::vector<u8>& out) {
@@ -675,12 +707,21 @@ bool Model::encode(std::span<const u8> raw, std::vector<u8>& out) {
   const std::size_t start = out.size();
   out.resize(start + raw.size());  // a coded form this long or longer is stored instead
   RangeEncoder coder(std::span<u8>(out.data() + start, raw.size()));
-  for (const u8 c : raw)
+  for (const u8 c : raw) {
+    if (bypass_ready()) {
+      const u32 bucket = bypass_bucket(), hit = c == match_.next_byte(history_);
+      coder.encode(hit, bypass_p_[bucket]);
+      bypass_update(bucket, hit);
+      if (hit) { skip_byte(c); continue; }
+    }
+    ensure_contexts();
     for (unsigned b = 0; b < 8; ++b) {
       const u32 bit = (u32{c} >> (7 - b)) & 1u;
       coder.encode(bit, predict());
       update(bit);
     }
+  }
+  ensure_contexts();
   const std::size_t n = coder.finish();
   if (coder.overflowed() || n >= raw.size()) return false;
   out.resize(start + n);
@@ -691,6 +732,16 @@ void Model::decode(std::span<const u8> payload, std::span<u8> out) {
   if (out.size() > buffer_.size() - history_.position) throw Error("ultracodec: Tier 4 history overflow");
   RangeDecoder coder(payload);
   for (u8& c : out) {
+    if (bypass_ready()) {
+      const u32 bucket = bypass_bucket(), hit = coder.decode(bypass_p_[bucket]);
+      bypass_update(bucket, hit);
+      if (hit) {
+        c = match_.next_byte(history_);
+        skip_byte(c);
+        continue;
+      }
+    }
+    ensure_contexts();
     u32 x = 0;
     for (unsigned b = 0; b < 8; ++b) {
       const u32 bit = coder.decode(predict());
@@ -699,6 +750,7 @@ void Model::decode(std::span<const u8> payload, std::span<u8> out) {
     }
     c = static_cast<u8>(x);
   }
+  ensure_contexts();
   if (!coder.consumed_exactly()) throw Error("ultracodec: Tier 4 stream did not end cleanly (corrupt block)");
 }
 
