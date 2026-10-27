@@ -20,6 +20,12 @@ around snapshot warm-start: -28.8% vs `zstd -19` on a text/code corpus at
 1.7 MB/s on 4 cores of an Apple M4 (see "Tier 4" below). The measured
 numbers and the reasons are below.
 
+October 27 second pass (see "Tier 1 entropy mode" and "Tier 4"): Tier 1 now
+codes entropy-coded sequences by default, +33.5% vs `zstd -19` instead of
++93%, at 606-626 MB/s on 4 x86 threads (target 752 missed). Tier 4 fits
+under 1 GB on 4 threads with recorded table layouts (909 MiB peak, +0.35%
+size) and runs 13% faster from one cache line per lookup.
+
 ## API
 
 ```cpp
