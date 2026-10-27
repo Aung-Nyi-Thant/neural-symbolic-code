@@ -9,14 +9,16 @@ four strategies:
 | 1 | Hyper-Speed | Byte-level LZ77 in the LZ4 block layout, 16 Ki-entry hash table, 64 KiB window | 1 MiB | ~64 KiB tables per thread |
 | 2 | Consumer | Lazy hash-chain LZ77 with repeat offsets + 8-way interleaved static rANS (AVX2 / NEON decode) | 2 MiB | ~25 MiB per thread |
 | 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 32 MiB table + ~29 MiB per thread, budget 512 MiB |
-| 4 | Enterprise TR3 | Long-range dedup pass, then 4 MiB wavefront-primed blocks through a 14-input, two-layer CM + binary rANS | 4 MiB + 256 KiB prefix | 640 MiB table + ~180 MiB per thread, budget 3.5 GiB |
+| 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 mixer sets, 4 APMs, binary range coder | 2 MiB | ~200 MiB per model: snapshot + one per worker (~1.1 GiB at 4 threads), budget 4 GiB |
 
 **Results in one line:** every tier round-trips, all archives are
 deterministic and the same on x86 and ARM, and RAM stays within budget.
 Tier 2 meets its speed target. Tier 1 decompression meets its target, but
-Tier 1 compression does not. Tiers 3 and 4 miss their speed targets by a
-wide margin, and on the mixed corpus they miss their density targets too.
-The measured numbers and the reasons are below.
+Tier 1 compression does not. Tier 3 misses its speed target by a wide
+margin, and on the mixed corpus its density target too. Tier 4 was rebuilt
+around snapshot warm-start: -28.8% vs `zstd -19` on a text/code corpus at
+1.7 MB/s on 4 cores of an Apple M4 (see "Tier 4" below). The measured
+numbers and the reasons are below.
 
 ## API
 
@@ -44,10 +46,15 @@ The `ultra` tool compresses files: `ultra c -t 3 in out`, `ultra d in out`,
 ArchiveHeader   32 bytes: "ULTR", version 1, tier, flags, block_log2,
                 u64 size, u32 block count, u32 prefix length, u32 model
                 parameter, CRC-32C of the first 28 bytes
-[dedup section] (flag 2, Tiers 3/4) u32 size + removed-repeat list, CRC of the original
+[dedup section] (flag 2, Tier 3) u32 size + removed-repeat list, CRC of the original
 block table     per block {u32 payload size, u32 CRC-32C of the raw block}, then its own CRC
 payloads        one per block: method byte (0 stored, 1 coded) + tier data
 ```
+
+Tier 4 sets flag 4 (snapshot warm-start) and stores the CRC-32C of its
+primer in the model parameter (0 = no primer). Its blocks are coded in the
+same layout, but every block after block 0 is decoded by a copy of the
+model that has read the primer and block 0.
 
 The decoder validates every length against the archive before it allocates
 anything. It caps output at `max_output_bytes`, checks every block CRC, and
@@ -90,9 +97,10 @@ varies by about ±20% from run to run.
 | 1 | 10,220,112 | +93% | 240 / 815 | 752 / 1,389 | 152 MiB |
 | 2 | 6,162,287 | +16.3% | 13-19 / 275-323 | 33 / 620 | 177 MiB |
 | 3 | 4,748,159 | **-10.4%** | 1.5 / 1.6 | 4.5 / 4.9 | 454 MiB |
-| 4 | 4,153,233 | **-21.6%** | ~0.12 / ~0.13 | 0.32 / 0.38 (0.66 / 0.78 on the 26 MB concatenation) | 3.6 GiB |
+| 4 (old TR3 design, replaced) | 4,153,233 | -21.6% | ~0.12 / ~0.13 | 0.32 / 0.38 (0.66 / 0.78 on the 26 MB concatenation) | 3.6 GiB |
 
-Per-file reduction vs zstd -19 (Tier 3 / Tier 4): Python -10.7% / -21.8%,
+The new Tier 4 was measured on a different corpus; see "Tier 4" below.
+Per-file reduction vs zstd -19 for the old design (Tier 3 / Tier 4): Python -10.7% / -21.8%,
 XML -4.7% / -16.0%, Perl+docs -13.2% / -23.5%, binaries -5.8% / -18.8%,
 novel -17.4% / -26.7%. On four 2 MB text/code samples alone (Python,
 novel, XML, docs), Tier 3 is -17.0% and Tier 4 -25.0%.
@@ -108,9 +116,63 @@ file: 3,026,137 bytes at 363 / 1003 MB/s. Tier 1 is 2,891,213 bytes at
 | 1 | 1.0-1.8 GB/s | Decompress 1.39 GB/s on 4 threads (0.82 on 1). Compress 0.75-0.82 GB/s on 4 threads (0.24 on 1). | Decompress met on 4 threads; compress missed. One core of this VM runs LZ4 itself at 0.26-0.61 GB/s, so a GB/s per core needs a faster machine. |
 | 2 | 15-20+ MB/s, <= 256 MiB | 33 MB/s comp on 4 threads, 13-19 on 1; decode 275-620 MB/s; 177 MiB | Met on 2+ threads; borderline on 1 thread. |
 | 3 | ~11 MB/s, 17.2% smaller than zstd -19, ~500 MiB | 4.5-4.8 MB/s on 4 threads; -10.4% on the mixed corpus, -17.0% on text/code; 454 MiB | Speed missed (~2.4x). Density met only on text/code. RAM met. |
-| 4 | >= 10 MB/s, 30-33% smaller, 3-4 GB | 0.3-0.7 MB/s on 4 threads; -21.6%; 3.6 GiB | Speed missed by ~15-30x, density missed by ~9 points. RAM met. |
+| 4 (old TR3) | >= 10 MB/s, 30-33% smaller, 3-4 GB | 0.3-0.7 MB/s on 4 threads; -21.6%; 3.6 GiB | Speed missed by ~15-30x, density missed by ~9 points. Replaced by SWS. |
+| 4 (SWS) | about -29% at about 2 MB/s | -28.8% per file (-26.8% as one mixed archive); 1.67 MB/s on 4 M4 cores; ~1.1 GiB | Density within 0.2 points on separate files; speed ~15% short on 4 cores. |
 
-### Why Tiers 3 and 4 miss
+### Tier 4: snapshot warm-start (SWS)
+
+A CM codec uses several cores by splitting the input into blocks with
+their own models, and every cold block forgets what the model learned:
+with 1 MiB blocks the 22-context model of `sws_model.cpp` (a port of the
+HCE "Ultra v4" lean model) loses ~7 points against coding a whole file.
+Tier 4 trains one model on a built-in 256 KiB primer and then on block 0,
+coding block 0 as it goes. Every later block is coded by a copy of that
+snapshot, so it starts with trained tables, mixer weights and APMs, and
+with block 0 in its match history. Those blocks are independent, so encode
+and decode both run them on all workers; only block 0 is serial.
+
+Measured 2026-10-27 on a 22.8 MB text/code corpus: 8 MiB Python 3.12
+stdlib (`*.py`, no tests), 4 MiB Perl modules, 4 MiB `/usr/share`
+XML/HTML/SVG and 5.7 MB of five Gutenberg novels. `zstd -19` gives
+4,191,049 bytes summed per file.
+
+| Input | Tier 4 bytes | vs zstd -19 |
+|---|---|---|
+| Four files, each compressed on its own | 2,985,777 | **-28.8%** |
+| Same, without the primer | 3,010,537 | -28.2% |
+| One 22.8 MB concatenation (one archive) | 3,066,541 | -26.8% |
+| Same, without the primer | 3,087,616 | -26.3% |
+| 4 MiB of ELF binaries from `/usr/bin` (zstd -19: 1,563,496) | 1,236,203 | -20.9% |
+
+Per file: Python -30.8%, Perl -29.5%, novels -26.6%, XML -29.3%. The
+primer helps mostly the Python file (-1.9%): it holds CPython 3.11 library
+code, which is close to this corpus even though the primer excludes the
+modules the benchmark corpus was built from. A concatenation compresses
+worse than separate files because the snapshot learns only block 0 (here
+Python), and the later Perl, prose and XML blocks start from that.
+
+| Machine | Threads | Compress / decompress (22.8 MB concatenation) | Peak RSS (bench) |
+|---|---|---|---|
+| Apple M4 (Linux VM, 4 cores) | 1 | 0.65 / 0.64 MB/s | 462 MiB |
+| Apple M4 (Linux VM, 4 cores) | 4 | 1.67 / 1.58 MB/s | 1,085 MiB |
+| x86 VM (Xeon 2.8 GHz) | 1 | 0.20 / 0.19 MB/s | 457 MiB |
+| x86 VM (Xeon 2.8 GHz) | 4 | 0.44 / 0.47 MB/s | 1,080 MiB |
+
+Archives are byte-identical on both machines and for any thread count.
+Separate files run slower (0.86 MB/s on the M4 at 4 threads) because a
+4-8 MiB file has only 1-3 blocks after the serial block 0.
+
+Memory: each model is ~200 MiB (twenty 8 MiB context tables, a 16 MiB
+match table, mixers, APMs and its history), and a call holds the snapshot
+plus one copy per worker. `memory_budget` (default 4 GiB) caps the
+workers; archives do not depend on it. Small inputs get smaller tables,
+because tables are sized from the bytes a model will see.
+
+Not done: block 0 is serial in decode, so speed grows with the number of
+blocks; the encoder could run v4's bit-exact producer pipeline on it, but
+the decoder cannot.
+
+### Why Tiers 3 and 4 (old design) miss
 
 * **Per-core speed.** A context-mixing model codes eight binary decisions
   per byte. Each one reads, mixes and updates every context, so the work
@@ -165,7 +227,8 @@ its own with `cmake -S ultracodec -B build-ultra`. The CTest entry
 validation, the CRC-32C known answer, rANS scalar/AVX2/NEON agreement,
 round trips of every tier over edge cases (empty input, 1 byte, block
 size ± 1, random, zeros, structured, text), byte-identical archives for
-1/2/3/4/7 threads, engine rules, corruption fuzzing, and peak RSS per tier
+1/2/3/4/7 threads, engine rules, the Tier 4 primer path, corruption
+fuzzing, and peak RSS per tier
 in a forked child (Linux, not under sanitizers). It passes with GCC and
 Clang at `-Werror` and under ASan+UBSan and TSan. The AArch64 and MinGW
 builds compile cleanly at `-Werror`.
@@ -191,7 +254,10 @@ src/cm_model.hpp                CM predictor: LUTs, counters, buckets, mixer ker
 src/cm_codec.hpp                CM block codec and engine (table sizing, worker cap)
 src/dedup.{hpp,cpp}             Long-range dedup pre-pass
 src/tier3_balanced.cpp          Tier 3 profile (contexts and knobs)
-src/tier4_enterprise.cpp        Tier 4 profile
+src/tier4_enterprise.cpp        Tier 4 engine: primer, block 0, snapshot copies on workers
+src/sws_model.{hpp,cpp}         Tier 4 22-context CM (port of HCE Ultra v4), copyable for snapshots
+src/sws_primer.inc              Tier 4 built-in 256 KiB primer (sources: third_party/sws_primer/NOTICE.md)
+src/range_coder.hpp             Tier 4 binary range coder
 tools/ultra_cli.cpp             ultra: compress/decompress/inspect files
 tools/ultra_bench.cpp           ultra_bench: round-trip benchmark
 tests/test_ultracodec.cpp       Test suite

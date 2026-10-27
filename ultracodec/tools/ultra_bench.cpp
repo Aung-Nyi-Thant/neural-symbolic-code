@@ -1,7 +1,8 @@
 // ultra_bench: round-trip benchmark for one ultracodec tier.
 //
 //   ultra_bench <tier 1-4> [--threads N] [--block BYTES] [--budget MIB]
-//               [--prime BYTES] [--runs N] [--kernel auto|scalar|avx2|neon] FILE...
+//               [--prime BYTES] [--runs N] [--kernel auto|scalar|avx2|neon]
+//               [--no-primer] [--total-only] FILE...
 //
 // For every file (and the concatenation of all of them, "TOTAL") prints the
 // compressed size, ratio, compress and decompress throughput (best of
@@ -64,6 +65,7 @@ int main(int argc, char** argv) {
     else if (a == "--prime") opt.prime_bytes = std::strtoull(next(), nullptr, 0);
     else if (a == "--runs") runs = std::atoi(next());
     else if (a == "--total-only") each = false;
+    else if (a == "--no-primer") opt.tier4_primer = false;
     else if (a == "--kernel") {
       std::string k = next();
       using detail::RansKernel;

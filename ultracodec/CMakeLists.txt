@@ -26,7 +26,8 @@ add_library(ultracodec STATIC
   src/tier1_hyperspeed.cpp
   src/tier2_consumer.cpp
   src/tier3_balanced.cpp
-  src/tier4_enterprise.cpp)
+  src/tier4_enterprise.cpp
+  src/sws_model.cpp)
 target_include_directories(ultracodec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(ultracodec PUBLIC cxx_std_20)
 target_link_libraries(ultracodec PUBLIC Threads::Threads)
