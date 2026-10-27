@@ -79,6 +79,9 @@ struct EngineOptions {
   std::size_t memory_budget = 0;        // bytes for all model tables (Tiers 3/4)
   std::size_t prime_bytes = SIZE_MAX;   // wavefront prefix; SIZE_MAX = tier default, 0 = off
   std::uint64_t max_output_bytes = std::uint64_t{1} << 36;  // decompress refuses larger archives
+  // Tier 1 entropy mode (recorded in the archive): entropy-coded sequences, about 1.4x smaller than
+  // the raw LZ4-layout mode and slower to decode. false = the raw mode.
+  bool tier1_entropy = true;
   bool tier4_primer = true;             // Tier 4: model the built-in primer first (archive records it)
   // Tier 4 context-table layout, recorded in the archive: 0 full (~194 MiB per model), 1 balanced
   // (~158 MiB, +0.2% size), 2 compact (~138 MiB, +0.5%), 3 small (~74 MiB, +2.2%). -1 picks the

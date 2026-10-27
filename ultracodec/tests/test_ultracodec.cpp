@@ -285,6 +285,30 @@ void test_engine_rules() {
   CHECK(!create_engine(TierLevel::Tier3_Balanced)->get_name().empty());
 }
 
+// Tier 1's two modes: both round-trip edge-case inputs, the archive records the mode, and the
+// entropy mode is the smaller one on text.
+void test_tier1_modes() {
+  std::vector<Bytes> inputs = {{}, Bytes(1, 7), Bytes(100000, 0), random_bytes(70000, 41), text_bytes(300000, 42)};
+  Bytes mixed = text_bytes(150000, 43);
+  Bytes rnd = random_bytes(40000, 44);
+  mixed.insert(mixed.begin() + 50000, rnd.begin(), rnd.end());
+  inputs.push_back(mixed);
+  for (const bool entropy : {false, true}) {
+    EngineOptions o = small_options(TierLevel::Tier1_HyperSpeed, 2);
+    o.tier1_entropy = entropy;
+    auto e = create_engine(TierLevel::Tier1_HyperSpeed, o);
+    for (const Bytes& in : inputs) {
+      const Bytes a = e->compress(in);
+      CHECK(e->decompress(a) == in);
+      if (!in.empty()) CHECK(peek_header(a).model_param == (entropy ? 1u : 0u));
+    }
+  }
+  EngineOptions raw;
+  raw.tier1_entropy = false;
+  const Bytes& text = inputs[4];
+  CHECK(compress(TierLevel::Tier1_HyperSpeed, text).size() * 5 < create_engine(TierLevel::Tier1_HyperSpeed, raw)->compress(text).size() * 4);
+}
+
 // Tier 4 with its built-in primer: round trips over several blocks and
 // thread counts, archives that do not depend on the thread count, and a
 // primer ID the decoder does not know.
@@ -507,6 +531,8 @@ int main() {
   test_thread_independence();
   std::printf("engine rules\n");
   test_engine_rules();
+  std::printf("tier 1 modes\n");
+  test_tier1_modes();
   std::printf("tier 4 primer\n");
   test_tier4_primer();
   std::printf("tier 4 table layouts\n");

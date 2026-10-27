@@ -6,10 +6,10 @@ four strategies:
 
 | Tier | Name | Backend | Default block | Memory |
 |---|---|---|---|---|
-| 1 | Hyper-Speed | Byte-level LZ77 in the LZ4 block layout, 64 Ki-entry hash table, 64 KiB window | 1 MiB | ~256 KiB tables per thread |
+| 1 | Hyper-Speed | Default: greedy two-hash LZ77 over the whole block with repeat offsets, entropy-coded sequences (rANS). Raw mode: byte-level LZ77 in the LZ4 block layout, 64 KiB window | 1 MiB | ~0.8 MiB tables per thread |
 | 2 | Consumer | Gated word-dictionary pre-filter, lazy hash-chain LZ77 with repeat offsets, 8-way interleaved static rANS (AVX2 / NEON decode) with literals split into 16 context streams | 2 MiB | ~30 MiB per thread |
 | 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 32 MiB table + ~29 MiB per thread, budget 512 MiB |
-| 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 mixer sets, 4 APMs, binary range coder | 2 MiB | ~200 MiB per model: snapshot + one per worker (~1.1 GiB at 4 threads), budget 4 GiB |
+| 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 mixer sets, 4 APMs, binary range coder | 2 MiB | 74-194 MiB per model by table layout: snapshot + one per worker (~0.9 GiB at 4 threads), budget 900 MiB |
 
 **Results in one line:** every tier round-trips, all archives are
 deterministic and the same on x86 and ARM, and RAM stays within budget.
@@ -207,6 +207,34 @@ Not done: block 0 is serial in decode, so speed grows with the number of
 blocks; the encoder could run v4's bit-exact producer pipeline on it, but
 the decoder cannot.
 
+### Tier 1 entropy mode
+
+Tier 1's default mode (`tier1_entropy`, recorded as model_param 1) writes
+the same sequence streams as Tier 2 (`seq_codec.hpp`, one literal stream
+instead of 16), from a greedy parser in the style of zstd's "dfast": repeat
+offset 0 at the next position, an 8-byte hash (2^17 entries) and a 5-byte
+hash (2^16), the longer match wins, backward extension, and repeat offset 1
+straight after each match. The raw LZ4-layout mode stays available
+(`tier1_entropy = false`).
+
+Measured 2026-10-27 on a 26.97 MB mixed corpus (4 MiB ELF binaries, 8 MiB
+Python, 4 MiB Perl, 6 MB Gutenberg prose, 4 MiB XML; `zstd -19` =
+5,758,651 bytes summed per file), 4-vCPU x86 VM at 2.1 GHz:
+
+| | size, files | vs zstd -19 | 1 thread comp / dec | 4 threads comp / dec (concatenation) | 4 threads comp, separate files |
+|---|---|---|---|---|---|
+| raw mode | 11,089,808 | +92.6% | 244 / 840 | 788 / 1,332 | 751 |
+| entropy mode | 7,686,216 | **+33.5%** | 160-168 / 310-356 | 606-626 / 866-937 | 463-519 |
+| zstd 2, 1 MiB blocks (python-zstandard) | 7,758,186 | +34.7% | 247 | 886 | |
+| zstd 3, 1 MiB blocks | 7,401,328 | +28.5% | 205 | 751 | |
+
+The entropy mode is as dense as `zstd -2` but 1.5x slower to compress, so it
+misses the 752 MB/s 4-thread target on this VM. A third of its time is the
+rANS encoder, which now renormalizes without a branch (2x faster, same
+streams, so Tier 2 archives are unchanged). Things that did not pay: a 5-byte hash alone (+4% size for +10% speed), 256-512 KiB blocks
+(+2-4% size, no faster on 4 threads), and replacing the encoder's divide by
+a reciprocal multiply (no faster).
+
 ### Tiers 1 and 2 against real codecs
 
 Re-measured on a rebuild of the same five-file corpus (26.4 MB; zstd -19 =
@@ -319,7 +347,8 @@ src/engine.cpp                  Factory
 src/block_engine.{hpp,cpp}      Block container: framing, validation, worker pool, wavefront waits
 src/common.{hpp,cpp}            LE access, CRC-32C (SSE4.2 or slice-by-8), vector copy, huge-page arrays
 src/lz_util.hpp                 Match length, wild and overlapping copies
-src/tier1_hyperspeed.cpp        Tier 1 LZ77
+src/tier1_hyperspeed.cpp        Tier 1 LZ77: raw LZ4-layout mode and entropy mode
+src/seq_codec.hpp               Entropy-coded LZ77 sequences (Tiers 1 and 2)
 src/tier2_consumer.cpp          Tier 2 lazy LZ77 + rANS streams
 src/word_filter.cpp             Tier 2 word-dictionary pre-filter
 src/word_dict.inc               its two built-in dictionaries (tools/word_dict/make_dict.py)
