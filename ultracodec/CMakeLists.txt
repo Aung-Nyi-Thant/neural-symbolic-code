@@ -25,6 +25,7 @@ add_library(ultracodec STATIC
   src/rans_static.cpp
   src/tier1_hyperspeed.cpp
   src/tier2_consumer.cpp
+  src/word_filter.cpp
   src/tier3_balanced.cpp
   src/tier4_enterprise.cpp
   src/sws_model.cpp)

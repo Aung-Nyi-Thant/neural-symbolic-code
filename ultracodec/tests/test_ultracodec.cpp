@@ -2,6 +2,7 @@
 // thread-count independence, the rANS vector kernels against the scalar
 // decoder, header/framing validation, corruption (truncation and random bit
 // flips must throw ultracodec::Error or decode to the original, never crash;
+// the Tier 2 word filter gets the same treatment on its own;
 // run under ASan/UBSan in CI) and peak-RSS limits per tier (Linux, not under
 // sanitizers).
 //
@@ -17,6 +18,7 @@
 
 #include "common.hpp"
 #include "rans_static.hpp"
+#include "word_filter.hpp"
 #include "ultracodec/engine.hpp"
 
 #if defined(__linux__)
@@ -84,6 +86,27 @@ Bytes text_bytes(std::size_t n, std::uint32_t seed) {
   }
   s.resize(n);
   return Bytes(s.begin(), s.end());
+}
+
+// text_bytes with capitalized, upper-case and mixed-case words, digits,
+// identifiers, UTF-8 and the filter's own escape bytes mixed in.
+Bytes cased_text_bytes(std::size_t n, std::uint32_t seed) {
+  static const char* extra[] = {"The", "THE", "McDonald", "iPhone", "A", "I", "X1", "_init_", "__INIT__",
+                                "foo_bar9", "caf\xc3\xa9", "\x01\x02\xff", "2024", "HTTPServer", "Return"};
+  Bytes base = text_bytes(n, seed);
+  std::mt19937 rng(seed);
+  Bytes out;
+  for (std::size_t i = 0; i < base.size(); ++i) {
+    out.push_back(base[i]);
+    if (base[i] == ' ' && rng() % 6 == 0) {
+      const char* w = extra[rng() % (sizeof extra / sizeof *extra)];
+      out.insert(out.end(), w, w + std::strlen(w));
+      out.push_back(' ');
+    }
+  }
+  out.insert(out.end(), 300, 'q');  // a word longer than 255 bytes
+  out.resize(n);
+  return out;
 }
 
 Bytes structured_bytes(std::size_t n) {
@@ -199,6 +222,7 @@ void test_roundtrips() {
   inputs.emplace_back("tiny-random", random_bytes(100, 1));
   inputs.emplace_back("zeros", Bytes(150000, 0));
   inputs.emplace_back("text", text_bytes(300000, 2));
+  inputs.emplace_back("cased-text", cased_text_bytes(200000, 7));
   inputs.emplace_back("random", random_bytes(140000, 3));
   inputs.emplace_back("structured", structured_bytes(200000));
   inputs.emplace_back("block-1", text_bytes(65535, 4));
@@ -340,6 +364,42 @@ void test_corruption() {
   }
 }
 
+void test_word_filter() {
+  using detail::WordDict;
+  std::vector<Bytes> inputs = {Bytes{}, Bytes{'A'}, Bytes{1, 2, 0xFF, 0, 0x80}, cased_text_bytes(50000, 31),
+                               text_bytes(50000, 32), random_bytes(20000, 33), Bytes(400, 'Z')};
+  for (WordDict d : {WordDict::Prose, WordDict::Code}) {
+    for (const Bytes& in : inputs) {
+      Bytes f;
+      detail::word_filter_encode(d, in, f);
+      CHECK(f.size() <= 2 * in.size());
+      Bytes back(in.size());
+      detail::word_filter_decode(d, f, back);
+      CHECK(back == in);
+    }
+  }
+  CHECK(detail::word_filter_choose(cased_text_bytes(200000, 34)) != WordDict::None);
+  CHECK(detail::word_filter_choose(random_bytes(200000, 35)) == WordDict::None);
+  CHECK(detail::word_filter_choose(structured_bytes(200000)) == WordDict::None);
+  // Corrupt filtered data: throw or decode to some bytes, never overrun.
+  std::mt19937 rng(36);
+  Bytes in = cased_text_bytes(20000, 37), f;
+  detail::word_filter_encode(WordDict::Code, in, f);
+  int threw = 0;
+  for (int i = 0; i < fuzz_iters(150) * 4; ++i) {
+    Bytes bad = f;
+    if (i % 2) bad.resize(rng() % bad.size());
+    else bad[rng() % bad.size()] = static_cast<std::uint8_t>(rng());
+    Bytes out(in.size() + (rng() % 3) - 1);
+    try {
+      detail::word_filter_decode(WordDict::Code, bad, out);
+    } catch (const Error&) {
+      ++threw;
+    }
+  }
+  CHECK(threw > 0);
+}
+
 #if defined(ULTRA_TEST_RSS) && !defined(ULTRA_SANITIZED)
 // Runs compress + decompress with default options in a child process and
 // returns its peak RSS in MiB.
@@ -395,6 +455,8 @@ int main() {
   test_engine_rules();
   std::printf("tier 4 primer\n");
   test_tier4_primer();
+  std::printf("word filter\n");
+  test_word_filter();
   std::printf("corruption\n");
   test_corruption();
 #if defined(ULTRA_TEST_RSS) && !defined(ULTRA_SANITIZED)

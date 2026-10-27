@@ -6,8 +6,8 @@ four strategies:
 
 | Tier | Name | Backend | Default block | Memory |
 |---|---|---|---|---|
-| 1 | Hyper-Speed | Byte-level LZ77 in the LZ4 block layout, 16 Ki-entry hash table, 64 KiB window | 1 MiB | ~64 KiB tables per thread |
-| 2 | Consumer | Lazy hash-chain LZ77 with repeat offsets + 8-way interleaved static rANS (AVX2 / NEON decode) | 2 MiB | ~25 MiB per thread |
+| 1 | Hyper-Speed | Byte-level LZ77 in the LZ4 block layout, 64 Ki-entry hash table, 64 KiB window | 1 MiB | ~256 KiB tables per thread |
+| 2 | Consumer | Gated word-dictionary pre-filter, lazy hash-chain LZ77 with repeat offsets, 8-way interleaved static rANS (AVX2 / NEON decode) with literals split into 16 context streams | 2 MiB | ~30 MiB per thread |
 | 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 32 MiB table + ~29 MiB per thread, budget 512 MiB |
 | 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 mixer sets, 4 APMs, binary range coder | 2 MiB | ~200 MiB per model: snapshot + one per worker (~1.1 GiB at 4 threads), budget 4 GiB |
 
@@ -95,7 +95,7 @@ varies by about ±20% from run to run.
 | Tier | Size | vs zstd -19 | 1 thread comp / dec | 4 threads comp / dec | Peak RSS (bench, 4 thr.) |
 |---|---|---|---|---|---|
 | 1 | 10,220,112 | +93% | 240 / 815 | 752 / 1,389 | 152 MiB |
-| 2 | 6,162,287 | +16.3% | 13-19 / 275-323 | 33 / 620 | 177 MiB |
+| 2 | 6,162,287 | +16.3% | 13-19 / 275-323 | 33 / 620 | 177 MiB (before the word filter; see below) |
 | 3 | 4,748,159 | **-10.4%** | 1.5 / 1.6 | 4.5 / 4.9 | 454 MiB |
 | 4 (old TR3 design, replaced) | 4,153,233 | -21.6% | ~0.12 / ~0.13 | 0.32 / 0.38 (0.66 / 0.78 on the 26 MB concatenation) | 3.6 GiB |
 
@@ -172,6 +172,41 @@ Not done: block 0 is serial in decode, so speed grows with the number of
 blocks; the encoder could run v4's bit-exact producer pipeline on it, but
 the decoder cannot.
 
+### Tiers 1 and 2 against real codecs
+
+Re-measured on a rebuild of the same five-file corpus (26.4 MB; zstd -19 =
+5,217,375 bytes summed per file), one thread, peers via python-zstandard,
+python-lz4, brotli and lzma:
+
+| codec | size | vs zstd -19 | comp MB/s | dec MB/s |
+|---|---|---|---|---|
+| lz4 -1 | 10,733,385 | +106% | 380 | 1,130 |
+| Tier 1 (16 Ki hash) | 10,137,183 | +94% | 344 | 1,256 |
+| **Tier 1 (64 Ki hash)** | 9,980,486 | **+91%** | 327 | 1,366 |
+| lz4 -12 | 7,877,407 | +51% | 9.8 | 1,446 |
+| zstd -1 | 7,361,338 | +41% | 278 | 754 |
+| zstd -3 | 6,568,232 | +26% | 199 | 825 |
+| Tier 2 (no filter, order-0 literals) | 6,062,343 | +16.2% | 23-25 | 430-447 |
+| zstd -6 | 6,024,509 | +15% | 73 | 792 |
+| brotli -6 | 5,773,772 | +11% | 27 | ~380 |
+| zstd -12 | 5,759,873 | +10% | 18 | 621 |
+| **Tier 2 (filter + 16 literal streams)** | 5,666,549 | **+8.6%** | 24-26 | 270-279 |
+| zstd -15 | 5,653,379 | +8% | 4.0 | 731 |
+| zstd -18 | 5,233,396 | +0.3% | 2.4 | |
+| zstd -19 | 5,217,375 | 0 | 1.9 | 669 |
+
+Tier 2 per file vs zstd -19: bin +10.2%, novel +1.7%, Perl +8.5%, Python
++8.7%, XML +17.8%. On 4 threads it compresses at 32-52 MB/s and decodes at
+490-570 MB/s. The filter is what costs decode speed (about 300-460 MB/s
+per output byte on its own), plus the per-byte literal loop.
+
+No LZ codec reaches zstd -19 size above about 2.5 MB/s per core, and LZ4's
+byte format cannot get below +51% at any speed. Measured levers that did
+not go in: an 8 MiB window across blocks (-1.6%, 1.4x slower, blocks stop
+decoding independently), hash chain depth 64 (-2.1%, 2.8x slower), a
+price-based optimal parser (-3.8%, 4.7x slower; +3.1% vs zstd -19 at
+2.9 MB/s together with the rest), per-128 KiB rANS tables (-0.15%).
+
 ### Why Tiers 3 and 4 (old design) miss
 
 * **Per-core speed.** A context-mixing model codes eight binary decisions
@@ -205,6 +240,9 @@ What would close the gap is a different design, not tuning:
 * Many more cores for the CM tiers.
 
 ## Tuning notes (all measured on the 4 × 2 MB samples)
+
+* Tier 1 hash table: 64 Ki entries is 1.5% smaller than 16 Ki entries on
+  the 26 MB corpus at the same speed (the results table above used 16 Ki).
 
 * Counter limit (adaptation floor 1/(n+1.5)): 16 is better than 30 (-0.2%)
   and 127 (-0.8%).
@@ -248,6 +286,8 @@ src/common.{hpp,cpp}            LE access, CRC-32C (SSE4.2 or slice-by-8), vecto
 src/lz_util.hpp                 Match length, wild and overlapping copies
 src/tier1_hyperspeed.cpp        Tier 1 LZ77
 src/tier2_consumer.cpp          Tier 2 lazy LZ77 + rANS streams
+src/word_filter.cpp             Tier 2 word-dictionary pre-filter
+src/word_dict.inc               its two built-in dictionaries (tools/word_dict/make_dict.py)
 src/rans_static.{hpp,cpp}       8-way static rANS, scalar / AVX2 / NEON decoders
 src/rans_binary.hpp             Two-state binary rANS for the CM tiers
 src/cm_model.hpp                CM predictor: LUTs, counters, buckets, mixer kernels, APM, match model
