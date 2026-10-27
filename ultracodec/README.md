@@ -6,7 +6,7 @@ four strategies:
 
 | Tier | Name | Backend | Default block | Memory |
 |---|---|---|---|---|
-| 1 | Hyper-Speed | Byte-level LZ77 in the LZ4 block layout, 16 Ki-entry hash table, 64 KiB window | 1 MiB | ~64 KiB tables per thread |
+| 1 | Hyper-Speed | Byte-level LZ77 in the LZ4 block layout, 64 Ki-entry hash table, 64 KiB window | 1 MiB | ~256 KiB tables per thread |
 | 2 | Consumer | Lazy hash-chain LZ77 with repeat offsets + 8-way interleaved static rANS (AVX2 / NEON decode) | 2 MiB | ~25 MiB per thread |
 | 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 32 MiB table + ~29 MiB per thread, budget 512 MiB |
 | 4 | Enterprise TR3 | Long-range dedup pass, then 4 MiB wavefront-primed blocks through a 14-input, two-layer CM + binary rANS | 4 MiB + 256 KiB prefix | 640 MiB table + ~180 MiB per thread, budget 3.5 GiB |
@@ -143,6 +143,9 @@ What would close the gap is a different design, not tuning:
 * Many more cores for the CM tiers.
 
 ## Tuning notes (all measured on the 4 × 2 MB samples)
+
+* Tier 1 hash table: 64 Ki entries is 1.5% smaller than 16 Ki entries on
+  the 26 MB corpus at the same speed (the results table above used 16 Ki).
 
 * Counter limit (adaptation floor 1/(n+1.5)): 16 is better than 30 (-0.2%)
   and 127 (-0.8%).
