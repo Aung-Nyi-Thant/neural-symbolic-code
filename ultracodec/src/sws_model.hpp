@@ -11,9 +11,9 @@
 // kernels (AVX2 / NEON) produce the same results as the scalar ones.
 //
 // The model is copyable. Tier 4 trains one model on the primer and the
-// first block, then copies that snapshot into every worker (sws_engine);
-// rebind() must run after a copy so the copy's pointers refer to its own
-// tables and history.
+// first block, packs that snapshot (Model::pack) and copies it into every
+// worker; a copy re-runs the context lookup so its slot pointers refer to its
+// own tables.
 #pragma once
 
 #include <array>
@@ -27,11 +27,13 @@
 
 namespace ultracodec::detail::sws {
 
-// Makes dst an exact copy of src, reusing dst's mapping when the sizes match.
+// Makes dst an exact copy of src, reusing dst's mapping when the sizes match. An empty src is a
+// packed model's released array: dst is left alone, and Model::operator= fills it from the pack.
 template <class T>
 void copy_big(BigArray<T>& dst, const BigArray<T>& src) {
+  if (!src.size()) return;
   if (dst.size() != src.size()) dst.reset(src.size());
-  if (src.size()) std::memcpy(dst.data(), src.data(), src.size() * sizeof(T));
+  std::memcpy(dst.data(), src.data(), src.size() * sizeof(T));
 }
 
 inline constexpr std::size_t kOrders = 13, kSparse = 2, kWord = 3, kColumn = 2, kIndirect = 2;
@@ -42,17 +44,21 @@ inline constexpr std::size_t kSets = 4;
 inline constexpr std::array<std::size_t, kSets> kSetRows{256, 64 * 256, 256 * 8, 2048};
 inline constexpr std::size_t kMixRows = kSetRows[0] + kSetRows[1] + kSetRows[2] + kSetRows[3];
 inline constexpr std::int32_t kWeightLimit = std::int32_t{1} << 19;
-inline constexpr unsigned kBucketBits = 17;  // per-context table cap: 2^17 x 64 B = 8 MiB
+inline constexpr unsigned kBucketBits = 17;  // Full layout's per-context cap: 2^17 x 64 B = 8 MiB
 
 // Per-context table caps. The archive records the layout, because table sizes change the coded
 // bits. Measured on 2 MiB blocks after a 2 MiB snapshot (Python, Perl, prose, XML):
-//   Full      all contexts 2^17 buckets                          ~194 MiB per model
-//   Balanced  orders 2-4 and 16/24/32 at 2^15                     ~158 MiB, +0.20% size
-//   Compact   Balanced, plus orders 5-12 at 2^16                  ~138 MiB, +0.52% size
-//   Small     every context at 2^15                               ~74 MiB,  +2.2% size
-// Speed is the same for all four: the model is bound by instructions, not by cache misses.
-enum class TableLayout : u8 { Full = 0, Balanced = 1, Compact = 2, Small = 3 };
-inline constexpr unsigned kTableLayouts = 4;
+//   Full        all contexts 2^17 buckets                        ~194 MiB per model
+//   Balanced    orders 2-4 and 16/24/32 at 2^15                   ~158 MiB, +0.20% size
+//   Compact     Balanced, plus orders 5-12 at 2^16                ~138 MiB, +0.52% size
+//   Small       every context at 2^15                             ~74 MiB,  +2.2% size
+//   Rebalanced  bits moved from contexts that do not use them     ~159 MiB, -0.23% vs Balanced
+//               (column, indirect, sparse, orders 2/16) to the starved ones (orders 3-5,
+//               word pair, two words + byte); 2^20 match table
+//   Lean        Balanced minus the unused bits, 2^20 match table  ~123 MiB, +0.07% vs Balanced
+// Speed is the same for all of them: the model is bound by instructions, not by cache misses.
+enum class TableLayout : u8 { Full = 0, Balanced = 1, Compact = 2, Small = 3, Rebalanced = 4, Lean = 5 };
+inline constexpr unsigned kTableLayouts = 6;
 inline constexpr std::int32_t kLearningRate = 6;
 
 // Static tables of the model arithmetic, built once by integer-only code.
@@ -106,6 +112,8 @@ struct Bits {
 
 // Fixed slots: a 64 B bucket holds four 16 B slots (8-bit check + 15 nibble-node states).
 class SlotTable {
+  friend class Model;
+
  public:
   struct Slot {
     u8 check = 0;
@@ -148,6 +156,8 @@ class Frontend {
 };
 
 class Contexts {
+  friend class Model;
+
  public:
   void reset(std::size_t capacity, TableLayout layout);
   void lookup(const std::array<u64, kContexts>& hashes, u32 c0) noexcept;
@@ -165,6 +175,8 @@ class Contexts {
 };
 
 class Match {
+  friend class Model;
+
  public:
   Match() = default;
   Match(const Match& o) { *this = o; }
@@ -178,7 +190,7 @@ class Match {
     bits_ = o.bits_;
     return *this;
   }
-  void reset(std::size_t capacity);
+  void reset(unsigned bits);
   void predict(const History& h, u32 bit, std::int32_t* inputs) noexcept;
   void update(u32 bit) noexcept;
   void observe(const History& h) noexcept;
@@ -197,6 +209,8 @@ class Match {
 };
 
 class Mixer {
+  friend class Model;
+
  public:
   Mixer() = default;
   Mixer(const Mixer& o) { *this = o; }
@@ -210,6 +224,7 @@ class Mixer {
     mixed_ = o.mixed_;
     return *this;
   }
+  static constexpr std::int32_t kInitialWeight = 65536 / 8;
   void reset();
   u32 predict(const std::int32_t* inputs, u32 hits, u32 match_length, u32 match_bit, const Bits& bits) noexcept;
   void train(const std::int32_t* inputs, u32 bit) noexcept;
@@ -226,6 +241,8 @@ class Mixer {
 };
 
 class Calibration {
+  friend class Model;
+
  public:
   void reset();
   u16 predict(u32 mixed, u32 match_length, u32 match_bit, const Bits& bits) noexcept;
@@ -242,6 +259,7 @@ class Calibration {
     }
     BigArray<u16> values;
     std::size_t index = 0;
+    static std::array<u16, 33> initial();  // the value of every untouched row
     void reset(std::size_t rows);
     u32 predict(std::size_t row, u32 low, u32 weight) noexcept;
     void update(u32 bit) noexcept;
@@ -274,6 +292,15 @@ class Model {
   // Measured at 32 on a 27 MB mixed archive: 1.11x speed, +0.70% size (xml +3.5%, prose 0).
   void set_bypass(u32 min_length) noexcept { bypass_min_ = min_length; }
 
+  // Stores the large arrays packed (per 64-byte chunk: a mask of the non-zero bytes, then those
+  // bytes) and releases them. Used for the Tier 4 snapshot, which is only ever copied: its tables
+  // are 60-66% zero bytes after block 0, so it shrinks to ~40%. A copy of a packed model is a
+  // full, bit-exact model; the packed model itself can no longer code.
+  void pack();
+  bool packed() const noexcept { return packed_.size() != 0; }
+  // Bytes of heap memory this model holds now (less than bytes() once packed).
+  std::size_t resident_bytes() const noexcept;
+
   std::size_t position() const noexcept { return history_.position; }
   // Bytes of heap memory one model holds (tables, history, mixers, APMs).
   static std::size_t bytes(std::size_t capacity, TableLayout layout = TableLayout::Full) noexcept;
@@ -288,6 +315,9 @@ class Model {
   void bypass_update(u32 bucket, u32 hit) noexcept;
   void skip_byte(u8 byte) noexcept;
   void ensure_contexts() noexcept { if (pending_) { next_contexts(); pending_ = false; } }
+  void check_unpacked() const;
+  template <class F> void for_each_array(F&& f);
+  void unpack_into(Model& dst) const;
 
   BigArray<u8> buffer_;
   TableLayout layout_ = TableLayout::Full;
@@ -304,6 +334,8 @@ class Model {
   u32 bypass_min_ = 0;
   bool pending_ = false;  // bytes were skipped since the last context lookup
   std::array<u16, 16 * 256> bypass_p_{};  // P(predicted byte is right), 16-bit, by log2 match length and that byte
+  BigArray<u8> packed_;                    // the large arrays while packed (pack())
+  std::vector<std::size_t> packed_sizes_;  // their element counts
 };
 
 // The built-in primer (third_party/sws_primer/NOTICE.md) and its CRC-32C.

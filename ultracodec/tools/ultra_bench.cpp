@@ -2,7 +2,7 @@
 //
 //   ultra_bench <tier 1-4> [--threads N] [--block BYTES] [--budget MIB]
 //               [--prime BYTES] [--runs N] [--kernel auto|scalar|avx2|neon]
-//               [--no-primer] [--tables 0-3] [--bypass] [--total-only] FILE...
+//               [--no-primer] [--tables 0-5] [--bypass] [--total-only] FILE...
 //
 // For every file (and the concatenation of all of them, "TOTAL") prints the
 // compressed size, ratio, compress and decompress throughput (best of
