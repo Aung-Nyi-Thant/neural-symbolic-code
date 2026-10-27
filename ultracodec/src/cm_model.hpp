@@ -110,6 +110,10 @@ class Apm {
     t_.resize(contexts * 33);
     for (std::size_t i = 0; i < t_.size(); i += 33) std::memcpy(&t_[i], row, sizeof row);
   }
+  ULTRA_INLINE void prefetch(std::size_t cx) const noexcept {
+    ULTRA_PREFETCH(&t_[cx * 33]);
+    ULTRA_PREFETCH(&t_[cx * 33 + 32]);
+  }
   ULTRA_INLINE int pp(int st, std::size_t cx) noexcept {
     int s = st + 2048;  // 1..4095
     int lo = s >> 7, w = s & 127;
@@ -238,7 +242,11 @@ class CmModel {
  public:
   static constexpr unsigned kH = P::kHashed;
   static constexpr unsigned kM = P::kMatch;
-  static constexpr unsigned kInputs = (1 + kH + kM + 1 + 7) & ~7u;
+  // Confidence maps: one adaptive counter per (context, log2 count, p bucket)
+  // re-estimates each context's prediction from how often it was seen
+  // (an indirect, PAQ-StateMap-like second opinion; one extra input each).
+  static constexpr unsigned kC = P::kConfMaps ? 1 + kH : 0;
+  static constexpr unsigned kInputs = (2 + kH + kM + kC + 7) & ~7u;
   static constexpr unsigned kMixers = P::kTwoLayer ? 3 : 1;
 
   // bucket_pairs: hashed-counter table size in 128-byte pairs.
@@ -267,6 +275,7 @@ class CmModel {
       for (auto& row : w_[k]) init_row(row.w, P::kInitWeight);
     if constexpr (P::kTwoLayer)
       for (auto& row : fw_) init_row8(row.w, 16384 / 3);
+    std::fill(std::begin(cmap_), std::end(cmap_), 0u);
     for (unsigned m = 0; m < kM; ++m) {
       std::fill(std::begin(mctr_[m]), std::end(mctr_[m]), 0u);
       mlen_[m] = 0;
@@ -326,6 +335,16 @@ class CmModel {
     int v[kInputs] = {};
     v[0] = stretch(counter_p(*o1cur_));
     for (unsigned i = 0; i < kH; ++i) v[1 + i] = stretch(counter_p(bkt_[i][nib_]));
+    if constexpr (kC > 0) {
+      const u32 nib = nib_;
+      for (unsigned i = 0; i < kC; ++i) {
+        const u32 t = (i == kH ? *o1cur_ : bkt_[i][nib]) ^ kFlip;
+        const u32 n = t & 0xFFFF;
+        const unsigned nq = n == 0 ? 0 : std::min(1 + highbit32(n), 7u);
+        ccur_[i] = &cmap_[((i * 8 + nq) << 6) | (t >> 26)];
+        v[2 + kH + kM + i] = stretch(counter_p(*ccur_[i]));
+      }
+    }
     for (unsigned m = 0; m < kM; ++m) v[1 + kH + m] = mcur_[m] ? stretch(counter_p(*mcur_[m])) : 0;
     v[1 + kH + kM] = 256;
     pack_inputs<kInputs>(v, x_);
@@ -377,6 +396,8 @@ class CmModel {
       u32* nodes[kH];
       for (unsigned i = 0; i < kH; ++i) nodes[i] = bkt_[i] + nib;
       for (unsigned i = 0; i < kH; ++i) counter_update<P::kCounterLimit>(*nodes[i], y);
+      if constexpr (kC > 0)
+        for (unsigned i = 0; i < kC; ++i) counter_update<255>(*ccur_[i], y);
       if constexpr (P::kTwoLayer) {
         for (unsigned k = 0; k < 3; ++k) mix_train<kInputs>(x_, row_[k], ((y << 12) - pm_[k]) * P::kMixerLr);
         mix_train<8>(fx_, frow_, ((y << 12) - pmix_) * P::kFinalLr);
@@ -406,12 +427,18 @@ class CmModel {
     } else if (bit_ == 8) {
       byte_update();
     }
+    // The next bit's APM row and order-1 counter are known now: start the
+    // loads while the coder and the next bit's other inputs run.
+    const u32 c1 = bs_.c4 & 0xFF;
+    a1_.prefetch((c1 << 8) | c0_);
+    ULTRA_PREFETCH(&o1_[(c1 << 8) | c0_]);
   }
 
  private:
   static void init_row(short* w, int v) {
     for (unsigned i = 0; i < kInputs; ++i) w[i] = 0;
     for (unsigned i = 0; i < 1 + kH + kM; ++i) w[i] = static_cast<short>(v);
+    for (unsigned i = 0; i < kC; ++i) w[2 + kH + kM + i] = static_cast<short>(v);
   }
   static void init_row8(short* w, int v) {
     for (unsigned i = 0; i < 8; ++i) w[i] = static_cast<short>(i < 3 ? v : 0);
@@ -425,6 +452,12 @@ class CmModel {
   ULTRA_INLINE u32* pair_of(u32 h) noexcept {
     const std::size_t pair = static_cast<std::size_t>((static_cast<u64>(h) * pairs_) >> 32);
     return table_.data() + pair * 32;
+  }
+  // Both 64-byte ways of a pair.
+  ULTRA_INLINE void prefetch_pair(u32 h) noexcept {
+    u32* b = pair_of(h);
+    ULTRA_PREFETCH(b);
+    ULTRA_PREFETCH(b + 16);
   }
 
   // Two-way set-associative bucket lookup; replaces the less used way.
@@ -453,8 +486,8 @@ class CmModel {
   ULTRA_INLINE void prefetch_second_nibble() noexcept {
     const u32 a = c0_ << 1, b = a | 1;
     for (unsigned i = 0; i < kH; ++i) {
-      ULTRA_PREFETCH(pair_of(nibble_hash(h_[i], a)));
-      ULTRA_PREFETCH(pair_of(nibble_hash(h_[i], b)));
+      prefetch_pair(nibble_hash(h_[i], a));
+      prefetch_pair(nibble_hash(h_[i], b));
     }
   }
 
@@ -510,7 +543,7 @@ class CmModel {
       P::contexts(next_[y].bs, ctx);
       for (unsigned i = 0; i < kH; ++i) {
         hc_[y][i] = hash32(ctx[i] + (static_cast<u64>(i + 1) << 58));
-        ULTRA_PREFETCH(pair_of(hc_[y][i]));
+        prefetch_pair(hc_[y][i]);
       }
       for (unsigned m = 0; m < kM; ++m) {
         ms_[y][m] = match_slot(m, next_[y].bs);
@@ -576,6 +609,8 @@ class CmModel {
   unsigned bit_ = 0;
   u32* o1cur_ = nullptr;
 
+  u32 cmap_[(kH + 1) * 8 * 64] = {};
+  u32* ccur_[kH + 1] = {};
   u32 mlen_[kM] = {};
   std::size_t mptr_[kM] = {};
   u32 mctr_[kM][64] = {};

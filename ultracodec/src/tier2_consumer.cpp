@@ -1,7 +1,7 @@
 // Tier 2: Consumer. Lazy hash-chain LZ77 with repeat offsets, entropy coded
 // with the 8-way interleaved static rANS (rans_static.hpp).
 //
-// A block (default 4 MiB, the LZ window) becomes four rANS streams and one
+// A block (default 2 MiB, the LZ window; 4 MiB is 0.9% smaller and 2x slower) becomes four rANS streams and one
 // raw bit stream:
 //   literals                    bytes
 //   literal-length codes        litlen       -> code + extra bits
@@ -12,7 +12,7 @@
 // Length codes: v < 16 is its own code; above, two codes per octave.
 //
 // Parser: zstd-"lazy2"-style. At each position it checks the three repeat
-// offsets and walks a hash chain (depth 48, 4-byte hash), then tries the next
+// offsets and walks a hash chain (depth 16, 4-byte hash), then tries the next
 // two positions and keeps the later match only when its estimated gain
 // (4 * length - log2(distance)) is better. Repeat offsets update as in zstd
 // (a hit on rep k moves it to the front).
@@ -31,10 +31,7 @@ namespace {
 
 constexpr std::size_t kMinMatch = 4;
 constexpr unsigned kHashLog = 18;
-#ifndef T2D
-#define T2D 16
-#endif
-constexpr unsigned kChainDepth = T2D;
+constexpr unsigned kChainDepth = 16;  // 48 gains ~1.6% for 2.5x less speed
 constexpr std::size_t kNiceLength = 128;
 
 ULTRA_INLINE u32 hash4(u32 v) noexcept { return (v * 2654435761u) >> (32 - kHashLog); }
@@ -141,9 +138,10 @@ class ConsumerCodec final : public BlockCodec {
       // Lazy evaluation of the next two positions.
       for (int depth = 1; depth <= 2 && ip + 1 < ilimit; ++depth) {
         Match m2 = best_match(ip + 1, rep);
+        if (m2.len < kMinMatch) break;
         long gain2 = static_cast<long>(m2.len * 4) - static_cast<long>(offset_cost(m2.offcode));
         long gain1 = static_cast<long>(m.len * 4) - static_cast<long>(offset_cost(m.offcode)) + (depth == 1 ? 4 : 7);
-        if (m2.len >= kMinMatch && gain2 > gain1) {
+        if (gain2 > gain1) {
           ++ip;
           m = m2;
         } else {
@@ -313,7 +311,7 @@ class ConsumerCodec final : public BlockCodec {
 class ConsumerEngine final : public BlockEngine {
  public:
   explicit ConsumerEngine(const EngineOptions& o)
-      : BlockEngine(TierLevel::Tier2_Consumer, "Tier2 Consumer (LZ77 + rANS)", o, {22, 0}) {}
+      : BlockEngine(TierLevel::Tier2_Consumer, "Tier2 Consumer (LZ77 + rANS)", o, {21, 0}) {}
 
  protected:
   u32 choose_model_param(std::size_t) const override { return 0; }

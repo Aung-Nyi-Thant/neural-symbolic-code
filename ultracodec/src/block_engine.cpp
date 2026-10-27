@@ -1,5 +1,7 @@
 #include "block_engine.hpp"
 
+#include "dedup.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -44,7 +46,7 @@ ArchiveHeader ArchiveHeader::parse(std::span<const std::uint8_t> bytes) {
   if (p[5] < 1 || p[5] > 4) throw Error("ultracodec: unknown tier");
   h.tier = static_cast<TierLevel>(p[5]);
   h.flags = p[6];
-  if (h.flags & ~kFlagWavefront) throw Error("ultracodec: unknown header flags");
+  if (h.flags & ~(kFlagWavefront | kFlagDedup)) throw Error("ultracodec: unknown header flags");
   h.block_log2 = p[7];
   if (h.block_log2 < 16 || h.block_log2 > 26) throw Error("ultracodec: block size out of range");
   h.uncompressed_size = load64(p + 8);
@@ -53,7 +55,11 @@ ArchiveHeader ArchiveHeader::parse(std::span<const std::uint8_t> bytes) {
   h.model_param = load32(p + 24);
   const u64 bs = u64{1} << h.block_log2;
   if (h.uncompressed_size > (u64{1} << 56)) throw Error("ultracodec: size out of range");
-  if (h.block_count != (h.uncompressed_size + bs - 1) / bs) throw Error("ultracodec: block count does not match size");
+  // With dedup the blocks cover the residual, checked once its size is read.
+  if (h.block_count != (h.uncompressed_size + bs - 1) / bs && !(h.flags & kFlagDedup))
+    throw Error("ultracodec: block count does not match size");
+  if (static_cast<u64>(h.block_count) * bs < h.uncompressed_size && !(h.flags & kFlagDedup))
+    throw Error("ultracodec: block count does not match size");
   if (h.prime_bytes > bs || ((h.flags & kFlagWavefront) == 0) != (h.prime_bytes == 0))
     throw Error("ultracodec: bad wavefront prefix");
   return h;
@@ -99,7 +105,7 @@ void parallel_blocks(std::size_t n, unsigned workers, const std::function<void(s
 
 BlockEngine::BlockEngine(TierLevel tier, std::string_view name, const EngineOptions& options,
                          TierDefaults defaults)
-    : tier_(tier), name_(name), options_(options) {
+    : tier_(tier), name_(name), options_(options), dedup_(defaults.dedup) {
   if (options.block_size) {
     std::size_t b = options.block_size;
     if ((b & (b - 1)) != 0 || b < (std::size_t{1} << 16) || b > (std::size_t{1} << 26))
@@ -139,6 +145,12 @@ BlockCodec& BlockEngine::codec(unsigned worker) {
 std::vector<u8> BlockEngine::compress(std::span<const u8> input, EngineStats* stats) {
   const auto t0 = std::chrono::steady_clock::now();
   const std::size_t bs = std::size_t{1} << block_log2_;
+  std::vector<u8> section, residual;
+  const std::span<const u8> original = input;
+  if (dedup_.far_min) {
+    residual = dedup_encode(input, {bs, dedup_.far_min, dedup_.near_min}, section);
+    input = residual;
+  }
   const std::size_t blocks = (input.size() + bs - 1) / bs;
   if (blocks > UINT32_MAX) throw Error("ultracodec: input too large");
   const u32 param = choose_model_param(input.size());
@@ -170,18 +182,24 @@ std::vector<u8> BlockEngine::compress(std::span<const u8> input, EngineStats* st
 
   ArchiveHeader h;
   h.tier = tier_;
-  h.flags = prime_bytes_ ? ArchiveHeader::kFlagWavefront : 0;
+  h.flags = static_cast<u8>((prime_bytes_ ? ArchiveHeader::kFlagWavefront : 0) |
+                            (dedup_.far_min ? ArchiveHeader::kFlagDedup : 0));
   h.block_log2 = static_cast<u8>(block_log2_);
-  h.uncompressed_size = input.size();
+  h.uncompressed_size = original.size();
   h.block_count = static_cast<u32>(blocks);
   h.prime_bytes = static_cast<u32>(prime_bytes_);
   h.model_param = param;
 
-  std::size_t total = ArchiveHeader::kSize + blocks * 8 + 4;
+  const std::size_t section_bytes = dedup_.far_min ? 4 + section.size() : 0;
+  std::size_t total = ArchiveHeader::kSize + section_bytes + blocks * 8 + 4;
   for (auto& p : payloads) total += p.size();
   std::vector<u8> out(total);
   h.serialize(out.data());
-  u8* table = out.data() + ArchiveHeader::kSize;
+  if (section_bytes) {
+    store32(out.data() + ArchiveHeader::kSize, static_cast<u32>(section.size()));
+    std::memcpy(out.data() + ArchiveHeader::kSize + 4, section.data(), section.size());
+  }
+  u8* table = out.data() + ArchiveHeader::kSize + section_bytes;
   for (std::size_t i = 0; i < blocks; ++i) {
     if (payloads[i].size() > UINT32_MAX) throw Error("ultracodec: block payload too large");
     store32(table + i * 8, static_cast<u32>(payloads[i].size()));
@@ -212,6 +230,18 @@ std::vector<u8> BlockEngine::decompress(std::span<const u8> archive, EngineStats
   const std::size_t bs = h.block_size();
 
   Reader r(archive.subspan(ArchiveHeader::kSize));
+  std::span<const u8> section;
+  std::size_t data_size = static_cast<std::size_t>(h.uncompressed_size);
+  if (h.flags & ArchiveHeader::kFlagDedup) {
+    section = r.take(r.u32v());
+    Reader peek(section);
+    peek.u32v();
+    auto rs = peek.take(8);
+    const u64 residual = load64(rs.data());
+    if (residual > h.uncompressed_size || h.block_count != (residual + bs - 1) / bs)
+      throw Error("ultracodec: dedup residual does not match the block count");
+    data_size = static_cast<std::size_t>(residual);
+  }
   if (r.remaining() / 8 < blocks) throw Error("ultracodec: truncated block table");
   auto table = r.take(blocks * 8);
   if (r.u32v() != crc32c(table)) throw Error("ultracodec: block table CRC mismatch");
@@ -225,7 +255,7 @@ std::vector<u8> BlockEngine::decompress(std::span<const u8> archive, EngineStats
   if (offset[blocks] != r.remaining()) throw Error("ultracodec: payload sizes do not match the archive");
   const u8* base = r.pos();
 
-  std::vector<u8> out(static_cast<std::size_t>(h.uncompressed_size));
+  std::vector<u8> out(data_size);
   const unsigned workers = workers_for(blocks, h.model_param);
   prepare_codecs({h.model_param, bs, h.prime_bytes}, workers);
 
@@ -264,6 +294,13 @@ std::vector<u8> BlockEngine::decompress(std::span<const u8> archive, EngineStats
         aborted.store(true, std::memory_order_release);
         for (std::size_t i = 0; i < blocks; ++i) progress[i].signal();
       });
+  if (h.flags & ArchiveHeader::kFlagDedup) {
+    std::vector<u8> original(static_cast<std::size_t>(h.uncompressed_size));
+    Reader sr(section);
+    dedup_decode(sr, out, original);
+    if (sr.remaining()) throw Error("ultracodec: trailing dedup data");
+    out.swap(original);
+  }
   if (stats) {
     stats->blocks = blocks;
     stats->stored_blocks = stored.load();

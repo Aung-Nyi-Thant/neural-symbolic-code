@@ -49,9 +49,15 @@ class BlockCodec {
                       Progress* progress, std::size_t signal_at) = 0;
 };
 
+struct DedupDefaults {
+  std::size_t far_min = 0;   // 0 = no long-range dedup pass
+  std::size_t near_min = 0;
+};
+
 struct TierDefaults {
   unsigned block_log2;
   std::size_t prime_bytes;  // 0 = this tier never primes
+  DedupDefaults dedup = {};
 };
 
 class BlockEngine : public ICompressionEngine {
@@ -94,6 +100,7 @@ class BlockEngine : public ICompressionEngine {
   EngineOptions options_;
   unsigned block_log2_;
   std::size_t prime_bytes_;
+  DedupDefaults dedup_;
   CodecKey codec_key_;
   std::vector<std::unique_ptr<BlockCodec>> codecs_;
 };

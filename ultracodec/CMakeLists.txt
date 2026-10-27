@@ -20,6 +20,7 @@ endif()
 add_library(ultracodec STATIC
   src/common.cpp
   src/block_engine.cpp
+  src/dedup.cpp
   src/engine.cpp
   src/rans_static.cpp
   src/tier1_hyperspeed.cpp
@@ -37,15 +38,31 @@ else()
   target_compile_options(ultracodec PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion)
 endif()
 
+# File tool: ultra c|d|i ...
+add_executable(ultra tools/ultra_cli.cpp)
+target_link_libraries(ultra PRIVATE ultracodec ${ULTRA_WARNINGS})
+
+# Round-trip benchmark: ultra_bench <tier> [--threads N] FILE...
 add_executable(ultra_bench tools/ultra_bench.cpp)
 target_link_libraries(ultra_bench PRIVATE ultracodec ${ULTRA_WARNINGS})
 target_include_directories(ultra_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(ultra_bench PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O2>)
 
 if(ULTRA_BUILD_TESTS)
+  enable_testing()
   add_executable(test_ultracodec tests/test_ultracodec.cpp)
   target_link_libraries(test_ultracodec PRIVATE ultracodec ${ULTRA_WARNINGS})
   target_include_directories(test_ultracodec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME ultracodec COMMAND test_ultracodec)
-  set_tests_properties(ultracodec PROPERTIES TIMEOUT 3600)
+  set(ULTRA_TEST_ENV
+    "ASAN_OPTIONS=exitcode=86:detect_leaks=1"
+    "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1:exitcode=87"
+    "TSAN_OPTIONS=halt_on_error=1:exitcode=88:second_deadlock_stack=1")
+  if(HCE_SANITIZE MATCHES "thread" OR CMAKE_CROSSCOMPILING)
+    list(APPEND ULTRA_TEST_ENV "ULTRA_FUZZ_ITERS=24")  # TSan, QEMU and Wine run the CM tiers 10-30x slower
+  endif()
+  if(WIN32 AND CMAKE_CROSSCOMPILING)
+    list(APPEND ULTRA_TEST_ENV "WINEDEBUG=-all")
+  endif()
+  set_tests_properties(ultracodec PROPERTIES TIMEOUT 3600 ENVIRONMENT "${ULTRA_TEST_ENV}")
 endif()

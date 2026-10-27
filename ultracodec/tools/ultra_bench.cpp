@@ -8,7 +8,10 @@
 // --runs, MB = 10^6 bytes) and verifies the round trip byte for byte. Peak
 // RSS of the whole process is printed at the end, so run one tier per process
 // to read that tier's memory.
+#if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
+#define ULTRA_HAVE_RUSAGE 1
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -113,8 +116,10 @@ int main(int argc, char** argv) {
     std::printf("%-12s %12zu %12zu %8.4f %10.2f %10.2f\n", "SUM(files)", sum_raw, sum_packed,
                 8.0 * static_cast<double>(sum_packed) / static_cast<double>(sum_raw),
                 static_cast<double>(sum_raw) / sum_ct / 1e6, static_cast<double>(sum_raw) / sum_dt / 1e6);
+#if defined(ULTRA_HAVE_RUSAGE)
   struct rusage ru {};
   getrusage(RUSAGE_SELF, &ru);
   std::printf("peak RSS %.1f MiB\n", static_cast<double>(ru.ru_maxrss) / 1024.0);
+#endif
   return 0;
 }

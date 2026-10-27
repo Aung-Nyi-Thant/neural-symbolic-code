@@ -838,6 +838,7 @@ encoder/parallel.{hpp,cpp}        Multi-threaded encoder: T workers, T+2 slots, 
 decoder/pipeline.{hpp,cpp}        Multi-threaded decoder: splitter, workers, ordered writer
 io/stream.hpp                     Stream interfaces and in-memory implementations
 aio/                              Asynchronous file I/O: io_uring and worker-thread backends, stream adapters
+ultracodec/                       The 4-tier ultracodec engine (see ultracodec/README.md)
 structural/                       Structural codec: tokenizer, frozen global model, token-level CM, HCS archives
 cli/hce.cpp, cli/posix_io.hpp     The hce command-line tool
 bindings/hce_python.cpp           pybind11 bindings: the hce._hce extension module

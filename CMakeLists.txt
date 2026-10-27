@@ -156,6 +156,13 @@ message(STATUS "hce_aio backends: ${HCE_AIO_BACKENDS}")
 add_library(hce_structural STATIC structural/archive.cpp)
 target_link_libraries(hce_structural PUBLIC hce_pipeline hce_aio PRIVATE hce_warnings)
 
+# ultracodec (ultracodec/): the 4-tier engine (LZ77, LZ77 + rANS, lean CM,
+# full CM). Shares no code with the HCE codec above.
+option(HCE_BUILD_ULTRACODEC "Build the ultracodec 4-tier engine" ON)
+if(HCE_BUILD_ULTRACODEC)
+  add_subdirectory(ultracodec)
+endif()
+
 # Command-line tool (POSIX: file descriptors, signals, atomic renames). Windows
 # builds (mingw-wine preset) cover the libraries and their suites.
 if(NOT WIN32)

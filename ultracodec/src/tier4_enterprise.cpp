@@ -9,16 +9,19 @@
 #include "tiers.hpp"
 
 namespace ultracodec::detail {
-namespace {
+// Profiles have external linkage: some knobs are read only by disabled
+// (if constexpr) features, which Clang would flag in an anonymous namespace.
+namespace profiles {
 
 struct FullProfile {
   static constexpr unsigned kHashed = 11;
   static constexpr unsigned kMatch = 2;
   static constexpr unsigned kMatchMin[2] = {5, 16};
   static constexpr unsigned kMatchLog2 = 22;
+  static constexpr bool kConfMaps = true;
   static constexpr bool kTwoLayer = true;
   static constexpr bool kSecondApm = true;
-  static constexpr int kCounterLimit = 255;
+  static constexpr int kCounterLimit = 16;
   static constexpr int kO1Limit = 255;
   static constexpr int kMixerLr = 5;
   static constexpr int kFinalLr = 3;
@@ -28,6 +31,8 @@ struct FullProfile {
   static constexpr bool kMatchSkip = false;
   static constexpr u32 kSkipLen = 48;
   static constexpr int kSkipMargin = 4;
+  static constexpr std::size_t kDedupFar = 32;   // long-range dedup: cross-block repeats
+  static constexpr std::size_t kDedupNear = 1073741824;  // and repeats this long anywhere
   static constexpr unsigned kBlockLog2 = 22;
   static constexpr std::size_t kPrimeBytes = 256 * 1024;
   static constexpr std::size_t kDefaultBudget = std::size_t{3584} << 20;
@@ -52,10 +57,10 @@ struct FullProfile {
   }
 };
 
-}  // namespace
+}  // namespace profiles
 
 std::unique_ptr<ICompressionEngine> make_tier4(const EngineOptions& o) {
-  return std::make_unique<CmEngine<FullProfile>>(TierLevel::Tier4_Enterprise, "Tier4 Enterprise TR3 (full CM + rANS)", o);
+  return std::make_unique<CmEngine<profiles::FullProfile>>(TierLevel::Tier4_Enterprise, "Tier4 Enterprise TR3 (full CM + rANS)", o);
 }
 
 }  // namespace ultracodec::detail

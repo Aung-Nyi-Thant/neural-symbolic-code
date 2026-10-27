@@ -5,6 +5,7 @@
 // Archive layout (all integers little-endian):
 //
 //   ArchiveHeader          32 bytes, CRC-protected (see below)
+//   [dedup section]        only with kFlagDedup: u32 size + section (dedup.hpp)
 //   block table            block_count x {u32 payload_size, u32 raw_crc32c}
 //   u32                    CRC-32C of the block table
 //   payloads               block_count payloads, concatenated
@@ -13,6 +14,8 @@
 // tier). Blocks are independent apart from the optional wavefront prefix
 // (Tiers 3 and 4): block k may be primed with the first prime_bytes of block
 // k-1, which the decoder has as soon as it has decoded that much of block k-1.
+// With kFlagDedup (Tiers 3 and 4) the blocks hold the residual of a
+// long-range deduplication pass and the section lists the removed repeats.
 #pragma once
 
 #include <cstddef>
@@ -47,13 +50,14 @@ inline constexpr std::uint8_t kFormatVersion = 1;
 struct ArchiveHeader {
   static constexpr std::size_t kSize = 32;
   static constexpr std::uint8_t kFlagWavefront = 1;  // blocks primed by their predecessor's head
+  static constexpr std::uint8_t kFlagDedup = 2;      // blocks hold a long-range dedup residual
 
   std::uint8_t version = kFormatVersion;
   TierLevel tier = TierLevel::Tier1_HyperSpeed;
   std::uint8_t flags = 0;
   std::uint8_t block_log2 = 20;           // block size = 1 << block_log2
   std::uint64_t uncompressed_size = 0;
-  std::uint32_t block_count = 0;
+  std::uint32_t block_count = 0;          // blocks of the (residual) data
   std::uint32_t prime_bytes = 0;          // wavefront prefix length (0 = off)
   std::uint32_t model_param = 0;          // tier-specific (CM table size, ...)
   // bytes 28..31: CRC-32C of bytes 0..27 (magic included)

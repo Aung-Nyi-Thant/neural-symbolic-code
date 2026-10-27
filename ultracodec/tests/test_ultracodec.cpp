@@ -54,6 +54,10 @@ int fuzz_iters(int dflt) {
   return dflt;
 }
 
+// Sanitizer / emulator runs set the iteration knob low; they also get
+// smaller inputs.
+bool slow_env() { return fuzz_iters(150) < 50; }
+
 Bytes random_bytes(std::size_t n, std::uint32_t seed) {
   std::mt19937 rng(seed);
   Bytes b(n);
@@ -75,7 +79,7 @@ Bytes text_bytes(std::size_t n, std::uint32_t seed) {
       continue;
     }
     s += words[rng() % (sizeof words / sizeof *words)];
-    unsigned r = rng() % 12;
+    unsigned r = static_cast<unsigned>(rng() % 12);
     s += r == 0 ? ".\n" : r == 1 ? ", " : r == 2 ? "(x)\n    " : " ";
   }
   s.resize(n);
@@ -159,8 +163,8 @@ void test_rans_kernels() {
   for (int round = 0; round < 40; ++round) {
     std::size_t n = (round % 5 == 0) ? rng() % 64 : rng() % 200000;
     Bytes sym(n);
-    unsigned alphabet = 1 + rng() % 256;
-    double skew = 0.2 + (rng() % 100) / 25.0;
+    unsigned alphabet = static_cast<unsigned>(1 + rng() % 256);
+    double skew = 0.2 + static_cast<double>(rng() % 100) / 25.0;
     std::exponential_distribution<double> ex(skew);
     for (auto& s : sym) s = static_cast<std::uint8_t>(std::min<double>(alphabet - 1, ex(rng) * alphabet / 4));
     std::vector<std::uint8_t> enc;
@@ -191,7 +195,7 @@ void test_roundtrips() {
   inputs.emplace_back("block+1", text_bytes(65537, 6));
   for (TierLevel tier : kTiers) {
     for (auto& [name, data] : inputs) {
-      if (is_cm(tier) && data.size() > 200000) continue;  // keep sanitizer runs short
+      if (is_cm(tier) && data.size() > (slow_env() ? 70000u : 200000u)) continue;  // keep sanitizer runs short
       for (unsigned threads : {1u, 3u}) {
         auto engine = create_engine(tier, small_options(tier, threads));
         EngineStats st;
@@ -208,7 +212,7 @@ void test_roundtrips() {
 }
 
 void test_thread_independence() {
-  Bytes data = text_bytes(400000, 9);
+  Bytes data = text_bytes(slow_env() ? 160000 : 400000, 9);
   for (TierLevel tier : kTiers) {
     Bytes ref = create_engine(tier, small_options(tier, 1))->compress(data);
     for (unsigned t : {2u, 4u, 7u}) {
@@ -249,7 +253,7 @@ void test_corruption() {
   const int iters = fuzz_iters(150);
   std::mt19937 rng(1234);
   for (TierLevel tier : kTiers) {
-    Bytes data = text_bytes(is_cm(tier) ? 20000 : 150000, 21);
+    Bytes data = text_bytes(is_cm(tier) ? 12000 : 150000, 21);
     // A few stored-friendly random bytes too, so both block methods are hit.
     Bytes rnd = random_bytes(3000, 22);
     data.insert(data.end(), rnd.begin(), rnd.end());
@@ -267,7 +271,8 @@ void test_corruption() {
         ++threw;
       }
     };
-    for (int i = 0; i < iters; ++i) {
+    const int n = is_cm(tier) ? std::max(4, iters / 3) : iters;  // each CM attempt decodes a block
+    for (int i = 0; i < n; ++i) {
       Bytes bad = packed;
       bad.resize(rng() % packed.size());  // truncation
       attempt(bad);

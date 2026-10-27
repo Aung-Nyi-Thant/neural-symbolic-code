@@ -65,7 +65,7 @@ template <class P>
 class CmEngine final : public BlockEngine {
  public:
   CmEngine(TierLevel tier, std::string_view name, const EngineOptions& o)
-      : BlockEngine(tier, name, o, {P::kBlockLog2, P::kPrimeBytes}),
+      : BlockEngine(tier, name, o, {P::kBlockLog2, P::kPrimeBytes, {P::kDedupFar, P::kDedupNear}}),
         budget_(o.memory_budget ? o.memory_budget : P::kDefaultBudget),
         block_(o.block_size ? o.block_size : std::size_t{1} << P::kBlockLog2) {}
 
