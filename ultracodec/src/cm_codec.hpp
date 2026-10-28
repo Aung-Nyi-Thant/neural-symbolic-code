@@ -85,9 +85,12 @@ class CmEngine final : public BlockEngine {
 
  public:
   CmEngine(TierLevel tier, std::string_view name, const EngineOptions& o)
-      : BlockEngine(tier, name, o, {P::kBlockLog2, P::kPrimeBytes, {P::kDedupFar, P::kDedupNear}}),
+      : BlockEngine(tier, name, o,
+                    o.tier3_compact ? TierDefaults{P::kBlockLog2, P::kPrimeBytes, {P::kDedupFar, P::kDedupNear}}
+                                    : TierDefaults{Legacy::kBlockLog2, Legacy::kPrimeBytes,
+                                                    {Legacy::kDedupFar, Legacy::kDedupNear}}),
         budget_(o.memory_budget ? o.memory_budget : P::kDefaultBudget),
-        block_(o.block_size ? o.block_size : std::size_t{1} << P::kBlockLog2),
+        block_(o.block_size ? o.block_size : std::size_t{1} << (o.tier3_compact ? P::kBlockLog2 : Legacy::kBlockLog2)),
         compact_(o.tier3_compact) {}
 
  protected:
