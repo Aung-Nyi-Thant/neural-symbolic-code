@@ -9,7 +9,7 @@ four strategies:
 | 1 | Hyper-Speed | Default: greedy two-hash LZ77 over the whole block with repeat offsets, entropy-coded sequences (rANS). Raw mode: byte-level LZ77 in the LZ4 block layout, 64 KiB window | 1 MiB | ~0.8 MiB tables per thread |
 | 2 | Consumer | Gated word-dictionary pre-filter, lazy hash-chain LZ77 with repeat offsets, 8-way interleaved static rANS (AVX2 / NEON decode) with literals split into 16 context streams | 2 MiB | ~30 MiB per thread |
 | 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 32 MiB table + ~29 MiB per thread, budget 512 MiB |
-| 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 mixer sets, 4 APMs, binary range coder | 2 MiB | 74-194 MiB per model by table layout: snapshot + one per worker (~0.9 GiB at 4 threads), budget 900 MiB |
+| 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 mixer sets, 4 APMs, binary range coder | 2 MiB | 74-194 MiB per model by table layout (default Rebalanced, ~159 MiB): packed snapshot (~61 MiB) + one per worker (794 MiB peak at 4 threads), budget 900 MiB |
 
 **Results in one line:** every tier round-trips, all archives are
 deterministic and the same on x86 and ARM, and RAM stays within budget.
@@ -25,6 +25,13 @@ codes entropy-coded sequences by default, +33.5% vs `zstd -19` instead of
 +93%, at 606-626 MB/s on 4 x86 threads (target 752 missed). Tier 4 fits
 under 1 GB on 4 threads with recorded table layouts (909 MiB peak, +0.35%
 size) and runs 13% faster from one cache line per lookup.
+
+October 27 memory pass (see "Tier 4 memory"): table bits moved from
+contexts that do not use them to the starved ones (Rebalanced layout, the
+new default) make Tier 4 0.25-0.29% smaller at the same RAM per model, and
+the snapshot is held packed while workers copy from it. Peak RSS at 4
+threads drops from 884 to 794 MiB; the Lean layout gets to 639 MiB for
++0.08% size.
 
 ## API
 
@@ -168,8 +175,10 @@ Archives are byte-identical on both machines and for any thread count.
 Separate files run slower (0.86 MB/s on the M4 at 4 threads) because a
 4-8 MiB file has only 1-3 blocks after the serial block 0.
 
-Memory: a call holds the snapshot plus one model per worker. The context
-tables dominate, and the archive records one of four table layouts
+#### Tier 4 memory
+
+A call holds the snapshot plus one model per worker. The context tables
+dominate, and the archive records one of six table layouts
 (`EngineOptions::tier4_tables`). Measured 2026-10-27 on 2 MiB blocks after
 a 2 MiB snapshot:
 
@@ -179,13 +188,48 @@ a 2 MiB snapshot:
 | 1 Balanced | ~158 MiB | +0.20% | orders 2-4 and 16/24/32 at 2^15 |
 | 2 Compact | ~138 MiB | +0.52% | Balanced, plus orders 5-12 at 2^16 |
 | 3 Small | ~74 MiB | +2.2% | every context at 2^15 |
+| 4 Rebalanced | ~159 MiB | -0.07% | default: bits moved to the contexts that use them, 2^20 match table |
+| 5 Lean | ~123 MiB | +0.23% | Balanced without the unused bits, 2^20 match table |
+
+The last two rows come from the memory-audit probe, in which Balanced was +0.16% vs Full.
+
+The Rebalanced and Lean caps come from halving each context's table on
+its own and measuring the size cost per MiB freed. The column context gave
+back 7 MiB for 0.001%, the first indirect context 6 MiB for 0.017%, and
+orders 2 and 16 cost nothing to halve. Orders 3 and 4 and the word-pair
+context lost 0.03-0.05% per MiB. Rebalanced shrinks the first group and
+grows the second (orders 3/4 to 2^17; order 5, word pair and two words +
+byte to 2^18). The match table goes from 2^22 to 2^20 entries: after a
+block only 8-18% of a 2^22 table is in use, and 2^20 costs 0.02%.
+
+After block 0 the snapshot is packed (`Model::pack`): every large array is
+XORed with its initial value (zero, the untouched APM row, or the initial
+mixer weight) and stored per 64-byte chunk as a mask of the non-zero bytes
+plus those bytes, in one exactly sized mapping. A model's tables are
+60-66% zero bytes after a block, so the snapshot shrinks from ~159 to
+~61 MiB. Workers expand it into their own arrays at each block start
+instead of a memcpy (60-75 ms per 2 MiB block, under 1% of the block's
+time). The coded bits do not change, and the worker count is planned
+against the packed snapshot.
 
 Speed does not change with the layout: the model is bound by instructions,
-not cache misses. By default (`tier4_tables = -1`) the encoder picks the
-largest layout whose snapshot plus four workers fit `memory_budget`
-(default 900 MiB), which is Balanced for inputs over ~4 MiB. That choice
-does not depend on the thread count, so archives stay identical for any
-`threads`. `memory_budget` also caps the workers, as before.
+not cache misses. By default (`tier4_tables = -1`) the encoder picks
+Rebalanced, else Lean, else Small: the first whose snapshot plus four
+workers fit `memory_budget` (default 900 MiB). That choice does not depend
+on the thread count, so archives stay identical for any `threads`.
+`memory_budget` also caps the workers, as before.
+
+Full corpus (22.8 MB text/code, x86 VM, 4 threads, `ultra_bench` per file
+plus the concatenation):
+
+| Build | Sum of files | Concatenation | Peak RSS |
+|---|---|---|---|
+| Before (auto = Balanced, snapshot unpacked) | 2,990,482 | 3,071,982 | 883.6 MiB |
+| Rebalanced + packed snapshot (default) | 2,983,124 (-0.25%) | 3,063,104 (-0.29%) | 794.4 MiB |
+| Lean + packed snapshot (`tier4_tables = 5`) | 2,992,783 (+0.08%) | 3,074,208 (+0.07%) | 638.9 MiB |
+
+Speed was the same within this VM's noise (0.34-0.36 MB/s per file,
+0.71-0.76 MB/s on the concatenation).
 
 On the 26.97 MB mixed corpus (x86 VM, 4 threads, concatenation): Full under
 a 900 MiB budget runs 3 workers, 0.74 MB/s, 889 MiB peak RSS; Balanced runs

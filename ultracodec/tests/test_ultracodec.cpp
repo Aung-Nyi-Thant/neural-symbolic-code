@@ -329,11 +329,15 @@ void test_tier4_primer() {
   auto three = create_engine(TierLevel::Tier4_Enterprise, o);
   CHECK(three->compress(data) == ref);
   CHECK(three->decompress(ref) == data);
-  // Unprimed archives record model_param 0.
+  // Unprimed archives record no primer CRC: model_param 0 with the Full layout.
   o.tier4_primer = false;
   Bytes plain = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
-  CHECK(peek_header(plain).model_param == 0 && plain != ref);
+  CHECK(peek_header(plain).model_param != peek_header(ref).model_param && plain != ref);
   CHECK(decompress(plain) == data);
+  o.tier4_tables = 0;
+  const Bytes plain_full = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
+  CHECK(peek_header(plain_full).model_param == 0 && decompress(plain_full) == data);
+  o.tier4_tables = -1;
   Bytes bad = ref;
   detail::store32(bad.data() + 24, 12345);  // another primer
   detail::store32(bad.data() + 28, detail::crc32c(bad.data(), 28));
@@ -352,16 +356,17 @@ void test_tier4_layouts() {
   o.block_size = 64 * 1024;
   o.threads = 2;
   std::vector<Bytes> archives;
-  for (int l = 0; l < 4; ++l) {
+  for (int l = 0; l < 6; ++l) {
     o.tier4_tables = l;
     archives.push_back(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data));
     CHECK(decompress(archives.back()) == data);
   }
   CHECK(peek_header(archives[0]).model_param == detail::sws::primer_crc());
-  CHECK(archives[0] != archives[3] && peek_header(archives[0]).model_param != peek_header(archives[3]).model_param);
+  for (std::size_t l = 1; l < 6; ++l)
+    CHECK(archives[0] != archives[l] && peek_header(archives[0]).model_param != peek_header(archives[l]).model_param);
   o.tier4_tables = -1;
-  o.memory_budget = std::size_t{4} << 30;
-  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[0]);
+  o.memory_budget = std::size_t{4} << 30;  // auto: Rebalanced
+  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[4]);
   o.memory_budget = std::size_t{1} << 20;  // nothing fits: Small, one worker
   o.threads = 4;
   CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[3]);
@@ -377,7 +382,7 @@ void test_tier4_layouts() {
   CHECK(by1 != archives[0] && decompress(by1) == data);
   const Bytes small = text_bytes(20000, 34);
   std::vector<std::uint32_t> params;
-  for (int l = 0; l < 4; ++l)
+  for (int l = 0; l < 6; ++l)
     for (const bool primer : {false, true})
       for (const bool bypass : {false, true}) {
         o.tier4_tables = l;
@@ -389,11 +394,44 @@ void test_tier4_layouts() {
       }
   std::sort(params.begin(), params.end());
   CHECK(std::adjacent_find(params.begin(), params.end()) == params.end());
-  o.tier4_tables = 4;
+  o.tier4_tables = 6;
   try {
     create_engine(TierLevel::Tier4_Enterprise, o);
     CHECK(false);
   } catch (const Error&) {
+  }
+}
+
+// A packed snapshot copies into a model that codes exactly like a copy of the unpacked one,
+// whether the target is new or a reused worker model; the packed model itself refuses to code.
+void test_tier4_packed_snapshot() {
+  namespace sws = detail::sws;
+  const Bytes a = text_bytes(300000, 41), b = text_bytes(200000, 42), c = text_bytes(150000, 43);
+  for (const auto layout : {sws::TableLayout::Rebalanced, sws::TableLayout::Small}) {
+    sws::Model snapshot(sws::primer().size() + a.size() + b.size(), layout);
+    snapshot.train(sws::primer());
+    snapshot.train(a);
+    const sws::Model plain(snapshot);
+    const std::size_t full = snapshot.resident_bytes();
+    snapshot.pack();
+    CHECK(snapshot.packed() && snapshot.resident_bytes() < full / 2);
+    Bytes out1, out2, out3;
+    sws::Model x(plain), y(snapshot);
+    CHECK(x.encode(b, out1) && y.encode(b, out2) && out1 == out2);
+    y = snapshot;  // reuse: y's arrays are dirty from block b
+    CHECK(y.encode(c, out3));
+    Bytes ref;
+    sws::Model z(plain);
+    CHECK(z.encode(c, ref) && ref == out3);
+    sws::Model d(snapshot);
+    Bytes back(b.size());
+    d.decode(out1, back);
+    CHECK(back == b);
+    try {
+      snapshot.encode(c, out3);
+      CHECK(false);
+    } catch (const Error&) {
+    }
   }
 }
 
@@ -537,6 +575,8 @@ int main() {
   test_tier4_primer();
   std::printf("tier 4 table layouts\n");
   test_tier4_layouts();
+  std::printf("tier 4 packed snapshot\n");
+  test_tier4_packed_snapshot();
   std::printf("word filter\n");
   test_word_filter();
   std::printf("corruption\n");
