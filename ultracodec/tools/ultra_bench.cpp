@@ -2,7 +2,7 @@
 //
 //   ultra_bench <tier 1-4> [--threads N] [--block BYTES] [--budget MIB]
 //               [--prime BYTES] [--runs N] [--kernel auto|scalar|avx2|neon]
-//               [--no-primer] [--tables 0-5] [--bypass] [--wide-mixer] [--total-only] FILE...
+//               [--no-primer] [--tables 0-5] [--bypass] [--wide-mixer] [--t3-legacy] [--total-only] FILE...
 //
 // For every file (and the concatenation of all of them, "TOTAL") prints the
 // compressed size, ratio, compress and decompress throughput (best of
@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
     else if (a == "--tables") opt.tier4_tables = std::atoi(next());
     else if (a == "--bypass") opt.tier4_bypass = true;
     else if (a == "--wide-mixer") opt.tier4_narrow_mixer = false;
+    else if (a == "--t3-legacy") opt.tier3_compact = false;
     else if (a == "--kernel") {
       std::string k = next();
       using detail::RansKernel;

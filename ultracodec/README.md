@@ -8,7 +8,7 @@ four strategies:
 |---|---|---|---|---|
 | 1 | Hyper-Speed | Default: greedy two-hash LZ77 over the whole block with repeat offsets, entropy-coded sequences (rANS). Raw mode: byte-level LZ77 in the LZ4 block layout, 64 KiB window | 1 MiB | ~0.8 MiB tables per thread |
 | 2 | Consumer | Gated word-dictionary pre-filter, lazy hash-chain LZ77 with repeat offsets, 8-way interleaved static rANS (AVX2 / NEON decode) with literals split into 16 context streams | 2 MiB | ~30 MiB per thread |
-| 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 32 MiB table + ~29 MiB per thread, budget 512 MiB |
+| 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 16 MiB table (16-bit counters) + ~14 MiB per thread, budget 512 MiB |
 | 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 int16 mixer sets, 4 APMs, binary range coder | 2 MiB | 74-194 MiB per model by table layout (default Rebalanced, ~159 MiB): packed snapshot (~61 MiB) + one per worker (794 MiB peak at 4 threads), budget 900 MiB |
 
 **Results in one line:** every tier round-trips, all archives are
@@ -37,6 +37,11 @@ October 28 (see "Tier 4 mixer"): the four mixer weight sets are int16
 instead of int32 by default. Tier 4 runs about 8% faster on 4 threads for
 +0.09% size; `tier4_narrow_mixer = false` writes the int32 mixer, and
 older archives still decode.
+
+October 28 (see "Tier 3 memory"): Tier 3 archives use 16-bit hashed
+counters and a rANS stream per 64 KiB. A worker needs 46 MiB less
+(398 -> 213 MiB peak at 4 threads), at the same size (-0.003%).
+`tier3_compact = false` writes the older format, which still decodes.
 
 ## API
 
@@ -114,7 +119,7 @@ varies by about ±20% from run to run.
 |---|---|---|---|---|---|
 | 1 | 10,220,112 | +93% | 240 / 815 | 752 / 1,389 | 152 MiB |
 | 2 | 6,162,287 | +16.3% | 13-19 / 275-323 | 33 / 620 | 177 MiB (before the word filter; see below) |
-| 3 | 4,748,159 | **-10.4%** | 1.5 / 1.6 | 4.5 / 4.9 | 454 MiB |
+| 3 | 4,748,159 | **-10.4%** | 1.5 / 1.6 | 4.5 / 4.9 | 454 MiB (before the compact format; see "Tier 3 memory") |
 | 4 (old TR3 design, replaced) | 4,153,233 | -21.6% | ~0.12 / ~0.13 | 0.32 / 0.38 (0.66 / 0.78 on the 26 MB concatenation) | 3.6 GiB |
 
 The new Tier 4 was measured on a different corpus; see "Tier 4" below.
@@ -235,6 +240,36 @@ plus the concatenation):
 
 Speed was the same within this VM's noise (0.34-0.36 MB/s per file,
 0.71-0.76 MB/s on the concatenation).
+
+#### Tier 3 memory
+
+Tier 3 archives use a compact format by default
+(`EngineOptions::tier3_compact`, recorded as bit 31 of `model_param`):
+
+* **16-bit hashed counters** store `p12 << 4 | n`, with n up to 15. The
+  update is the 32-bit one on `p12 << 4`, rounded back to 12 bits. A
+  nibble bucket (tag plus 15 nodes) is 32 bytes, so a two-way pair fits
+  in one cache line instead of two. The 16 MiB table holds as many
+  buckets as the 32 MiB table of 32-bit counters.
+* **One rANS stream per 64 KiB** of the block. rANS codes backwards, so
+  the encoder records 2 bytes per bit and codes them when the stream
+  ends. That record plus the stream's word buffer was 32 MiB per 1 MiB
+  block and is now 2 MiB. Each stream adds 12 bytes, about 200 bytes per
+  block.
+
+The older format (32-bit counters, one stream per block) still decodes,
+and `tier3_compact = false` writes it. Those archives are byte-identical
+to what earlier builds wrote, and a test pins their CRC.
+
+Full corpus, x86 VM:
+
+| Format | Sum of files | Concatenation | Peak RSS 1 / 4 threads | Comp / dec MB/s, 4 threads (concatenation) |
+|---|---|---|---|---|
+| 32-bit counters, one stream per block | 3,621,559 | 3,620,815 | 175.4 / 397.8 MiB | 4.39 / 4.80 |
+| Compact (default) | 3,621,491 (-0.002%) | 3,620,697 (-0.003%) | 131.1 / 213.1 MiB | 4.45 / 5.18 |
+
+That is 46 MiB less per worker at 4 threads (44 MiB on one thread), with
+speed the same within noise.
 
 #### Tier 4 mixer
 
@@ -392,8 +427,9 @@ What would close the gap is a different design, not tuning:
 
 * Counter limit (adaptation floor 1/(n+1.5)): 16 is better than 30 (-0.2%)
   and 127 (-0.8%).
-* Tier 3 table per worker: 4 MiB +2.3%, 16 MiB +0.6%, 32 MiB (default)
-  about +0.3%, 128 MiB baseline.
+* Tier 3 table per worker, 32-bit counters: 4 MiB +2.3%, 16 MiB +0.6%,
+  32 MiB about +0.3%, 128 MiB baseline. The compact format holds the
+  32 MiB slot count in 16 MiB (the default).
 * Confidence maps (an adaptive re-estimate of each context's prediction
   from its hit count): Tier 4 -0.7% (on), Tier 3 -0.03% (off, it costs
   speed).

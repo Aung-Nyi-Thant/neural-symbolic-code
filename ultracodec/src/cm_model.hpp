@@ -19,20 +19,23 @@
 //     certain, the APM stage (and its update) is bypassed; optionally, inside
 //     long, reliable matches, the whole mixer and all context counters are
 //     bypassed and the match model alone predicts;
-//   * memory-wall mitigation: counters live in 64-byte buckets (one cache
-//     line holds a whole nibble's 15 tree nodes plus a tag), two-way set
-//     associative pairs on 128 bytes, looked up twice per byte; the buckets
-//     of the next nibble are prefetched (__builtin_prefetch) for both
-//     possible values of the pending bit, one bit early; tables are
-//     huge-page backed (common.hpp).
+//   * memory-wall mitigation: a nibble's 15 tree nodes plus a tag form one
+//     bucket, two buckets form a two-way set-associative pair, looked up
+//     twice per byte; the pairs of the next nibble are prefetched
+//     (__builtin_prefetch) for both possible values of the pending bit, one
+//     bit early; tables are huge-page backed (common.hpp). With 32-bit
+//     counters a bucket is a 64-byte line and a pair spans two; compact
+//     profiles (P::kCompact) use 16-bit counters, so a pair is one line.
 //
-// Counters store (p22 << 10 | n) XOR 0x80000000, so zeroed memory reads as
-// p = 0.5, n = 0 and tables reset with one madvise/memset. Adaptation rate is
-// 1/(n + 1.5) up to a per-profile limit (state-count adaptive counters).
+// Counters store (p16 << 16 | n) XOR 0x80000000 (compact hashed counters:
+// (p12 << 4 | n) XOR 0x8000), so zeroed memory reads as p = 0.5, n = 0 and
+// tables reset with one madvise/memset. Adaptation rate is 1/(n + 1.5) up to
+// a per-profile limit (state-count adaptive counters).
 #pragma once
 
 #include <algorithm>
 #include <array>
+#include <type_traits>
 
 #include "common.hpp"
 
@@ -92,6 +95,21 @@ ULTRA_INLINE void counter_update(u32& stored, int y) noexcept {
   int p = static_cast<int>(t >> 16);
   p += ((y ? 65535 : 0) - p) * kRates.v[n] >> 14;
   stored = ((static_cast<u32>(p) << 16) | static_cast<u32>(n + (n < Limit))) ^ kFlip;
+}
+
+// Compact counter: (p12 << 4 | n) ^ 0x8000, n <= 15. The update is the 32-bit
+// one on p12 << 4, rounded back to 12 bits.
+constexpr u16 kFlip16 = 0x8000u;
+ULTRA_INLINE int counter_p(u16 stored) noexcept { return (stored ^ kFlip16) >> 4; }
+template <int Limit>
+ULTRA_INLINE void counter_update(u16& stored, int y) noexcept {
+  static_assert(Limit <= 15);
+  const unsigned t = stored ^ kFlip16;
+  const int n = static_cast<int>(t & 15);
+  int p = static_cast<int>(t >> 4) << 4;
+  p += ((y ? 65535 : 0) - p) * kRates.v[n] >> 14;
+  p = std::min((p + 8) >> 4, 4095);
+  stored = static_cast<u16>(((static_cast<unsigned>(p) << 4) | static_cast<unsigned>(n + (n < Limit))) ^ kFlip16);
 }
 
 ULTRA_INLINE u32 hash32(u64 x) noexcept {
@@ -248,8 +266,11 @@ class CmModel {
   static constexpr unsigned kC = P::kConfMaps ? 1 + kH : 0;
   static constexpr unsigned kInputs = (2 + kH + kM + kC + 7) & ~7u;
   static constexpr unsigned kMixers = P::kTwoLayer ? 3 : 1;
+  // Hashed counters: u32 (a 128-byte pair) or, in compact profiles, u16 (a 64-byte pair).
+  using Node = std::conditional_t<P::kCompact, u16, u32>;
+  static constexpr std::size_t kPairBytes = 32 * sizeof(Node);
 
-  // bucket_pairs: hashed-counter table size in 128-byte pairs.
+  // bucket_pairs: hashed-counter table size in pairs of buckets.
   CmModel(std::size_t bucket_pairs, std::size_t max_history)
       : pairs_(bucket_pairs), table_(bucket_pairs * 32), o1_(65536) {
     for (unsigned m = 0; m < kM; ++m) mt_[m].reset(std::size_t{1} << P::kMatchLog2);
@@ -393,7 +414,7 @@ class CmModel {
     const unsigned bit = bit_;
     if (!(P::kMatchSkip && skip_)) {
       counter_update<P::kO1Limit>(*o1cur_, y);
-      u32* nodes[kH];
+      Node* nodes[kH];
       for (unsigned i = 0; i < kH; ++i) nodes[i] = bkt_[i] + nib;
       for (unsigned i = 0; i < kH; ++i) counter_update<P::kCounterLimit>(*nodes[i], y);
       if constexpr (kC > 0)
@@ -449,26 +470,29 @@ class CmModel {
   // Hash of a context for the second nibble, keyed by the first nibble.
   static ULTRA_INLINE u32 nibble_hash(u32 h, u32 c0) noexcept { return (h + c0 * 0x6F4F2A2Bu) * 0x9E3779B1u; }
 
-  ULTRA_INLINE u32* pair_of(u32 h) noexcept {
+  ULTRA_INLINE Node* pair_of(u32 h) noexcept {
     const std::size_t pair = static_cast<std::size_t>((static_cast<u64>(h) * pairs_) >> 32);
     return table_.data() + pair * 32;
   }
-  // Both 64-byte ways of a pair.
+  // Every cache line of a pair.
   ULTRA_INLINE void prefetch_pair(u32 h) noexcept {
-    u32* b = pair_of(h);
+    Node* b = pair_of(h);
     ULTRA_PREFETCH(b);
-    ULTRA_PREFETCH(b + 16);
+    if constexpr (!P::kCompact) ULTRA_PREFETCH(b + 16);
   }
 
-  // Two-way set-associative bucket lookup; replaces the less used way.
-  ULTRA_INLINE u32* find(u32 h) noexcept {
-    u32* b = pair_of(h);
-    u32 tag = h & 0xFFFF;
+  // Two-way set-associative bucket lookup; replaces the less used way (by
+  // the count of the bucket's first node). Node 0 of a bucket is its tag.
+  ULTRA_INLINE Node* find(u32 h) noexcept {
+    Node* b = pair_of(h);
+    Node tag = static_cast<Node>(h & 0xFFFF);
     if (!tag) tag = 1;
     if ((b[0] & 0xFFFF) == tag) return b;
     if ((b[16] & 0xFFFF) == tag) return b + 16;
-    u32* v = ((b[1] ^ kFlip) & 0xFFFF) <= ((b[17] ^ kFlip) & 0xFFFF) ? b : b + 16;
-    std::memset(v, 0, 64);
+    constexpr u32 kCountMask = P::kCompact ? 0xF : 0xFFFF;
+    constexpr Node kNodeFlip = P::kCompact ? Node{kFlip16} : static_cast<Node>(kFlip);
+    Node* v = ((b[1] ^ kNodeFlip) & kCountMask) <= ((b[17] ^ kNodeFlip) & kCountMask) ? b : b + 16;
+    std::memset(v, 0, 16 * sizeof(Node));
     v[0] = tag;
     return v;
   }
@@ -589,7 +613,7 @@ class CmModel {
   }
 
   std::size_t pairs_;
-  BigArray<u32> table_;
+  BigArray<Node> table_;
   BigArray<u32> o1_;
   BigArray<u32> mt_[kM];
   std::vector<u8> hist_;
@@ -604,7 +628,7 @@ class CmModel {
   u32 hc_[2][kH] = {};
   std::size_t ms_[2][kM] = {};
   u32 h_[kH] = {};
-  u32* bkt_[kH] = {};
+  Node* bkt_[kH] = {};
   u32 c0_ = 1, nib_ = 1;
   unsigned bit_ = 0;
   u32* o1cur_ = nullptr;
