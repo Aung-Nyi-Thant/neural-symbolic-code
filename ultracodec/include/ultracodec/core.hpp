@@ -82,6 +82,9 @@ struct EngineOptions {
   // Tier 1 entropy mode (recorded in the archive): entropy-coded sequences, about 1.4x smaller than
   // the raw LZ4-layout mode and slower to decode. false = the raw mode.
   bool tier1_entropy = true;
+  // Tier 3 compact format (recorded in the archive): 16-bit hashed counters and a rANS stream per
+  // 64 KiB, about 47 MiB less per worker. false writes the format before it.
+  bool tier3_compact = true;
   bool tier4_primer = true;             // Tier 4: model the built-in primer first (archive records it)
   // Tier 4 context-table layout, recorded in the archive: 0 full (~194 MiB per model), 1 balanced
   // (~158 MiB, +0.2% size), 2 compact (~138 MiB, +0.5%), 3 small (~74 MiB, +2.2%), 4 rebalanced

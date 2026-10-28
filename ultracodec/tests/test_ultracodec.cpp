@@ -313,6 +313,32 @@ void test_tier1_modes() {
 // Tier 4 with its built-in primer: round trips over several blocks and
 // thread counts, archives that do not depend on the thread count, and a
 // primer ID the decoder does not know.
+// Tier 3 formats: the compact one (default) and the one before it both round-trip at any thread
+// count and read apart by model_param; the old format is byte-identical to what earlier builds
+// wrote (CRCs pinned), and blocks of several 64 KiB rANS chunks decode chunk by chunk.
+void test_tier3_formats() {
+  EngineOptions o = small_options(TierLevel::Tier3_Balanced, 1);
+  const Bytes small = text_bytes(150000, 77);
+  const Bytes compact = create_engine(TierLevel::Tier3_Balanced, o)->compress(small);
+  o.tier3_compact = false;
+  const Bytes legacy = create_engine(TierLevel::Tier3_Balanced, o)->compress(small);
+  CHECK(legacy.size() == 13074 && detail::crc32c(legacy.data(), legacy.size()) == 0x56cc2ec6u);
+  CHECK(compact.size() == 13080 && detail::crc32c(compact.data(), compact.size()) == 0x94733fe6u);
+  CHECK(peek_header(legacy).model_param == 0x40 && peek_header(compact).model_param == 0x80000040u);
+  CHECK(decompress(legacy) == small && decompress(compact) == small);
+
+  const Bytes data = text_bytes(slow_env() ? 300000 : 700000, 78);
+  o.block_size = 256 * 1024;  // four rANS chunks per block
+  for (const bool c : {false, true}) {
+    o.tier3_compact = c;
+    o.threads = 1;
+    const Bytes ref = create_engine(TierLevel::Tier3_Balanced, o)->compress(data);
+    o.threads = 3;
+    CHECK(create_engine(TierLevel::Tier3_Balanced, o)->compress(data) == ref);
+    CHECK(create_engine(TierLevel::Tier3_Balanced, o)->decompress(ref) == data);
+  }
+}
+
 void test_tier4_primer() {
   Bytes data = text_bytes(slow_env() ? 100000 : 300000, 31);
   Bytes rnd = random_bytes(70000, 32);  // a stored block between coded ones
@@ -569,12 +595,13 @@ void test_rss_limits() {
     std::size_t input;
     double mib;
   };
-  // Targets: Tier 2 <= 256 MiB, Tier 3 ~500 MiB, Tier 4 ~200 MiB per model
+  // Targets: Tier 2 <= 256 MiB, Tier 3 ~30 MiB per worker (141 MiB measured on 4 threads with
+  // the compact format; the old format needed ~76 MiB per worker), Tier 4 ~200 MiB per model
   // (here the snapshot and one worker, as 4 MiB is two blocks); inputs are
   // counted in the RSS too.
   const Limit limits[] = {{TierLevel::Tier1_HyperSpeed, 32u << 20, 160},
                           {TierLevel::Tier2_Consumer, 32u << 20, 256},
-                          {TierLevel::Tier3_Balanced, 4u << 20, 600},
+                          {TierLevel::Tier3_Balanced, 4u << 20, 256},
                           {TierLevel::Tier4_Enterprise, 4u << 20, 640}};
   for (const auto& l : limits) {
     double rss = child_peak_rss_mib(l.tier, l.input);
@@ -599,6 +626,8 @@ int main() {
   test_engine_rules();
   std::printf("tier 1 modes\n");
   test_tier1_modes();
+  std::printf("tier 3 formats\n");
+  test_tier3_formats();
   std::printf("tier 4 primer\n");
   test_tier4_primer();
   std::printf("tier 4 table layouts\n");

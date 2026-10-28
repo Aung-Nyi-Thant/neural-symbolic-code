@@ -9,6 +9,12 @@
 // Measured trade-off (ultracodec/README.md): a 5th hashed context (order 6)
 // gains 0.8% density for ~25% less speed; dropping order 3 gains ~30% speed
 // for 0.6% density.
+//
+// Archives use CompactProfile: 16-bit hashed counters (a bucket pair is one
+// cache line, 16 MiB per worker for the slots 32-bit counters held in 32 MiB)
+// and one rANS stream per 64 KiB, so the encoder's bit record is 1 MiB
+// instead of 16 MiB. LeanProfile, the format before that, still decodes and
+// is written with EngineOptions::tier3_compact = false.
 #include "cm_codec.hpp"
 #include "tiers.hpp"
 
@@ -18,6 +24,8 @@ namespace ultracodec::detail {
 namespace profiles {
 
 struct LeanProfile {
+  static constexpr bool kCompact = false;
+  static constexpr std::size_t kChunkBytes = 0;  // one rANS stream per block
   static constexpr unsigned kHashed = 4;
   static constexpr unsigned kMatch = 1;
   static constexpr unsigned kMatchMin[1] = {6};
@@ -53,10 +61,20 @@ struct LeanProfile {
   }
 };
 
+struct CompactProfile : LeanProfile {
+  static constexpr bool kCompact = true;
+  static constexpr std::size_t kChunkBytes = 64 * 1024;
+  static constexpr int kCounterLimit = 15;
+  static constexpr std::size_t kTableBytes = std::size_t{16} << 20;
+  static constexpr std::size_t kMaxTablePerByte = 64;
+  static constexpr u64 kMaxTableBytes = u64{4} << 30;
+};
+
 }  // namespace profiles
 
 std::unique_ptr<ICompressionEngine> make_tier3(const EngineOptions& o) {
-  return std::make_unique<CmEngine<profiles::LeanProfile>>(TierLevel::Tier3_Balanced, "Tier3 Balanced (lean CM + rANS)", o);
+  return std::make_unique<CmEngine<profiles::CompactProfile, profiles::LeanProfile>>(TierLevel::Tier3_Balanced,
+                                                                                     "Tier3 Balanced (lean CM + rANS)", o);
 }
 
 }  // namespace ultracodec::detail
