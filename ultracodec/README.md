@@ -9,7 +9,7 @@ four strategies:
 | 1 | Hyper-Speed | Default: greedy two-hash LZ77 over the whole block with repeat offsets, entropy-coded sequences (rANS). Raw mode: byte-level LZ77 in the LZ4 block layout, 64 KiB window | 1 MiB | ~0.8 MiB tables per thread |
 | 2 | Consumer | Gated word-dictionary pre-filter, lazy hash-chain LZ77 with repeat offsets, 8-way interleaved static rANS (AVX2 / NEON decode) with literals split into 16 context streams | 2 MiB | ~30 MiB per thread |
 | 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 32 MiB table + ~29 MiB per thread, budget 512 MiB |
-| 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 mixer sets, 4 APMs, binary range coder | 2 MiB | 74-194 MiB per model by table layout (default Rebalanced, ~159 MiB): packed snapshot (~61 MiB) + one per worker (794 MiB peak at 4 threads), budget 900 MiB |
+| 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 int16 mixer sets, 4 APMs, binary range coder | 2 MiB | 74-194 MiB per model by table layout (default Rebalanced, ~159 MiB): packed snapshot (~61 MiB) + one per worker (794 MiB peak at 4 threads), budget 900 MiB |
 
 **Results in one line:** every tier round-trips, all archives are
 deterministic and the same on x86 and ARM, and RAM stays within budget.
@@ -32,6 +32,11 @@ new default) make Tier 4 0.25-0.29% smaller at the same RAM per model, and
 the snapshot is held packed while workers copy from it. Peak RSS at 4
 threads drops from 884 to 794 MiB; the Lean layout gets to 639 MiB for
 +0.08% size.
+
+October 28 (see "Tier 4 mixer"): the four mixer weight sets are int16
+instead of int32 by default. Tier 4 runs about 8% faster on 4 threads for
++0.09% size; `tier4_narrow_mixer = false` writes the int32 mixer, and
+older archives still decode.
 
 ## API
 
@@ -230,6 +235,34 @@ plus the concatenation):
 
 Speed was the same within this VM's noise (0.34-0.36 MB/s per file,
 0.71-0.76 MB/s on the concatenation).
+
+#### Tier 4 mixer
+
+The four mixer weight sets hold int16 weights (1.0 = 4096, saturating at
++-8, the same range the int32 weights are clamped to) unless
+`EngineOptions::tier4_narrow_mixer` is false. The archive records the
+choice in `model_param`, so int32 archives, including all older ones,
+still decode. The 32 inputs are narrowed once per bit, and then a set's
+dot product is two `vpmaddwd` (AVX2) or four `smlal` (NEON) steps. The
+training step is `x * error / 2^18`, rounded twice the way `vpmulhrsw` /
+`sqrdmulh` and a rounding shift compute it, with a saturating add. The
+scalar, AVX2 and NEON kernels give identical results;
+`sws::mixer_kernels_match` checks them on random and extreme values.
+
+Full corpus, x86 VM, 4 threads, Rebalanced layout:
+
+| Mixer | Sum of files | Concatenation | Comp / dec MB/s (concatenation) |
+|---|---|---|---|
+| int32 (`tier4_narrow_mixer = false`) | 2,983,124 | 3,063,104 | 0.61-0.70 / 0.64-0.69 |
+| int16 (default) | 2,986,164 (+0.10%) | 3,065,845 (+0.09%) | 0.69-0.74 / 0.68-0.76 |
+
+Over 8 interleaved runs, int16 was faster in every one: +1.4% to +18% on
+compression and +6% to +12% on decompression (both means about +8%). The size loss
+comes from precision. Prose loses 0.26% and XML gains 0.54%. Other
+settings came out worse: weights at 1.0 = 2^11, 2^13 or 2^14 (+0.11%,
++0.11%, +0.17% on the concatenation), learning rate 5 or 7 instead of 6,
+and dithered rounding of the training step (+1.1%). RSS drops by only
+~1 MiB per model, because the weights are 2.6 MiB of int32.
 
 On the 26.97 MB mixed corpus (x86 VM, 4 threads, concatenation): Full under
 a 900 MiB budget runs 3 workers, 0.74 MB/s, 889 MiB peak RSS; Balanced runs

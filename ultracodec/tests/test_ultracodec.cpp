@@ -14,6 +14,7 @@
 #include <functional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common.hpp"
@@ -329,15 +330,18 @@ void test_tier4_primer() {
   auto three = create_engine(TierLevel::Tier4_Enterprise, o);
   CHECK(three->compress(data) == ref);
   CHECK(three->decompress(ref) == data);
-  // Unprimed archives record no primer CRC: model_param 0 with the Full layout.
+  // Unprimed archives record no primer CRC: model_param 0 with the Full layout and wide mixer
+  // (archives written before layouts and the narrow mixer).
   o.tier4_primer = false;
   Bytes plain = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
   CHECK(peek_header(plain).model_param != peek_header(ref).model_param && plain != ref);
   CHECK(decompress(plain) == data);
   o.tier4_tables = 0;
+  o.tier4_narrow_mixer = false;
   const Bytes plain_full = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
   CHECK(peek_header(plain_full).model_param == 0 && decompress(plain_full) == data);
   o.tier4_tables = -1;
+  o.tier4_narrow_mixer = true;
   Bytes bad = ref;
   detail::store32(bad.data() + 24, 12345);  // another primer
   detail::store32(bad.data() + 28, detail::crc32c(bad.data(), 28));
@@ -361,7 +365,7 @@ void test_tier4_layouts() {
     archives.push_back(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data));
     CHECK(decompress(archives.back()) == data);
   }
-  CHECK(peek_header(archives[0]).model_param == detail::sws::primer_crc());
+  CHECK(peek_header(archives[0]).model_param != detail::sws::primer_crc());  // narrow mixer
   for (std::size_t l = 1; l < 6; ++l)
     CHECK(archives[0] != archives[l] && peek_header(archives[0]).model_param != peek_header(archives[l]).model_param);
   o.tier4_tables = -1;
@@ -371,7 +375,7 @@ void test_tier4_layouts() {
   o.threads = 4;
   CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[3]);
   // Long-match bypass: deterministic across thread counts, recorded, and every primer x layout x
-  // bypass combination gets its own model_param.
+  // bypass x mixer combination gets its own model_param.
   o.tier4_tables = -1;
   o.memory_budget = 0;
   o.tier4_bypass = true;
@@ -384,14 +388,17 @@ void test_tier4_layouts() {
   std::vector<std::uint32_t> params;
   for (int l = 0; l < 6; ++l)
     for (const bool primer : {false, true})
-      for (const bool bypass : {false, true}) {
-        o.tier4_tables = l;
-        o.tier4_primer = primer;
-        o.tier4_bypass = bypass;
-        const Bytes a = create_engine(TierLevel::Tier4_Enterprise, o)->compress(small);
-        CHECK(decompress(a) == small);
-        params.push_back(peek_header(a).model_param);
-      }
+      for (const bool bypass : {false, true})
+        for (const bool narrow : {false, true}) {
+          o.tier4_tables = l;
+          o.tier4_primer = primer;
+          o.tier4_bypass = bypass;
+          o.tier4_narrow_mixer = narrow;
+          const Bytes a = create_engine(TierLevel::Tier4_Enterprise, o)->compress(small);
+          CHECK(decompress(a) == small);
+          params.push_back(peek_header(a).model_param);
+        }
+  CHECK(params.size() == 48);
   std::sort(params.begin(), params.end());
   CHECK(std::adjacent_find(params.begin(), params.end()) == params.end());
   o.tier4_tables = 6;
@@ -402,13 +409,34 @@ void test_tier4_layouts() {
   }
 }
 
+// Wide (int32) and narrow (int16) mixers: the SIMD kernels match the scalar ones, both mixers
+// round-trip at any thread count, and they code different bits.
+void test_tier4_mixers() {
+  for (std::uint32_t seed = 1; seed <= 4; ++seed) CHECK(detail::sws::mixer_kernels_match(seed));
+  const Bytes data = text_bytes(slow_env() ? 150000 : 300000, 35);
+  EngineOptions o;
+  o.block_size = 64 * 1024;
+  std::vector<Bytes> archives;
+  for (const bool narrow : {false, true}) {
+    o.tier4_narrow_mixer = narrow;
+    o.threads = 1;
+    archives.push_back(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data));
+    o.threads = 3;
+    CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives.back());
+    CHECK(decompress(archives.back()) == data);
+  }
+  CHECK(archives[0] != archives[1] && peek_header(archives[0]).model_param != peek_header(archives[1]).model_param);
+  CHECK(detail::sws::Model::bytes(1 << 20, detail::sws::TableLayout::Small, true) <
+        detail::sws::Model::bytes(1 << 20, detail::sws::TableLayout::Small, false));
+}
+
 // A packed snapshot copies into a model that codes exactly like a copy of the unpacked one,
 // whether the target is new or a reused worker model; the packed model itself refuses to code.
 void test_tier4_packed_snapshot() {
   namespace sws = detail::sws;
   const Bytes a = text_bytes(300000, 41), b = text_bytes(200000, 42), c = text_bytes(150000, 43);
-  for (const auto layout : {sws::TableLayout::Rebalanced, sws::TableLayout::Small}) {
-    sws::Model snapshot(sws::primer().size() + a.size() + b.size(), layout);
+  for (const auto& [layout, narrow] : {std::pair{sws::TableLayout::Rebalanced, true}, std::pair{sws::TableLayout::Small, false}}) {
+    sws::Model snapshot(sws::primer().size() + a.size() + b.size(), layout, narrow);
     snapshot.train(sws::primer());
     snapshot.train(a);
     const sws::Model plain(snapshot);
@@ -575,6 +603,8 @@ int main() {
   test_tier4_primer();
   std::printf("tier 4 table layouts\n");
   test_tier4_layouts();
+  std::printf("tier 4 mixers\n");
+  test_tier4_mixers();
   std::printf("tier 4 packed snapshot\n");
   test_tier4_packed_snapshot();
   std::printf("word filter\n");
