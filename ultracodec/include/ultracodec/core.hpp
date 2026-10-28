@@ -91,6 +91,9 @@ struct EngineOptions {
   // Tier 4 long-match bypass (recorded in the archive): bytes inside a match of 32+ bytes cost one
   // flag instead of the full model when predicted right. ~1.1x speed for ~+0.7% size.
   bool tier4_bypass = false;
+  // Tier 4 mixer weights as int16 instead of int32 (recorded in the archive): half the weight
+  // memory and SIMD work, same density. false writes the original wide mixer.
+  bool tier4_narrow_mixer = true;
 };
 
 // What one compress/decompress call measured (filled when requested).

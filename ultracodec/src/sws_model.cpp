@@ -257,6 +257,90 @@ void train(const std::int32_t* x, std::int32_t* w, std::int32_t error) noexcept 
 #endif
 }
 
+// Narrow mixer: |weight| <= 2^15. An int32 lane of the SIMD kernels sums at most 16 products,
+// each below 3071 * 2^15, so it stays below 2^31; the last two lanes are added in int64.
+[[maybe_unused]] void narrow_scalar(const std::int32_t* x, std::int16_t* y) noexcept {
+  for (std::size_t i = 0; i < kLanes; ++i) y[i] = static_cast<std::int16_t>(std::clamp(x[i], -32768, 32767));
+}
+[[maybe_unused]] std::int64_t dot16_scalar(const std::int16_t* x, const std::int16_t* w) noexcept {
+  std::int64_t sum = 0;
+  for (std::size_t i = 0; i < kLanes; ++i) sum += std::int32_t{x[i]} * w[i];
+  return sum;
+}
+// The step x * error / 2^18 is rounded in two stages, as pmulhrsw / sqrdmulh and a rounding shift
+// compute it, and the weight saturates at the int16 range.
+[[maybe_unused]] void train16_scalar(const std::int16_t* x, std::int16_t* w, std::int16_t error) noexcept {
+  for (std::size_t i = 0; i < kLanes; ++i) {
+    const std::int32_t step = (((std::int32_t{x[i]} * error + 16384) >> 15) + (1 << kNarrowStepShift >> 1)) >> kNarrowStepShift;
+    w[i] = static_cast<std::int16_t>(std::clamp(w[i] + step, -32768, 32767));
+  }
+}
+
+#if defined(ULTRA_SWS_AVX2)
+__attribute__((target("avx2"))) void narrow_avx2(const std::int32_t* x, std::int16_t* y) noexcept {
+  for (std::size_t i = 0; i < kLanes; i += 16) {
+    const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+    const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 8));
+    // packs works per 128-bit half; the permute puts the four quarters back in order.
+    const __m256i packed = _mm256_permute4x64_epi64(_mm256_packs_epi32(a, b), 0xD8);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(y + i), packed);
+  }
+}
+__attribute__((target("avx2"))) std::int64_t dot16_avx2(const std::int16_t* x, const std::int16_t* w) noexcept {
+  const auto* xv = reinterpret_cast<const __m256i*>(x);
+  const auto* wv = reinterpret_cast<const __m256i*>(w);
+  const __m256i sum = _mm256_add_epi32(_mm256_madd_epi16(_mm256_loadu_si256(xv), _mm256_loadu_si256(wv)),
+                                       _mm256_madd_epi16(_mm256_loadu_si256(xv + 1), _mm256_loadu_si256(wv + 1)));
+  __m128i half = _mm_add_epi32(_mm256_castsi256_si128(sum), _mm256_extracti128_si256(sum, 1));
+  half = _mm_add_epi32(half, _mm_shuffle_epi32(half, 0x4E));
+  return std::int64_t{_mm_cvtsi128_si32(half)} + _mm_extract_epi32(half, 1);
+}
+__attribute__((target("avx2"))) void train16_avx2(const std::int16_t* x, std::int16_t* w, std::int16_t error) noexcept {
+  const __m256i e = _mm256_set1_epi16(error), round = _mm256_set1_epi16(1 << kNarrowStepShift >> 1);
+  for (std::size_t i = 0; i < kLanes; i += 16) {
+    const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+    const __m256i b = _mm256_loadu_si256(reinterpret_cast<__m256i*>(w + i));
+    const __m256i step = _mm256_srai_epi16(_mm256_add_epi16(_mm256_mulhrs_epi16(a, e), round), kNarrowStepShift);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(w + i), _mm256_adds_epi16(b, step));
+  }
+}
+#endif
+
+void narrow(const std::int32_t* x, std::int16_t* y) noexcept {
+#if defined(ULTRA_SWS_NEON)
+  for (std::size_t i = 0; i < kLanes; i += 8) vst1q_s16(y + i, vcombine_s16(vqmovn_s32(vld1q_s32(x + i)), vqmovn_s32(vld1q_s32(x + i + 4))));
+#elif defined(ULTRA_SWS_AVX2)
+  if (has_avx2()) narrow_avx2(x, y); else narrow_scalar(x, y);
+#else
+  narrow_scalar(x, y);
+#endif
+}
+std::int64_t dot16(const std::int16_t* x, const std::int16_t* w) noexcept {
+#if defined(ULTRA_SWS_NEON)
+  int32x4_t sum = vdupq_n_s32(0);
+  for (std::size_t i = 0; i < kLanes; i += 8) {
+    const auto x0 = vld1q_s16(x + i), w0 = vld1q_s16(w + i);
+    sum = vmlal_high_s16(vmlal_s16(sum, vget_low_s16(x0), vget_low_s16(w0)), x0, w0);
+  }
+  return vaddlvq_s32(sum);
+#elif defined(ULTRA_SWS_AVX2)
+  return has_avx2() ? dot16_avx2(x, w) : dot16_scalar(x, w);
+#else
+  return dot16_scalar(x, w);
+#endif
+}
+void train16(const std::int16_t* x, std::int16_t* w, std::int16_t error) noexcept {
+#if defined(ULTRA_SWS_NEON)
+  const auto e = vdupq_n_s16(error);
+  for (std::size_t i = 0; i < kLanes; i += 8)
+    vst1q_s16(w + i, vqaddq_s16(vld1q_s16(w + i), vrshrq_n_s16(vqrdmulhq_s16(vld1q_s16(x + i), e), kNarrowStepShift)));
+#elif defined(ULTRA_SWS_AVX2)
+  if (has_avx2()) train16_avx2(x, w, error); else train16_scalar(x, w, error);
+#else
+  train16_scalar(x, w, error);
+#endif
+}
+
 // ---- snapshot packing ----------------------------------------------------------
 // One array is stored as the XOR of its bytes with a repeating baseline (the initial APM row, the
 // initial mixer weight, or zero), then as a mode byte followed by either the raw bytes (mode 0) or,
@@ -580,8 +664,14 @@ void Match::observe(const History& h) noexcept {
 // ---- Mixer ----------------------------------------------------------------------
 
 void Mixer::reset() {
-  weights_.reset(kMixRows * kLanes);
-  std::fill_n(weights_.data(), weights_.size(), kInitialWeight);
+  if (narrow_) {
+    weights16_.reset(kMixRows * kLanes);
+    std::fill_n(weights16_.data(), weights16_.size(), kInitialWeight16);
+  } else {
+    weights_.reset(kMixRows * kLanes);
+    std::fill_n(weights_.data(), weights_.size(), kInitialWeight);
+  }
+  inputs16_.fill(0);
   final_weights_.assign(256 * (kSets + 1), 65536 / std::int32_t{kSets});
   rows_.fill(0);
   set_probability_.fill(32768);
@@ -597,8 +687,11 @@ u32 Mixer::predict(const std::int32_t* inputs, u32 hits, u32 match_length, u32 m
   rows_[1] = kSetRows[0] + std::size_t{bits.c1} * 64 + ((bucket * 2 + (match_length ? match_bit : 0u)) * 8 + std::min(bits.bit, 7u)) % 64;
   rows_[2] = kSetRows[0] + kSetRows[1] + std::size_t{bits.c0} * 8 + std::min(hits * 8 / (kContexts + 1), std::size_t{7});
   rows_[3] = kSetRows[0] + kSetRows[1] + kSetRows[2] + ((std::size_t{bits.c2} * 8 + bits.bit) & 2047u);
+  if (narrow_) narrow(inputs, inputs16_.data());
   for (std::size_t s = 0; s < kSets; ++s) {
-    const std::int64_t logit = clamp64(dot(inputs, &weights_[rows_[s] * kLanes]) >> 16, kLogitMin, kLogitMax);
+    const std::size_t row = rows_[s] * kLanes;
+    const std::int64_t sum = narrow_ ? dot16(inputs16_.data(), &weights16_[row]) >> kNarrowBits : dot(inputs, &weights_[row]) >> 16;
+    const std::int64_t logit = clamp64(sum, kLogitMin, kLogitMax);
     set_probability_[s] = squash(t, logit);
     final_inputs_[s] = static_cast<std::int32_t>(logit);
   }
@@ -613,8 +706,12 @@ u32 Mixer::predict(const std::int32_t* inputs, u32 hits, u32 match_length, u32 m
 
 void Mixer::train(const std::int32_t* inputs, u32 bit) noexcept {
   for (std::size_t s = 0; s < kSets; ++s) {
+    // |error| <= 4095 * 6, which fits the narrow kernels' int16.
     const std::int32_t error = ((static_cast<std::int32_t>(bit) << 12) - static_cast<std::int32_t>(set_probability_[s] >> 4)) * kLearningRate;
-    sws::train(inputs, &weights_[rows_[s] * kLanes], error);
+    if (narrow_)
+      train16(inputs16_.data(), &weights16_[rows_[s] * kLanes], static_cast<std::int16_t>(error));
+    else
+      sws::train(inputs, &weights_[rows_[s] * kLanes], error);
   }
   const std::int32_t error = ((static_cast<std::int32_t>(bit) << 12) - static_cast<std::int32_t>(mixed_ >> 4)) * 2;
   std::int32_t* w = &final_weights_[final_row_];
@@ -675,7 +772,10 @@ void Calibration::update(u32 bit) noexcept {
 
 // ---- Model ----------------------------------------------------------------------
 
-Model::Model(std::size_t capacity, TableLayout layout) : buffer_(capacity), layout_(layout) { reset(); }
+Model::Model(std::size_t capacity, TableLayout layout, bool narrow_mixer)
+    : buffer_(capacity), layout_(layout), mixer_(narrow_mixer) {
+  reset();
+}
 
 Model::Model(const Model& o) { *this = o; }
 
@@ -722,10 +822,10 @@ void Model::reset() {
   next_contexts();
 }
 
-std::size_t Model::bytes(std::size_t capacity, TableLayout layout) noexcept {
+std::size_t Model::bytes(std::size_t capacity, TableLayout layout, bool narrow_mixer) noexcept {
   std::size_t b = capacity + (std::size_t{4} << match_bits(capacity, layout)) + (256 + 65536) * 2;
   for (std::size_t k = 0; k < kContexts; ++k) b += std::size_t{64} << table_bits(capacity, k, layout);
-  b += kMixRows * kLanes * 4 + 256 * (kSets + 1) * 4;
+  b += kMixRows * kLanes * (narrow_mixer ? 2 : 4) + 256 * (kSets + 1) * 4;
   b += (kApmRows0 + kApmRows1 + kApmRows2 + kApmRows3) * 33 * 2;
   return b + sizeof(Model);
 }
@@ -735,11 +835,13 @@ std::size_t Model::bytes(std::size_t capacity, TableLayout layout) noexcept {
 template <class F>
 void Model::for_each_array(F&& f) {
   static const Baseline zero, apm(Calibration::Apm::initial().data(), 33 * sizeof(u16)),
-      weight(&Mixer::kInitialWeight, sizeof(Mixer::kInitialWeight));
+      weight(&Mixer::kInitialWeight, sizeof(Mixer::kInitialWeight)),
+      weight16(&Mixer::kInitialWeight16, sizeof(Mixer::kInitialWeight16));
   f(buffer_, zero);
   for (auto& table : contexts_.tables_) f(table.buckets_, zero);
   f(match_.table_, zero);
-  f(mixer_.weights_, weight);
+  f(mixer_.weights_, weight);  // one of the two weight arrays is empty
+  f(mixer_.weights16_, weight16);
   f(calibration_.apm0_.values, apm);
   f(calibration_.apm1_.values, apm);
   f(calibration_.apm2_.values, apm);
@@ -753,11 +855,12 @@ void Model::pack() {
   packed_sizes_.clear();
   for_each_array([&]<class T>(BigArray<T>& a, const Baseline& b) {
     packed_sizes_.push_back(a.size());
-    total += packed_size(reinterpret_cast<const u8*>(a.data()), a.size() * sizeof(T), b);
+    if (a.size()) total += packed_size(reinterpret_cast<const u8*>(a.data()), a.size() * sizeof(T), b);
   });
   packed_.reset(total);
   u8* out = packed_.data();
   for_each_array([&]<class T>(BigArray<T>& a, const Baseline& b) {
+    if (!a.size()) return;  // the unused mixer weight array
     out = pack_bytes(reinterpret_cast<const u8*>(a.data()), a.size() * sizeof(T), b, out);
     a.reset(0);  // release
   });
@@ -770,12 +873,13 @@ void Model::unpack_into(Model& dst) const {
   dst.for_each_array([&]<class T>(BigArray<T>& a, const Baseline& b) {
     const std::size_t n = packed_sizes_[i++];
     if (a.size() != n) a.reset(n);
-    in = unpack_bytes(in, reinterpret_cast<u8*>(a.data()), n * sizeof(T), b);
+    if (n) in = unpack_bytes(in, reinterpret_cast<u8*>(a.data()), n * sizeof(T), b);
   });
 }
 
 std::size_t Model::resident_bytes() const noexcept {
-  std::size_t b = sizeof(Model) + packed_.size() + buffer_.size() + match_.table_.size() * 4 + mixer_.weights_.size() * 4;
+  std::size_t b = sizeof(Model) + packed_.size() + buffer_.size() + match_.table_.size() * 4 + mixer_.weights_.size() * 4 +
+                  mixer_.weights16_.size() * 2;
   for (const auto& table : contexts_.tables_) b += table.buckets_.size() * sizeof(SlotTable::Bucket);
   for (const auto* apm : {&calibration_.apm0_, &calibration_.apm1_, &calibration_.apm2_, &calibration_.apm3_}) b += apm->values.size() * 2;
   return b;
@@ -907,6 +1011,42 @@ void Model::decode(std::span<const u8> payload, std::span<u8> out) {
   }
   ensure_contexts();
   if (!coder.consumed_exactly()) throw Error("ultracodec: Tier 4 stream did not end cleanly (corrupt block)");
+}
+
+bool mixer_kernels_match(u32 seed) {
+  u64 state = seed;
+  const auto next = [&] { return state = mix64(state + kSalt); };
+  // Uniform in [lo, hi], or an end point in one draw out of four.
+  const auto draw = [&](std::int32_t lo, std::int32_t hi) {
+    const u64 r = next();
+    if ((r & 3) == 0) return (r & 4) ? hi : lo;
+    return lo + static_cast<std::int32_t>((r >> 3) % static_cast<u64>(hi - lo + 1));
+  };
+  bool ok = true;
+  for (int round = 0; round < 2000; ++round) {
+    alignas(32) std::array<std::int32_t, kLanes> x{}, w{}, w_simd{};
+    alignas(32) std::array<std::int16_t, kLanes> x16{}, x16_simd{}, w16{}, w16_simd{};
+    for (std::size_t i = 0; i < kLanes; ++i) {
+      x[i] = draw(kLogitMin, kLogitMax);
+      w[i] = draw(-kWeightLimit, kWeightLimit);
+      w16[i] = static_cast<std::int16_t>(draw(-32768, 32767));
+    }
+    const std::int32_t error = draw(-4095, 4095) * kLearningRate;
+    narrow_scalar(x.data(), x16.data());
+    narrow(x.data(), x16_simd.data());
+    ok &= x16 == x16_simd;
+    ok &= dot_scalar(x.data(), w.data()) == dot(x.data(), w.data());
+    ok &= dot16_scalar(x16.data(), w16.data()) == dot16(x16.data(), w16.data());
+    w_simd = w;
+    train_scalar(x.data(), w.data(), error);
+    train(x.data(), w_simd.data(), error);
+    ok &= w == w_simd;
+    w16_simd = w16;
+    train16_scalar(x16.data(), w16.data(), static_cast<std::int16_t>(error));
+    train16(x16.data(), w16_simd.data(), static_cast<std::int16_t>(error));
+    ok &= w16 == w16_simd;
+  }
+  return ok;
 }
 
 }  // namespace ultracodec::detail::sws

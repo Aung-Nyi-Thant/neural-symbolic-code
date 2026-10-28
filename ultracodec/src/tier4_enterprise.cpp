@@ -42,27 +42,32 @@ constexpr std::size_t kDefaultBudget = std::size_t{900} << 20;  // all models of
 constexpr std::size_t kPlannedModels = 5;
 
 // What the archive records about the model in model_param: primer CRC (0 without primer) XOR a
-// per-layout salt XOR a bypass salt. Full without bypass has salt 0, so archives written before
-// layouts existed still read as Full. Tests check that all 24 values are distinct.
+// per-layout salt XOR a bypass salt XOR a narrow-mixer salt. Full, wide, without bypass has salt
+// 0, so archives written before layouts existed still read as Full. Tests check that all 48
+// values are distinct.
 constexpr std::array<u32, sws::kTableLayouts> kLayoutSalt{0, 0x4C415931u, 0x4C415932u, 0x4C415933u, 0x4C415934u, 0x4C415935u};
 constexpr u32 kBypassSalt = 0x0B790000u;
 constexpr u32 kBypassLength = 32;
+constexpr u32 kNarrowSalt = 0x4E160000u;
 
 struct SwsConfig {
   bool primed = true;
   sws::TableLayout layout = sws::TableLayout::Full;
   bool bypass = false;
+  bool narrow = true;  // int16 mixer weights
   u32 param() const noexcept {
-    return (primed ? sws::primer_crc() : 0) ^ kLayoutSalt[static_cast<unsigned>(layout)] ^ (bypass ? kBypassSalt : 0);
+    return (primed ? sws::primer_crc() : 0) ^ kLayoutSalt[static_cast<unsigned>(layout)] ^ (bypass ? kBypassSalt : 0) ^
+           (narrow ? kNarrowSalt : 0);
   }
   static SwsConfig from_param(u32 param) {
     for (unsigned l = 0; l < sws::kTableLayouts; ++l)
       for (const bool p : {false, true})
-        for (const bool b : {false, true}) {
-          const SwsConfig c{p, static_cast<sws::TableLayout>(l), b};
-          if (c.param() == param) return c;
-        }
-    throw Error("ultracodec: unknown Tier 4 primer, table layout or bypass");
+        for (const bool b : {false, true})
+          for (const bool n : {false, true}) {
+            const SwsConfig c{p, static_cast<sws::TableLayout>(l), b, n};
+            if (c.param() == param) return c;
+          }
+    throw Error("ultracodec: unknown Tier 4 primer, table layout, bypass or mixer");
   }
 };
 
@@ -74,7 +79,7 @@ std::size_t capacity(std::size_t size, std::size_t block, bool primed) noexcept 
 
 // A model that has read the primer (when enabled), ready for block 0.
 sws::Model start_model(std::size_t capacity, const SwsConfig& c) {
-  sws::Model m(capacity, c.layout);
+  sws::Model m(capacity, c.layout, c.narrow);
   m.set_bypass(c.bypass ? kBypassLength : 0);
   if (c.primed) m.train(sws::primer());
   return m;
@@ -120,10 +125,11 @@ class SwsEngine final : public ICompressionEngine {
  private:
   // Workers for the parallel stage, so that the packed snapshot plus one model
   // per worker fit the memory budget. The archive does not depend on this.
-  unsigned workers_for(std::size_t later_blocks, std::size_t capacity, sws::TableLayout layout,
+  unsigned workers_for(std::size_t later_blocks, std::size_t capacity, const SwsConfig& c,
                        const sws::Model& snapshot) const noexcept {
     const std::size_t held = snapshot.resident_bytes(), budget = options_.memory_budget;
-    const std::size_t models = budget > held ? (budget - held) / sws::Model::bytes(capacity, layout) : 0;
+    const std::size_t one = sws::Model::bytes(capacity, c.layout, c.narrow);
+    const std::size_t models = budget > held ? (budget - held) / one : 0;
     const std::size_t w = std::min<std::size_t>({options_.threads, later_blocks, models});
     return static_cast<unsigned>(std::max<std::size_t>(1, w));
   }
@@ -131,10 +137,10 @@ class SwsEngine final : public ICompressionEngine {
   // The requested layout, or the densest one whose planned models fit the budget (Small if none).
   // Rebalanced is smaller and denser than Full and Balanced, Lean smaller and denser than
   // Balanced and Compact, so those are only used when asked for.
-  sws::TableLayout layout_for(std::size_t capacity) const noexcept {
+  sws::TableLayout layout_for(std::size_t capacity, bool narrow) const noexcept {
     if (options_.tier4_tables >= 0) return static_cast<sws::TableLayout>(options_.tier4_tables);
     for (const auto layout : {sws::TableLayout::Rebalanced, sws::TableLayout::Lean})
-      if (kPlannedModels * sws::Model::bytes(capacity, layout) <= options_.memory_budget) return layout;
+      if (kPlannedModels * sws::Model::bytes(capacity, layout, narrow) <= options_.memory_budget) return layout;
     return sws::TableLayout::Small;
   }
 
@@ -153,17 +159,16 @@ std::vector<u8> SwsEngine::compress(std::span<const u8> input, EngineStats* stat
   std::vector<std::vector<u8>> payloads(blocks);
   std::vector<u32> crcs(blocks);
   std::atomic<std::size_t> stored{0};
-  SwsConfig config{primed, sws::TableLayout::Full, options_.tier4_bypass};
-  const sws::TableLayout& layout = config.layout;
+  SwsConfig config{primed, sws::TableLayout::Full, options_.tier4_bypass, options_.tier4_narrow_mixer};
   if (blocks) {
     const std::size_t cap = capacity(input.size(), bs, primed);
-    config.layout = layout_for(cap);
+    config.layout = layout_for(cap, config.narrow);
     sws::Model snapshot = start_model(cap, config);
     crcs[0] = crc32c(block(0));
     if (code_block(snapshot, block(0), payloads[0])) stored.fetch_add(1);
     if (blocks > 1) {
       snapshot.pack();
-      const unsigned workers = workers_for(blocks - 1, cap, layout, snapshot);
+      const unsigned workers = workers_for(blocks - 1, cap, config, snapshot);
       std::vector<std::optional<sws::Model>> models(workers);
       parallel_blocks(
           blocks - 1, workers,
@@ -218,7 +223,6 @@ std::vector<u8> SwsEngine::decompress(std::span<const u8> archive, EngineStats* 
   if (h.uncompressed_size > options_.max_output_bytes) throw Error("ultracodec: archive exceeds max_output_bytes");
   const SwsConfig config = SwsConfig::from_param(h.model_param);
   const bool primed = config.primed;
-  const sws::TableLayout layout = config.layout;
   const std::size_t blocks = h.block_count;
   const std::size_t bs = h.block_size();
 
@@ -263,7 +267,7 @@ std::vector<u8> SwsEngine::decompress(std::span<const u8> archive, EngineStats* 
     decode_block(0, &snapshot);
     if (blocks > 1) {
       snapshot.pack();
-      const unsigned workers = workers_for(blocks - 1, cap, layout, snapshot);
+      const unsigned workers = workers_for(blocks - 1, cap, config, snapshot);
       std::vector<std::optional<sws::Model>> models(workers);
       parallel_blocks(
           blocks - 1, workers,

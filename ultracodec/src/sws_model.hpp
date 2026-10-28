@@ -2,7 +2,8 @@
 //
 // Per bit it mixes 22 hashed contexts (orders 0-6, 8, 10, 12, 16, 24, 32,
 // two sparse, three word, two column, two indirect) and a match model in
-// four int32 mixer weight sets plus a final mixer, then refines the result
+// four mixer weight sets (int16, or int32 in archives written before the
+// narrow mixer) plus a final mixer, then refines the result
 // with four APMs. Context tables use 64-byte buckets of four 16-byte nibble
 // slots (8-bit check + 15 bit-history states), so a nibble costs one cache
 // line per context.
@@ -44,6 +45,8 @@ inline constexpr std::size_t kSets = 4;
 inline constexpr std::array<std::size_t, kSets> kSetRows{256, 64 * 256, 256 * 8, 2048};
 inline constexpr std::size_t kMixRows = kSetRows[0] + kSetRows[1] + kSetRows[2] + kSetRows[3];
 inline constexpr std::int32_t kWeightLimit = std::int32_t{1} << 19;
+inline constexpr int kNarrowBits = 12;  // narrow mixer weights: 1.0 = 2^kNarrowBits
+inline constexpr int kNarrowStepShift = 15 - kNarrowBits;  // after the rounded x * error >> 15
 inline constexpr unsigned kBucketBits = 17;  // Full layout's per-context cap: 2^17 x 64 B = 8 MiB
 
 // Per-context table caps. The archive records the layout, because table sizes change the coded
@@ -208,14 +211,20 @@ class Match {
   unsigned bits_ = 20;
 };
 
+// Narrow mixers hold the set weights as int16 (1.0 = 4096) instead of int32 (1.0 = 65536): half
+// the weight bytes and twice the lanes per SIMD instruction. Both saturate at +-8.0; the archive
+// records which one coded it.
 class Mixer {
   friend class Model;
 
  public:
-  Mixer() = default;
+  explicit Mixer(bool narrow = false) : narrow_(narrow) {}
   Mixer(const Mixer& o) { *this = o; }
   Mixer& operator=(const Mixer& o) {
+    narrow_ = o.narrow_;
     copy_big(weights_, o.weights_);
+    copy_big(weights16_, o.weights16_);
+    inputs16_ = o.inputs16_;
     final_weights_ = o.final_weights_;
     rows_ = o.rows_;
     set_probability_ = o.set_probability_;
@@ -225,13 +234,17 @@ class Mixer {
     return *this;
   }
   static constexpr std::int32_t kInitialWeight = 65536 / 8;
+  static constexpr std::int16_t kInitialWeight16 = (1 << kNarrowBits) / 8;
   void reset();
   u32 predict(const std::int32_t* inputs, u32 hits, u32 match_length, u32 match_bit, const Bits& bits) noexcept;
   void train(const std::int32_t* inputs, u32 bit) noexcept;
 
  private:
   const Tables* t_ = &tables();
-  BigArray<std::int32_t> weights_;
+  bool narrow_ = false;
+  BigArray<std::int32_t> weights_;    // wide mixer
+  BigArray<std::int16_t> weights16_;  // narrow mixer
+  alignas(32) std::array<std::int16_t, kLanes> inputs16_{};  // this bit's inputs, narrowed
   std::vector<std::int32_t> final_weights_;
   std::array<std::size_t, kSets> rows_{};
   std::array<u32, kSets> set_probability_{};
@@ -271,7 +284,7 @@ class Calibration {
 // one model ever sees (primer + block 0 + one later block) and sizes its tables.
 class Model {
  public:
-  explicit Model(std::size_t capacity, TableLayout layout = TableLayout::Full);
+  explicit Model(std::size_t capacity, TableLayout layout = TableLayout::Full, bool narrow_mixer = false);
   Model(const Model& o);
   Model& operator=(const Model& o);
 
@@ -303,7 +316,7 @@ class Model {
 
   std::size_t position() const noexcept { return history_.position; }
   // Bytes of heap memory one model holds (tables, history, mixers, APMs).
-  static std::size_t bytes(std::size_t capacity, TableLayout layout = TableLayout::Full) noexcept;
+  static std::size_t bytes(std::size_t capacity, TableLayout layout = TableLayout::Full, bool narrow_mixer = false) noexcept;
 
  private:
   u16 predict() noexcept;
@@ -337,6 +350,10 @@ class Model {
   BigArray<u8> packed_;                    // the large arrays while packed (pack())
   std::vector<std::size_t> packed_sizes_;  // their element counts
 };
+
+// Test hook: runs the mixer kernels on random inputs, weights and errors (with the ends of their
+// ranges) and returns true when the AVX2 / NEON kernels match the scalar ones.
+bool mixer_kernels_match(u32 seed);
 
 // The built-in primer (third_party/sws_primer/NOTICE.md) and its CRC-32C.
 std::span<const u8> primer() noexcept;
