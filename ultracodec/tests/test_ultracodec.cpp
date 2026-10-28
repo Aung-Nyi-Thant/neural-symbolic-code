@@ -2,6 +2,7 @@
 // thread-count independence, the rANS vector kernels against the scalar
 // decoder, header/framing validation, corruption (truncation and random bit
 // flips must throw ultracodec::Error or decode to the original, never crash;
+// the Tier 2 word filter gets the same treatment on its own;
 // run under ASan/UBSan in CI) and peak-RSS limits per tier (Linux, not under
 // sanitizers).
 //
@@ -17,6 +18,8 @@
 
 #include "common.hpp"
 #include "rans_static.hpp"
+#include "sws_model.hpp"
+#include "word_filter.hpp"
 #include "ultracodec/engine.hpp"
 
 #if defined(__linux__)
@@ -84,6 +87,27 @@ Bytes text_bytes(std::size_t n, std::uint32_t seed) {
   }
   s.resize(n);
   return Bytes(s.begin(), s.end());
+}
+
+// text_bytes with capitalized, upper-case and mixed-case words, digits,
+// identifiers, UTF-8 and the filter's own escape bytes mixed in.
+Bytes cased_text_bytes(std::size_t n, std::uint32_t seed) {
+  static const char* extra[] = {"The", "THE", "McDonald", "iPhone", "A", "I", "X1", "_init_", "__INIT__",
+                                "foo_bar9", "caf\xc3\xa9", "\x01\x02\xff", "2024", "HTTPServer", "Return"};
+  Bytes base = text_bytes(n, seed);
+  std::mt19937 rng(seed);
+  Bytes out;
+  for (std::size_t i = 0; i < base.size(); ++i) {
+    out.push_back(base[i]);
+    if (base[i] == ' ' && rng() % 6 == 0) {
+      const char* w = extra[rng() % (sizeof extra / sizeof *extra)];
+      out.insert(out.end(), w, w + std::strlen(w));
+      out.push_back(' ');
+    }
+  }
+  out.insert(out.end(), 300, 'q');  // a word longer than 255 bytes
+  out.resize(n);
+  return out;
 }
 
 Bytes structured_bytes(std::size_t n) {
@@ -199,6 +223,7 @@ void test_roundtrips() {
   inputs.emplace_back("tiny-random", random_bytes(100, 1));
   inputs.emplace_back("zeros", Bytes(150000, 0));
   inputs.emplace_back("text", text_bytes(300000, 2));
+  inputs.emplace_back("cased-text", cased_text_bytes(200000, 7));
   inputs.emplace_back("random", random_bytes(140000, 3));
   inputs.emplace_back("structured", structured_bytes(200000));
   inputs.emplace_back("block-1", text_bytes(65535, 4));
@@ -260,6 +285,30 @@ void test_engine_rules() {
   CHECK(!create_engine(TierLevel::Tier3_Balanced)->get_name().empty());
 }
 
+// Tier 1's two modes: both round-trip edge-case inputs, the archive records the mode, and the
+// entropy mode is the smaller one on text.
+void test_tier1_modes() {
+  std::vector<Bytes> inputs = {{}, Bytes(1, 7), Bytes(100000, 0), random_bytes(70000, 41), text_bytes(300000, 42)};
+  Bytes mixed = text_bytes(150000, 43);
+  Bytes rnd = random_bytes(40000, 44);
+  mixed.insert(mixed.begin() + 50000, rnd.begin(), rnd.end());
+  inputs.push_back(mixed);
+  for (const bool entropy : {false, true}) {
+    EngineOptions o = small_options(TierLevel::Tier1_HyperSpeed, 2);
+    o.tier1_entropy = entropy;
+    auto e = create_engine(TierLevel::Tier1_HyperSpeed, o);
+    for (const Bytes& in : inputs) {
+      const Bytes a = e->compress(in);
+      CHECK(e->decompress(a) == in);
+      if (!in.empty()) CHECK(peek_header(a).model_param == (entropy ? 1u : 0u));
+    }
+  }
+  EngineOptions raw;
+  raw.tier1_entropy = false;
+  const Bytes& text = inputs[4];
+  CHECK(compress(TierLevel::Tier1_HyperSpeed, text).size() * 5 < create_engine(TierLevel::Tier1_HyperSpeed, raw)->compress(text).size() * 4);
+}
+
 // Tier 4 with its built-in primer: round trips over several blocks and
 // thread counts, archives that do not depend on the thread count, and a
 // primer ID the decoder does not know.
@@ -280,11 +329,15 @@ void test_tier4_primer() {
   auto three = create_engine(TierLevel::Tier4_Enterprise, o);
   CHECK(three->compress(data) == ref);
   CHECK(three->decompress(ref) == data);
-  // Unprimed archives record model_param 0.
+  // Unprimed archives record no primer CRC: model_param 0 with the Full layout.
   o.tier4_primer = false;
   Bytes plain = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
-  CHECK(peek_header(plain).model_param == 0 && plain != ref);
+  CHECK(peek_header(plain).model_param != peek_header(ref).model_param && plain != ref);
   CHECK(decompress(plain) == data);
+  o.tier4_tables = 0;
+  const Bytes plain_full = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
+  CHECK(peek_header(plain_full).model_param == 0 && decompress(plain_full) == data);
+  o.tier4_tables = -1;
   Bytes bad = ref;
   detail::store32(bad.data() + 24, 12345);  // another primer
   detail::store32(bad.data() + 28, detail::crc32c(bad.data(), 28));
@@ -292,6 +345,93 @@ void test_tier4_primer() {
     decompress(bad);
     CHECK(false);
   } catch (const Error&) {
+  }
+}
+
+// Every table layout round-trips, is recorded in the archive and changes the coded bits; the
+// auto choice follows the memory budget, not the thread count.
+void test_tier4_layouts() {
+  const Bytes data = text_bytes(slow_env() ? 150000 : 400000, 33);
+  EngineOptions o;
+  o.block_size = 64 * 1024;
+  o.threads = 2;
+  std::vector<Bytes> archives;
+  for (int l = 0; l < 6; ++l) {
+    o.tier4_tables = l;
+    archives.push_back(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data));
+    CHECK(decompress(archives.back()) == data);
+  }
+  CHECK(peek_header(archives[0]).model_param == detail::sws::primer_crc());
+  for (std::size_t l = 1; l < 6; ++l)
+    CHECK(archives[0] != archives[l] && peek_header(archives[0]).model_param != peek_header(archives[l]).model_param);
+  o.tier4_tables = -1;
+  o.memory_budget = std::size_t{4} << 30;  // auto: Rebalanced
+  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[4]);
+  o.memory_budget = std::size_t{1} << 20;  // nothing fits: Small, one worker
+  o.threads = 4;
+  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == archives[3]);
+  // Long-match bypass: deterministic across thread counts, recorded, and every primer x layout x
+  // bypass combination gets its own model_param.
+  o.tier4_tables = -1;
+  o.memory_budget = 0;
+  o.tier4_bypass = true;
+  o.threads = 1;
+  const Bytes by1 = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
+  o.threads = 3;
+  CHECK(create_engine(TierLevel::Tier4_Enterprise, o)->compress(data) == by1);
+  CHECK(by1 != archives[0] && decompress(by1) == data);
+  const Bytes small = text_bytes(20000, 34);
+  std::vector<std::uint32_t> params;
+  for (int l = 0; l < 6; ++l)
+    for (const bool primer : {false, true})
+      for (const bool bypass : {false, true}) {
+        o.tier4_tables = l;
+        o.tier4_primer = primer;
+        o.tier4_bypass = bypass;
+        const Bytes a = create_engine(TierLevel::Tier4_Enterprise, o)->compress(small);
+        CHECK(decompress(a) == small);
+        params.push_back(peek_header(a).model_param);
+      }
+  std::sort(params.begin(), params.end());
+  CHECK(std::adjacent_find(params.begin(), params.end()) == params.end());
+  o.tier4_tables = 6;
+  try {
+    create_engine(TierLevel::Tier4_Enterprise, o);
+    CHECK(false);
+  } catch (const Error&) {
+  }
+}
+
+// A packed snapshot copies into a model that codes exactly like a copy of the unpacked one,
+// whether the target is new or a reused worker model; the packed model itself refuses to code.
+void test_tier4_packed_snapshot() {
+  namespace sws = detail::sws;
+  const Bytes a = text_bytes(300000, 41), b = text_bytes(200000, 42), c = text_bytes(150000, 43);
+  for (const auto layout : {sws::TableLayout::Rebalanced, sws::TableLayout::Small}) {
+    sws::Model snapshot(sws::primer().size() + a.size() + b.size(), layout);
+    snapshot.train(sws::primer());
+    snapshot.train(a);
+    const sws::Model plain(snapshot);
+    const std::size_t full = snapshot.resident_bytes();
+    snapshot.pack();
+    CHECK(snapshot.packed() && snapshot.resident_bytes() < full / 2);
+    Bytes out1, out2, out3;
+    sws::Model x(plain), y(snapshot);
+    CHECK(x.encode(b, out1) && y.encode(b, out2) && out1 == out2);
+    y = snapshot;  // reuse: y's arrays are dirty from block b
+    CHECK(y.encode(c, out3));
+    Bytes ref;
+    sws::Model z(plain);
+    CHECK(z.encode(c, ref) && ref == out3);
+    sws::Model d(snapshot);
+    Bytes back(b.size());
+    d.decode(out1, back);
+    CHECK(back == b);
+    try {
+      snapshot.encode(c, out3);
+      CHECK(false);
+    } catch (const Error&) {
+    }
   }
 }
 
@@ -338,6 +478,42 @@ void test_corruption() {
     CHECK(threw > 0);
     std::printf("  corruption %-40s %d rejected, %d harmless\n", std::string(engine->get_name()).c_str(), threw, same);
   }
+}
+
+void test_word_filter() {
+  using detail::WordDict;
+  std::vector<Bytes> inputs = {Bytes{}, Bytes{'A'}, Bytes{1, 2, 0xFF, 0, 0x80}, cased_text_bytes(50000, 31),
+                               text_bytes(50000, 32), random_bytes(20000, 33), Bytes(400, 'Z')};
+  for (WordDict d : {WordDict::Prose, WordDict::Code}) {
+    for (const Bytes& in : inputs) {
+      Bytes f;
+      detail::word_filter_encode(d, in, f);
+      CHECK(f.size() <= 2 * in.size());
+      Bytes back(in.size());
+      detail::word_filter_decode(d, f, back);
+      CHECK(back == in);
+    }
+  }
+  CHECK(detail::word_filter_choose(cased_text_bytes(200000, 34)) != WordDict::None);
+  CHECK(detail::word_filter_choose(random_bytes(200000, 35)) == WordDict::None);
+  CHECK(detail::word_filter_choose(structured_bytes(200000)) == WordDict::None);
+  // Corrupt filtered data: throw or decode to some bytes, never overrun.
+  std::mt19937 rng(36);
+  Bytes in = cased_text_bytes(20000, 37), f;
+  detail::word_filter_encode(WordDict::Code, in, f);
+  int threw = 0;
+  for (int i = 0; i < fuzz_iters(150) * 4; ++i) {
+    Bytes bad = f;
+    if (i % 2) bad.resize(rng() % bad.size());
+    else bad[rng() % bad.size()] = static_cast<std::uint8_t>(rng());
+    Bytes out(in.size() + (rng() % 3) - 1);
+    try {
+      detail::word_filter_decode(WordDict::Code, bad, out);
+    } catch (const Error&) {
+      ++threw;
+    }
+  }
+  CHECK(threw > 0);
 }
 
 #if defined(ULTRA_TEST_RSS) && !defined(ULTRA_SANITIZED)
@@ -393,8 +569,16 @@ int main() {
   test_thread_independence();
   std::printf("engine rules\n");
   test_engine_rules();
+  std::printf("tier 1 modes\n");
+  test_tier1_modes();
   std::printf("tier 4 primer\n");
   test_tier4_primer();
+  std::printf("tier 4 table layouts\n");
+  test_tier4_layouts();
+  std::printf("tier 4 packed snapshot\n");
+  test_tier4_packed_snapshot();
+  std::printf("word filter\n");
+  test_word_filter();
   std::printf("corruption\n");
   test_corruption();
 #if defined(ULTRA_TEST_RSS) && !defined(ULTRA_SANITIZED)

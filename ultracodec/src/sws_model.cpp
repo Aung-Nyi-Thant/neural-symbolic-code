@@ -44,12 +44,41 @@ u32 squash(const Tables& t, std::int64_t logit) noexcept {
 // Table sizes follow the bytes a model will see (`capacity`), up to the caps. Order 0 sees 17
 // nibble contexts and order 1 at most 4352; larger tables would stay empty. Four slots per bucket:
 // 2^(log2(capacity) - 1) buckets hold the two nibble contexts of every byte.
-unsigned table_bits(std::size_t capacity, std::size_t context) noexcept {
-  const unsigned cap = context == 0 ? 6u : context == 1 ? 12u : kBucketBits;
+// The layout lowers the caps of the contexts that lose least from smaller tables (TableLayout).
+// Rebalanced and Lean come from halving each table on its own (memory audit, 2026-10-27): the
+// column context gives back 7 MiB for 0.001% size, the first indirect context 6 MiB for 0.017%,
+// while orders 3 and 4 and the word pair lose 0.03-0.05% per MiB taken from them.
+// Context order: orders 0-6, 8, 10, 12, 16, 24, 32; sparse x2; word x3; column x2; indirect x2.
+constexpr std::array<u8, kContexts> kRebalancedCaps{6, 12, 14, 17, 17, 18, 17, 17, 17, 17, 14,
+                                                    15, 15, 17, 16, 17, 18, 18, 14, 17, 15, 16};
+constexpr std::array<u8, kContexts> kLeanCaps{6, 12, 14, 15, 15, 17, 17, 17, 17, 17, 14,
+                                              15, 15, 17, 16, 17, 17, 17, 14, 17, 15, 16};
+unsigned layout_cap(TableLayout layout, std::size_t context) noexcept {
+  const bool low = context >= 2 && context <= 4;     // orders 2-4
+  const bool mid = context >= 5 && context <= 9;     // orders 5, 6, 8, 10, 12
+  const bool high = context >= 10 && context <= 12;  // orders 16, 24, 32
+  switch (layout) {
+    case TableLayout::Full: return kBucketBits;
+    case TableLayout::Balanced: return low || high ? 15u : kBucketBits;
+    case TableLayout::Compact: return low || high ? 15u : mid ? 16u : kBucketBits;
+    case TableLayout::Small: return 15u;
+    case TableLayout::Rebalanced: return kRebalancedCaps[context];
+    case TableLayout::Lean: return kLeanCaps[context];
+  }
+  return kBucketBits;
+}
+
+unsigned table_bits(std::size_t capacity, std::size_t context, TableLayout layout) noexcept {
+  const unsigned cap = context == 0 ? 6u : context == 1 ? 12u : layout_cap(layout, context);
   const unsigned wanted = capacity <= 1 ? 0u : static_cast<unsigned>(std::bit_width(capacity - 1));
   return std::clamp(wanted ? wanted - 1 : 0u, std::min(10u, cap), cap);
 }
-unsigned match_bits(std::size_t capacity) noexcept { return capacity < (std::size_t{1} << 20) ? 20u : 22u; }
+// The match table holds one position per hashed 6-byte context; after a block 8-18% of a 2^22
+// table is in use, and 2^20 costs 0.02% size.
+unsigned match_bits(std::size_t capacity, TableLayout layout) noexcept {
+  if (layout == TableLayout::Rebalanced || layout == TableLayout::Lean) return 20u;
+  return capacity < (std::size_t{1} << 20) ? 20u : 22u;
+}
 
 // ---- static tables ----------------------------------------------------------
 
@@ -228,6 +257,79 @@ void train(const std::int32_t* x, std::int32_t* w, std::int32_t error) noexcept 
 #endif
 }
 
+// ---- snapshot packing ----------------------------------------------------------
+// One array is stored as the XOR of its bytes with a repeating baseline (the initial APM row, the
+// initial mixer weight, or zero), then as a mode byte followed by either the raw bytes (mode 0) or,
+// per 64-byte chunk, a 64-bit mask of the chunk's non-zero bytes and those bytes (mode 1),
+// whichever is smaller. Context tables are 60-66% zero bytes after a block.
+
+// The baseline repeated, so that any 64 bytes of it starting at offset (at % period) are contiguous.
+struct Baseline {
+  std::vector<u8> bytes;
+  std::size_t period = 1;
+  Baseline() : bytes(65, 0) {}
+  Baseline(const void* pattern, std::size_t n) : bytes(n + 64), period(n) {
+    for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<const u8*>(pattern)[i % n];
+  }
+  const u8* at(std::size_t offset) const noexcept { return bytes.data() + offset % period; }
+};
+
+u64 nonzero_mask(const u8* p, const u8* base, std::size_t len) noexcept {
+  u64 mask = 0;
+  for (std::size_t i = 0; i < len; ++i) mask |= u64{p[i] != base[i]} << i;
+  return mask;
+}
+
+std::size_t masked_size(const u8* p, std::size_t n, const Baseline& b) noexcept {
+  std::size_t size = 0;
+  for (std::size_t at = 0; at < n; at += 64) {
+    const std::size_t len = std::min<std::size_t>(64, n - at);
+    size += 8 + static_cast<std::size_t>(std::popcount(nonzero_mask(p + at, b.at(at), len)));
+  }
+  return size;
+}
+
+// Bytes pack_bytes writes for p[0, n).
+std::size_t packed_size(const u8* p, std::size_t n, const Baseline& b) noexcept { return 1 + std::min(n, masked_size(p, n, b)); }
+
+u8* pack_bytes(const u8* p, std::size_t n, const Baseline& b, u8* out) noexcept {
+  if (masked_size(p, n, b) >= n) {
+    *out++ = 0;
+    std::memcpy(out, p, n);
+    return out + n;
+  }
+  *out++ = 1;
+  for (std::size_t at = 0; at < n; at += 64) {
+    const std::size_t len = std::min<std::size_t>(64, n - at);
+    const u8* base = b.at(at);
+    u64 mask = nonzero_mask(p + at, base, len);
+    store64(out, mask);
+    out += 8;
+    for (; mask; mask &= mask - 1) {
+      const auto i = static_cast<std::size_t>(std::countr_zero(mask));
+      *out++ = static_cast<u8>(p[at + i] ^ base[i]);
+    }
+  }
+  return out;
+}
+
+// Inverse of pack_bytes into p[0, n); returns the end of the packed array.
+const u8* unpack_bytes(const u8* in, u8* p, std::size_t n, const Baseline& b) noexcept {
+  if (*in++ == 0) {
+    std::memcpy(p, in, n);
+    return in + n;
+  }
+  for (std::size_t at = 0; at < n; at += 64) {
+    const std::size_t len = std::min<std::size_t>(64, n - at);
+    u64 mask = load64(in);
+    in += 8;
+    u8* chunk = p + at;
+    std::memcpy(chunk, b.at(at), len);
+    for (; mask; mask &= mask - 1) chunk[std::countr_zero(mask)] ^= *in++;
+  }
+  return in;
+}
+
 constexpr u8 kPrimer[] = {
 #include "sws_primer.inc"
 };
@@ -261,7 +363,6 @@ void StateMap::update(u8 state, u32 bit, const Tables& t) noexcept {
 
 void SlotTable::reset(unsigned bits) {
   buckets_.reset(std::size_t{1} << bits);  // zeroed: every slot empty
-  tags_.reset(std::size_t{1} << bits);
   bits_ = bits;
 }
 
@@ -269,7 +370,10 @@ u8* SlotTable::find(u64 hash, const Tables& t) noexcept {
   const auto index = static_cast<std::size_t>(hash >> (64 - bits_));
   auto& bucket = buckets_[index];
   const auto check = static_cast<u8>(static_cast<u8>(hash >> 8) | 1u);  // 0 marks an empty slot
-  const u32 difference = tags_[index] ^ (u32{check} * 0x01010101u);
+  // The four check bytes sit at offsets 0/16/32/48 of the bucket's one cache line.
+  const u32 tags = u32{bucket.slots[0].check} | u32{bucket.slots[1].check} << 8 |
+                   u32{bucket.slots[2].check} << 16 | u32{bucket.slots[3].check} << 24;
+  const u32 difference = tags ^ (u32{check} * 0x01010101u);
   const u32 equal = (difference - 0x01010101u) & ~difference & 0x80808080u;
   if (equal) return bucket.slots[static_cast<std::size_t>(std::countr_zero(equal)) / 8].states.data();
   std::size_t victim = 0;
@@ -289,14 +393,11 @@ u8* SlotTable::find(u64 hash, const Tables& t) noexcept {
   auto& slot = bucket.slots[victim];
   slot = Slot{};
   slot.check = check;
-  const auto shift = static_cast<unsigned>(victim * 8);
-  tags_[index] = (tags_[index] & ~(255u << shift)) | (u32{check} << shift);
   return slot.states.data();
 }
 
 void SlotTable::prefetch(u64 hash) const noexcept {
   const auto index = static_cast<std::size_t>(hash >> (64 - bits_));
-  ULTRA_PREFETCH(&tags_[index]);
   ULTRA_PREFETCH(&buckets_[index]);
 }
 
@@ -379,9 +480,9 @@ void Frontend::contexts(const History& h, std::array<u64, kContexts>& out) const
 
 // ---- Contexts -----------------------------------------------------------------
 
-void Contexts::reset(std::size_t capacity) {
+void Contexts::reset(std::size_t capacity, TableLayout layout) {
   for (std::size_t k = 0; k < kContexts; ++k) {
-    tables_[k].reset(table_bits(capacity, k));
+    tables_[k].reset(table_bits(capacity, k, layout));
     maps_[k] = StateMap(*t_);
   }
   slots_.fill(nullptr);
@@ -422,9 +523,9 @@ void Contexts::update(u32 bit) noexcept {
 
 // ---- Match ----------------------------------------------------------------------
 
-void Match::reset(std::size_t capacity) {
+void Match::reset(unsigned bits) {
   for (auto& map : maps_) map = StateMap(*t_);
-  bits_ = match_bits(capacity);
+  bits_ = bits;
   table_.reset(std::size_t{1} << bits_);
   pointer_ = 0;
   length_ = expected_ = context_ = 0;
@@ -480,7 +581,7 @@ void Match::observe(const History& h) noexcept {
 
 void Mixer::reset() {
   weights_.reset(kMixRows * kLanes);
-  std::fill_n(weights_.data(), weights_.size(), 65536 / 8);
+  std::fill_n(weights_.data(), weights_.size(), kInitialWeight);
   final_weights_.assign(256 * (kSets + 1), 65536 / std::int32_t{kSets});
   rows_.fill(0);
   set_probability_.fill(32768);
@@ -523,10 +624,15 @@ void Mixer::train(const std::int32_t* inputs, u32 bit) noexcept {
 
 // ---- Calibration (APMs) -------------------------------------------------------
 
-void Calibration::Apm::reset(std::size_t rows) {
+std::array<u16, 33> Calibration::Apm::initial() {
   const auto& t = tables();
-  std::array<u16, 33> initial{};
-  for (std::size_t j = 0; j < 33; ++j) initial[j] = static_cast<u16>(squash(t, (static_cast<std::int64_t>(j) - 16) * 192));
+  std::array<u16, 33> row{};
+  for (std::size_t j = 0; j < 33; ++j) row[j] = static_cast<u16>(squash(t, (static_cast<std::int64_t>(j) - 16) * 192));
+  return row;
+}
+
+void Calibration::Apm::reset(std::size_t rows) {
+  const std::array<u16, 33> initial = Apm::initial();
   values.reset(rows * 33);
   for (std::size_t r = 0; r < rows; ++r) std::copy_n(initial.data(), 33, values.data() + r * 33);
   index = 0;
@@ -569,15 +675,16 @@ void Calibration::update(u32 bit) noexcept {
 
 // ---- Model ----------------------------------------------------------------------
 
-Model::Model(std::size_t capacity) : buffer_(capacity) { reset(); }
+Model::Model(std::size_t capacity, TableLayout layout) : buffer_(capacity), layout_(layout) { reset(); }
 
 Model::Model(const Model& o) { *this = o; }
 
 Model& Model::operator=(const Model& o) {
   if (this == &o) return *this;
   // Arrays of equal size copy in place, so a worker's model is refreshed without reallocating.
+  // A packed source has no arrays to copy; they are unpacked below.
   copy_big(buffer_, o.buffer_);
-  history_ = {buffer_.data(), o.history_.position};
+  layout_ = o.layout_;
   bits_ = o.bits_;
   frontend_ = o.frontend_;
   contexts_ = o.contexts_;
@@ -587,9 +694,16 @@ Model& Model::operator=(const Model& o) {
   hashes_ = o.hashes_;
   inputs_ = o.inputs_;
   hits_ = o.hits_;
+  bypass_min_ = o.bypass_min_;
+  pending_ = o.pending_;
+  bypass_p_ = o.bypass_p_;
+  packed_.reset(0);
+  packed_sizes_.clear();
+  if (o.packed()) o.unpack_into(*this);
+  history_ = {buffer_.data(), o.history_.position};
   // The copied slot pointers still point into o's tables: look them up again in ours. Snapshots
   // are taken on byte boundaries, where the lookup uses c0 = 1.
-  contexts_.lookup(hashes_, bits_.c0);
+  if (!pending_) contexts_.lookup(hashes_, bits_.c0);
   return *this;
 }
 
@@ -598,20 +712,77 @@ void Model::reset() {
   bits_ = {};
   inputs_.fill(0);
   hits_ = 0;
+  pending_ = false;
+  bypass_p_.fill(60000);
   frontend_.reset();
-  contexts_.reset(buffer_.size());
-  match_.reset(buffer_.size());
+  contexts_.reset(buffer_.size(), layout_);
+  match_.reset(match_bits(buffer_.size(), layout_));
   mixer_.reset();
   calibration_.reset();
   next_contexts();
 }
 
-std::size_t Model::bytes(std::size_t capacity) noexcept {
-  std::size_t b = capacity + (std::size_t{4} << match_bits(capacity)) + (256 + 65536) * 2;
-  for (std::size_t k = 0; k < kContexts; ++k) b += std::size_t{68} << table_bits(capacity, k);
+std::size_t Model::bytes(std::size_t capacity, TableLayout layout) noexcept {
+  std::size_t b = capacity + (std::size_t{4} << match_bits(capacity, layout)) + (256 + 65536) * 2;
+  for (std::size_t k = 0; k < kContexts; ++k) b += std::size_t{64} << table_bits(capacity, k, layout);
   b += kMixRows * kLanes * 4 + 256 * (kSets + 1) * 4;
   b += (kApmRows0 + kApmRows1 + kApmRows2 + kApmRows3) * 33 * 2;
   return b + sizeof(Model);
+}
+
+// Every large array of the model with its packing baseline, in a fixed order (pack and unpack
+// walk the same list).
+template <class F>
+void Model::for_each_array(F&& f) {
+  static const Baseline zero, apm(Calibration::Apm::initial().data(), 33 * sizeof(u16)),
+      weight(&Mixer::kInitialWeight, sizeof(Mixer::kInitialWeight));
+  f(buffer_, zero);
+  for (auto& table : contexts_.tables_) f(table.buckets_, zero);
+  f(match_.table_, zero);
+  f(mixer_.weights_, weight);
+  f(calibration_.apm0_.values, apm);
+  f(calibration_.apm1_.values, apm);
+  f(calibration_.apm2_.values, apm);
+  f(calibration_.apm3_.values, apm);
+}
+
+void Model::pack() {
+  if (packed()) return;
+  // Sized exactly first, so the pack is one mapping and no reallocation leaves heap behind.
+  std::size_t total = 0;
+  packed_sizes_.clear();
+  for_each_array([&]<class T>(BigArray<T>& a, const Baseline& b) {
+    packed_sizes_.push_back(a.size());
+    total += packed_size(reinterpret_cast<const u8*>(a.data()), a.size() * sizeof(T), b);
+  });
+  packed_.reset(total);
+  u8* out = packed_.data();
+  for_each_array([&]<class T>(BigArray<T>& a, const Baseline& b) {
+    out = pack_bytes(reinterpret_cast<const u8*>(a.data()), a.size() * sizeof(T), b, out);
+    a.reset(0);  // release
+  });
+  history_.data = nullptr;
+}
+
+void Model::unpack_into(Model& dst) const {
+  const u8* in = packed_.data();
+  std::size_t i = 0;
+  dst.for_each_array([&]<class T>(BigArray<T>& a, const Baseline& b) {
+    const std::size_t n = packed_sizes_[i++];
+    if (a.size() != n) a.reset(n);
+    in = unpack_bytes(in, reinterpret_cast<u8*>(a.data()), n * sizeof(T), b);
+  });
+}
+
+std::size_t Model::resident_bytes() const noexcept {
+  std::size_t b = sizeof(Model) + packed_.size() + buffer_.size() + match_.table_.size() * 4 + mixer_.weights_.size() * 4;
+  for (const auto& table : contexts_.tables_) b += table.buckets_.size() * sizeof(SlotTable::Bucket);
+  for (const auto* apm : {&calibration_.apm0_, &calibration_.apm1_, &calibration_.apm2_, &calibration_.apm3_}) b += apm->values.size() * 2;
+  return b;
+}
+
+void Model::check_unpacked() const {
+  if (packed()) throw Error("ultracodec: a packed Tier 4 model cannot code; copy it first");
 }
 
 void Model::next_contexts() noexcept {
@@ -646,26 +817,65 @@ void Model::append(u8 byte) noexcept {
   next_contexts();
 }
 
+u32 Model::bypass_bucket() const noexcept {
+  return std::min(static_cast<u32>(std::bit_width(match_.length())), 15u) * 256 + match_.next_byte(history_);
+}
+
+void Model::bypass_update(u32 bucket, u32 hit) noexcept {
+  const std::int32_t p = bypass_p_[bucket];
+  bypass_p_[bucket] = static_cast<u16>(p + (((hit ? 65535 : 0) - p) >> 5));
+}
+
+// A byte the bypass flag confirmed: history, byte state, frontend and match model advance; the
+// context tables, mixers and APMs do not see it, and the context lookup waits for the next coded byte.
+void Model::skip_byte(u8 byte) noexcept {
+  buffer_[history_.position++] = byte;
+  bits_.c2 = bits_.c1;
+  bits_.c1 = byte;
+  frontend_.observe(history_, byte);
+  match_.observe(history_);
+  pending_ = true;
+}
+
 void Model::train(std::span<const u8> bytes) {
+  check_unpacked();
   if (bytes.size() > buffer_.size() - history_.position) throw Error("ultracodec: Tier 4 history overflow");
-  for (const u8 c : bytes)
+  for (const u8 c : bytes) {
+    if (bypass_ready()) {
+      const u32 hit = c == match_.next_byte(history_);
+      bypass_update(bypass_bucket(), hit);
+      if (hit) { skip_byte(c); continue; }
+    }
+    ensure_contexts();
     for (unsigned b = 0; b < 8; ++b) {
       (void)predict();
       update((u32{c} >> (7 - b)) & 1u);
     }
+  }
+  ensure_contexts();
 }
 
 bool Model::encode(std::span<const u8> raw, std::vector<u8>& out) {
+  check_unpacked();
   if (raw.size() > buffer_.size() - history_.position) throw Error("ultracodec: Tier 4 history overflow");
   const std::size_t start = out.size();
   out.resize(start + raw.size());  // a coded form this long or longer is stored instead
   RangeEncoder coder(std::span<u8>(out.data() + start, raw.size()));
-  for (const u8 c : raw)
+  for (const u8 c : raw) {
+    if (bypass_ready()) {
+      const u32 bucket = bypass_bucket(), hit = c == match_.next_byte(history_);
+      coder.encode(hit, bypass_p_[bucket]);
+      bypass_update(bucket, hit);
+      if (hit) { skip_byte(c); continue; }
+    }
+    ensure_contexts();
     for (unsigned b = 0; b < 8; ++b) {
       const u32 bit = (u32{c} >> (7 - b)) & 1u;
       coder.encode(bit, predict());
       update(bit);
     }
+  }
+  ensure_contexts();
   const std::size_t n = coder.finish();
   if (coder.overflowed() || n >= raw.size()) return false;
   out.resize(start + n);
@@ -673,9 +883,20 @@ bool Model::encode(std::span<const u8> raw, std::vector<u8>& out) {
 }
 
 void Model::decode(std::span<const u8> payload, std::span<u8> out) {
+  check_unpacked();
   if (out.size() > buffer_.size() - history_.position) throw Error("ultracodec: Tier 4 history overflow");
   RangeDecoder coder(payload);
   for (u8& c : out) {
+    if (bypass_ready()) {
+      const u32 bucket = bypass_bucket(), hit = coder.decode(bypass_p_[bucket]);
+      bypass_update(bucket, hit);
+      if (hit) {
+        c = match_.next_byte(history_);
+        skip_byte(c);
+        continue;
+      }
+    }
+    ensure_contexts();
     u32 x = 0;
     for (unsigned b = 0; b < 8; ++b) {
       const u32 bit = coder.decode(predict());
@@ -684,6 +905,7 @@ void Model::decode(std::span<const u8> payload, std::span<u8> out) {
     }
     c = static_cast<u8>(x);
   }
+  ensure_contexts();
   if (!coder.consumed_exactly()) throw Error("ultracodec: Tier 4 stream did not end cleanly (corrupt block)");
 }
 

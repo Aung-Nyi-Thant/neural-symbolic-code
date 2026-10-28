@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <atomic>
 
 #if defined(__x86_64__)
@@ -188,7 +189,19 @@ void rans_encode(std::span<const u8> sym, std::vector<u8>& out) {
   if (n > UINT32_MAX) throw Error("ultracodec: rANS stream too long");
   put_varint(out, static_cast<u32>(n));
   std::array<u64, 256> count{};
-  for (u8 s : sym) ++count[s];
+  {
+    // Four sub-histograms break the store-to-load chain on runs of one symbol.
+    std::array<std::array<u32, 256>, 4> part{};
+    std::size_t i = 0;
+    for (; i + 4 <= n && i < (std::size_t{1} << 31); i += 4) {
+      ++part[0][sym[i]];
+      ++part[1][sym[i + 1]];
+      ++part[2][sym[i + 2]];
+      ++part[3][sym[i + 3]];
+    }
+    for (unsigned s = 0; s < 256; ++s) count[s] = u64{part[0][s]} + part[1][s] + part[2][s] + part[3][s];
+    for (; i < n; ++i) ++count[sym[i]];
+  }
   unsigned distinct = 0, max_sym = 0;
   for (unsigned s = 0; s < 256; ++s)
     if (count[s]) { ++distinct; max_sym = s; }
@@ -207,24 +220,27 @@ void rans_encode(std::span<const u8> sym, std::vector<u8>& out) {
   for (unsigned s = 1; s < 256; ++s) start[s] = start[s - 1] + f[s - 1];
 
   // Words are produced back to front.
-  std::vector<u16> buf(n + 2 * kLanes + 1);
-  std::size_t pos = buf.size();
+  const std::size_t buf_size = n + 2 * kLanes + 1;
+  const std::unique_ptr<u16[]> buf(new u16[buf_size]);  // written back to front, read only from pos
+  std::size_t pos = buf_size;
   u32 x[kLanes];
   std::fill(x, x + kLanes, kL);
   for (std::size_t i = n; i-- > 0;) {
     u32& xs = x[i & (kLanes - 1)];
-    const u32 fr = f[sym[i]];
-    if (xs >= (fr << 20)) {
-      buf[--pos] = static_cast<u16>(xs);
-      xs >>= 16;
-    }
-    xs = ((xs / fr) << kScaleBits) + (xs % fr) + start[sym[i]];
+    const u8 c = sym[i];
+    const u32 fr = f[c];
+    // Branch-free renormalization: the word is always stored, pos moves only when it counts.
+    const u32 out16 = xs >= (fr << 20) ? 1u : 0u;
+    buf[pos - 1] = static_cast<u16>(xs);
+    pos -= out16;
+    xs >>= out16 * 16;
+    xs = ((xs / fr) << kScaleBits) + (xs % fr) + start[c];
   }
   for (unsigned l = kLanes; l-- > 0;) {
     buf[--pos] = static_cast<u16>(x[l] >> 16);
     buf[--pos] = static_cast<u16>(x[l]);
   }
-  const std::size_t words = buf.size() - pos;
+  const std::size_t words = buf_size - pos;
   std::vector<u8> table;
   table.push_back(static_cast<u8>(max_sym));
   for (unsigned s = 0; s <= max_sym; ++s) put_varint(table, f[s]);
@@ -238,7 +254,7 @@ void rans_encode(std::span<const u8> sym, std::vector<u8>& out) {
   put_varint(out, static_cast<u32>(words));
   const std::size_t at = out.size();
   out.resize(at + 2 * words);
-  std::memcpy(out.data() + at, buf.data() + pos, 2 * words);
+  std::memcpy(out.data() + at, buf.get() + pos, 2 * words);
 }
 
 void rans_decode(Reader& in, std::vector<u8>& out, std::size_t max_symbols) {

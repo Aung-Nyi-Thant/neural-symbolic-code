@@ -1,15 +1,21 @@
-// Tier 2: Consumer. Lazy hash-chain LZ77 with repeat offsets, entropy coded
-// with the 8-way interleaved static rANS (rans_static.hpp).
+// Tier 2: Consumer. Optional word-dictionary pre-filter, then lazy
+// hash-chain LZ77 with repeat offsets, entropy coded with the 8-way
+// interleaved static rANS (rans_static.hpp).
 //
-// A block (default 2 MiB, the LZ window; 4 MiB is 0.9% smaller and 2x slower) becomes four rANS streams and one
-// raw bit stream:
-//   literals                    bytes
-//   literal-length codes        litlen       -> code + extra bits
-//   match-length codes          matchlen - 4 -> code + extra bits
-//   offset codes                1..3 = repeat offset 0..2, else distance + 3,
-//                               code = floor(log2(v)), extra = low bits of v
-//   extra bits                  LSB-first, per sequence: LL, ML, OF
-// Length codes: v < 16 is its own code; above, two codes per octave.
+// Block payload (default block 2 MiB, the LZ window; 4 MiB is 0.9% smaller
+// and 2x slower):
+//   u8 dict                     0 none | 1 prose | 2 code (word_filter.hpp)
+//   [varint filtered size]      when dict != 0; LZ77 runs on the filtered bytes
+//   sequences                   seq_codec.hpp, 16 literal streams split by the
+//                               high nibble of the byte before them
+//
+// The filter is used when four 16 KiB samples of the block shrink below 85%
+// with one of the two built-in dictionaries (English prose, code
+// identifiers): on the benchmark corpus it takes 14% off the novel and 6-7%
+// off Python and Perl, and is skipped for XML and binaries. Splitting the
+// literals by context takes another 1%; the decoder entropy-decodes all 16
+// streams up front with the vector kernels and only picks the stream per
+// literal while replaying sequences.
 //
 // Parser: zstd-"lazy2"-style. At each position it checks the three repeat
 // offsets and walks a hash chain (depth 16, 4-byte hash), then tries the next
@@ -18,93 +24,27 @@
 // (a hit on rep k moves it to the front).
 //
 // Decoding entropy-decodes the streams (vector rANS kernels), then replays
-// the sequences with the same bounded copies as Tier 1.
+// the sequences with the same bounded copies as Tier 1, then undoes the
+// filter.
 #include <algorithm>
 
 #include "block_engine.hpp"
 #include "lz_util.hpp"
-#include "rans_static.hpp"
+#include "seq_codec.hpp"
 #include "tiers.hpp"
+#include "word_filter.hpp"
 
 namespace ultracodec::detail {
 namespace {
 
-constexpr std::size_t kMinMatch = 4;
+using seq::kMinMatch;
+using seq::offset_cost;
 constexpr unsigned kHashLog = 18;
 constexpr unsigned kChainDepth = 16;  // 48 gains ~1.6% for 2.5x less speed
 constexpr std::size_t kNiceLength = 128;
+constexpr unsigned kLitContexts = 16;  // literal stream = previous byte >> 4
 
 ULTRA_INLINE u32 hash4(u32 v) noexcept { return (v * 2654435761u) >> (32 - kHashLog); }
-
-ULTRA_INLINE void length_code(u32 v, u8& code, unsigned& nbits, u32& extra) noexcept {
-  if (v < 16) {
-    code = static_cast<u8>(v);
-    nbits = 0;
-    extra = 0;
-    return;
-  }
-  unsigned hb = highbit32(v);
-  code = static_cast<u8>(16 + (hb - 4) * 2 + ((v >> (hb - 1)) & 1));
-  nbits = hb - 1;
-  extra = v & ((1u << nbits) - 1);
-}
-// Inverse of length_code; returns false for a code that cannot occur.
-ULTRA_INLINE bool length_base(u8 code, u32& base, unsigned& nbits) noexcept {
-  if (code < 16) { base = code; nbits = 0; return true; }
-  unsigned k = code - 16u;
-  unsigned hb = 4 + k / 2;
-  if (hb > 26) return false;
-  nbits = hb - 1;
-  base = (1u << hb) | ((k & 1u) << (hb - 1));
-  return true;
-}
-
-ULTRA_INLINE unsigned offset_cost(u32 offcode) noexcept { return highbit32(offcode); }
-
-class BitWriter {
- public:
-  void put(u32 v, unsigned n) {
-    if (!n) return;
-    acc_ |= static_cast<u64>(v) << fill_;
-    fill_ += n;
-    while (fill_ >= 8) { out_.push_back(static_cast<u8>(acc_)); acc_ >>= 8; fill_ -= 8; }
-  }
-  std::vector<u8>& finish() {
-    if (fill_) out_.push_back(static_cast<u8>(acc_));
-    acc_ = 0;
-    fill_ = 0;
-    return out_;
-  }
-  void clear() { out_.clear(); acc_ = 0; fill_ = 0; }
-
- private:
-  std::vector<u8> out_;
-  u64 acc_ = 0;
-  unsigned fill_ = 0;
-};
-
-class BitReader {
- public:
-  explicit BitReader(std::span<const u8> s) : p_(s.data()), end_(s.data() + s.size()) {}
-  u32 get(unsigned n) {
-    if (!n) return 0;
-    while (fill_ < n) {
-      if (p_ == end_) throw Error("ultracodec: truncated tier-2 extra bits");
-      acc_ |= static_cast<u64>(*p_++) << fill_;
-      fill_ += 8;
-    }
-    u32 v = static_cast<u32>(acc_ & ((u64{1} << n) - 1));
-    acc_ >>= n;
-    fill_ -= n;
-    return v;
-  }
-
- private:
-  const u8* p_;
-  const u8* end_;
-  u64 acc_ = 0;
-  unsigned fill_ = 0;
-};
 
 struct Match {
   std::size_t len = 0;
@@ -114,17 +54,21 @@ struct Match {
 class ConsumerCodec final : public BlockCodec {
  public:
   void encode(std::span<const u8>, std::span<const u8> raw, std::vector<u8>& out) override {
-    const std::size_t n = raw.size();
-    src_ = raw.data();
+    const WordDict dict = word_filter_choose(raw);
+    std::span<const u8> lz = raw;
+    if (dict != WordDict::None) {
+      word_filter_encode(dict, raw, filtered_);
+      if (filtered_.size() < raw.size()) lz = filtered_;
+    }
+    out.push_back(static_cast<u8>(lz.data() == raw.data() ? WordDict::None : dict));
+    if (lz.data() != raw.data()) put_varint(out, static_cast<u32>(lz.size()));
+    const std::size_t n = lz.size();
+    src_ = lz.data();
     n_ = n;
     head_.assign(std::size_t{1} << kHashLog, UINT32_MAX);
     chain_.resize(n);
     next_insert_ = 0;
-    lits_.clear();
-    ll_.clear();
-    ml_.clear();
-    of_.clear();
-    bits_.clear();
+    writer_.reset(src_);
     u32 rep[3] = {1, 4, 8};
     std::size_t anchor = 0, ip = 0;
     const std::size_t ilimit = n > 16 ? n - 16 : 0;  // matches start before this; keeps 8-byte loads in bounds
@@ -153,82 +97,29 @@ class ConsumerCodec final : public BlockCodec {
         std::size_t dist = m.offcode - 3;
         while (ip > anchor && ip > dist && src_[ip - 1] == src_[ip - 1 - dist]) { --ip; ++m.len; }
       }
-      emit(anchor, ip, m, rep);
+      writer_.sequence(anchor, ip, m.len, m.offcode, rep);
       ip += m.len;
       anchor = ip;
     }
     // Trailing literals (no sequence): the decoder copies what is left.
-    lits_.insert(lits_.end(), src_ + anchor, src_ + n);
-
-    put_varint(out, static_cast<u32>(ll_.size()));
-    rans_encode(lits_, out);
-    rans_encode(ll_, out);
-    rans_encode(ml_, out);
-    rans_encode(of_, out);
-    auto& eb = bits_.finish();
-    put_varint(out, static_cast<u32>(eb.size()));
-    out.insert(out.end(), eb.begin(), eb.end());
+    writer_.literals(anchor, n);
+    writer_.finish(out);
   }
 
-  void decode(std::span<const u8>, std::span<const u8> payload, std::span<u8> dst, Progress*,
+  void decode(std::span<const u8>, std::span<const u8> payload, std::span<u8> out, Progress*,
               std::size_t) override {
     Reader r(payload);
-    const std::size_t nseq = r.varint();
-    if (nseq > dst.size() / kMinMatch + 1) throw Error("ultracodec: corrupt tier-2 sequence count");
-    rans_decode(r, lits_, dst.size());
-    rans_decode(r, ll_, nseq);
-    rans_decode(r, ml_, nseq);
-    rans_decode(r, of_, nseq);
-    if (ll_.size() != nseq || ml_.size() != nseq || of_.size() != nseq)
-      throw Error("ultracodec: corrupt tier-2 streams");
-    const std::size_t eb = r.varint();
-    BitReader br(r.take(eb));
-    if (r.remaining()) throw Error("ultracodec: trailing tier-2 data");
-
-    u8* op = dst.data();
-    u8* const ostart = op;
-    u8* const oend = op + dst.size();
-    const u8* lp = lits_.data();
-    const u8* const lend = lp + lits_.size();
-    u32 rep[3] = {1, 4, 8};
-    auto fail = [] { throw Error("ultracodec: corrupt tier-2 block"); };
-    for (std::size_t s = 0; s < nseq; ++s) {
-      u32 base;
-      unsigned nb;
-      if (!length_base(ll_[s], base, nb)) fail();
-      const std::size_t litlen = base + br.get(nb);
-      if (!length_base(ml_[s], base, nb)) fail();
-      const std::size_t mlen = base + br.get(nb) + kMinMatch;
-      const unsigned oc = of_[s];
-      if (oc > 30) fail();
-      const u32 offcode = (1u << oc) | br.get(oc);
-      if (litlen > static_cast<std::size_t>(lend - lp) || litlen > static_cast<std::size_t>(oend - op)) fail();
-      if (op + litlen + 16 <= oend && lp + litlen + 16 <= lend) {
-        wild_copy(op, lp, litlen);
-      } else {
-        std::memcpy(op, lp, litlen);
-      }
-      op += litlen;
-      lp += litlen;
-      u32 dist;
-      if (offcode <= 3) {
-        unsigned k = offcode - 1;
-        dist = rep[k];
-        if (k == 1) std::swap(rep[0], rep[1]);
-        else if (k == 2) { rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = dist; }
-      } else {
-        dist = offcode - 3;
-        rep[2] = rep[1];
-        rep[1] = rep[0];
-        rep[0] = dist;
-      }
-      if (dist == 0 || dist > static_cast<std::size_t>(op - ostart) || mlen > static_cast<std::size_t>(oend - op)) fail();
-      copy_match(op, dist, mlen, oend);
-      op += mlen;
+    const u8 dict = r.u8v();
+    if (dict > static_cast<u8>(WordDict::Code)) throw Error("ultracodec: bad tier-2 dictionary");
+    std::span<u8> dst = out;
+    if (dict) {
+      const std::size_t fsize = r.varint();
+      if (fsize > 2 * out.size()) throw Error("ultracodec: corrupt tier-2 filtered size");
+      filtered_.resize(fsize);
+      dst = filtered_;
     }
-    const std::size_t tail = static_cast<std::size_t>(lend - lp);
-    if (tail != static_cast<std::size_t>(oend - op)) fail();
-    std::memcpy(op, lp, tail);
+    reader_.decode(r, dst);
+    if (dict) word_filter_decode(static_cast<WordDict>(dict), dst, out);
   }
 
  private:
@@ -273,39 +164,13 @@ class ConsumerCodec final : public BlockCodec {
     return best;
   }
 
-  void emit(std::size_t anchor, std::size_t ip, const Match& m, u32 rep[3]) {
-    u8 code;
-    unsigned nb;
-    u32 extra;
-    const std::size_t litlen = ip - anchor;
-    lits_.insert(lits_.end(), src_ + anchor, src_ + ip);
-    length_code(static_cast<u32>(litlen), code, nb, extra);
-    ll_.push_back(code);
-    bits_.put(extra, nb);
-    length_code(static_cast<u32>(m.len - kMinMatch), code, nb, extra);
-    ml_.push_back(code);
-    bits_.put(extra, nb);
-    unsigned oc = highbit32(m.offcode);
-    of_.push_back(static_cast<u8>(oc));
-    bits_.put(m.offcode & ((1u << oc) - 1), oc);
-    if (m.offcode <= 3) {
-      unsigned k = m.offcode - 1;
-      u32 d = rep[k];
-      if (k == 1) std::swap(rep[0], rep[1]);
-      else if (k == 2) { rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = d; }
-    } else {
-      rep[2] = rep[1];
-      rep[1] = rep[0];
-      rep[0] = m.offcode - 3;
-    }
-  }
-
   const u8* src_ = nullptr;
   std::size_t n_ = 0;
   std::size_t next_insert_ = 0;
   std::vector<u32> head_, chain_;
-  std::vector<u8> lits_, ll_, ml_, of_;
-  BitWriter bits_;
+  std::vector<u8> filtered_;
+  seq::Writer<kLitContexts> writer_;
+  seq::Reader<kLitContexts> reader_;
 };
 
 class ConsumerEngine final : public BlockEngine {
