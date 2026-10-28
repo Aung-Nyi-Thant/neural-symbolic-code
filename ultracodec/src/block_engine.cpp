@@ -46,7 +46,11 @@ ArchiveHeader ArchiveHeader::parse(std::span<const std::uint8_t> bytes) {
   if (p[5] < 1 || p[5] > 4) throw Error("ultracodec: unknown tier");
   h.tier = static_cast<TierLevel>(p[5]);
   h.flags = p[6];
-  if (h.flags & ~(kFlagWavefront | kFlagDedup)) throw Error("ultracodec: unknown header flags");
+  if (h.flags & ~(kFlagWavefront | kFlagDedup | kFlagSnapshot)) throw Error("ultracodec: unknown header flags");
+  // Tier 4 always uses (and alone uses) snapshot warm-start, without prefix or dedup.
+  if (((h.flags & kFlagSnapshot) != 0) != (h.tier == TierLevel::Tier4_Enterprise) ||
+      ((h.flags & kFlagSnapshot) && (h.flags & (kFlagWavefront | kFlagDedup))))
+    throw Error("ultracodec: header flags do not match the tier");
   h.block_log2 = p[7];
   if (h.block_log2 < 16 || h.block_log2 > 26) throw Error("ultracodec: block size out of range");
   h.uncompressed_size = load64(p + 8);

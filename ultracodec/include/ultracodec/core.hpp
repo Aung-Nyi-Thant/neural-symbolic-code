@@ -12,10 +12,12 @@
 //
 // Each payload starts with a one-byte method (0 = stored, 1 = coded by the
 // tier). Blocks are independent apart from the optional wavefront prefix
-// (Tiers 3 and 4): block k may be primed with the first prime_bytes of block
-// k-1, which the decoder has as soon as it has decoded that much of block k-1.
-// With kFlagDedup (Tiers 3 and 4) the blocks hold the residual of a
-// long-range deduplication pass and the section lists the removed repeats.
+// (Tier 3): block k may be primed with the first prime_bytes of block k-1,
+// which the decoder has as soon as it has decoded that much of block k-1.
+// With kFlagDedup (Tier 3) the blocks hold the residual of a long-range
+// deduplication pass and the section lists the removed repeats. With
+// kFlagSnapshot (Tier 4) every block after block 0 is coded by a model that
+// has already read block 0 (snapshot warm-start, tier4_enterprise.cpp).
 #pragma once
 
 #include <cstddef>
@@ -32,7 +34,7 @@ enum class TierLevel : std::uint8_t {
   Tier1_HyperSpeed = 1,  // byte-level LZ77, LZ4-class speed
   Tier2_Consumer = 2,    // lazy hash-chain LZ77 + 8-way interleaved static rANS
   Tier3_Balanced = 3,    // 1 MiB primed blocks, lean 6-context CM + binary rANS
-  Tier4_Enterprise = 4,  // large blocks, 12-context CM with two mixer layers
+  Tier4_Enterprise = 4,  // 2 MiB blocks warm-started from block 0, 22-context CM
 };
 
 // Every failure the library reports: malformed or truncated archives, CRC
@@ -51,6 +53,7 @@ struct ArchiveHeader {
   static constexpr std::size_t kSize = 32;
   static constexpr std::uint8_t kFlagWavefront = 1;  // blocks primed by their predecessor's head
   static constexpr std::uint8_t kFlagDedup = 2;      // blocks hold a long-range dedup residual
+  static constexpr std::uint8_t kFlagSnapshot = 4;   // Tier 4: blocks 1.. start from block 0's model
 
   std::uint8_t version = kFormatVersion;
   TierLevel tier = TierLevel::Tier1_HyperSpeed;
@@ -76,6 +79,7 @@ struct EngineOptions {
   std::size_t memory_budget = 0;        // bytes for all model tables (Tiers 3/4)
   std::size_t prime_bytes = SIZE_MAX;   // wavefront prefix; SIZE_MAX = tier default, 0 = off
   std::uint64_t max_output_bytes = std::uint64_t{1} << 36;  // decompress refuses larger archives
+  bool tier4_primer = true;             // Tier 4: model the built-in primer first (archive records it)
 };
 
 // What one compress/decompress call measured (filled when requested).

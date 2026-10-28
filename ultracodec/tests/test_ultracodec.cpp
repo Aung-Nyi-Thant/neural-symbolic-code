@@ -99,10 +99,13 @@ EngineOptions small_options(TierLevel tier, unsigned threads) {
   EngineOptions o;
   o.threads = threads;
   o.block_size = 64 * 1024;
-  if (tier == TierLevel::Tier3_Balanced || tier == TierLevel::Tier4_Enterprise) {
+  if (tier == TierLevel::Tier3_Balanced) {
     o.memory_budget = std::size_t{96} << 20;
     o.prime_bytes = 8 * 1024;
   }
+  // Modelling Tier 4's 256 KiB primer takes about a second per call (much
+  // longer under sanitizers); test_tier4_primer covers the primed path.
+  if (tier == TierLevel::Tier4_Enterprise) o.tier4_primer = false;
   return o;
 }
 
@@ -144,6 +147,14 @@ void test_header() {
   }));
   CHECK(rejects([](std::uint8_t* b) {
     detail::store32(b + 16, 5);  // block count inconsistent with size
+    detail::store32(b + 28, detail::crc32c(b, 28));
+  }));
+  CHECK(rejects([](std::uint8_t* b) {
+    b[6] |= ArchiveHeader::kFlagSnapshot;  // snapshot warm-start belongs to Tier 4 only
+    detail::store32(b + 28, detail::crc32c(b, 28));
+  }));
+  CHECK(rejects([](std::uint8_t* b) {
+    b[5] = 4;  // Tier 4 without kFlagSnapshot
     detail::store32(b + 28, detail::crc32c(b, 28));
   }));
   CHECK(rejects([](std::uint8_t*) {}) == false);
@@ -249,6 +260,41 @@ void test_engine_rules() {
   CHECK(!create_engine(TierLevel::Tier3_Balanced)->get_name().empty());
 }
 
+// Tier 4 with its built-in primer: round trips over several blocks and
+// thread counts, archives that do not depend on the thread count, and a
+// primer ID the decoder does not know.
+void test_tier4_primer() {
+  Bytes data = text_bytes(slow_env() ? 100000 : 300000, 31);
+  Bytes rnd = random_bytes(70000, 32);  // a stored block between coded ones
+  data.insert(data.begin() + 65536, rnd.begin(), rnd.end());
+  EngineOptions o;
+  o.block_size = 64 * 1024;
+  o.threads = 1;
+  auto one = create_engine(TierLevel::Tier4_Enterprise, o);
+  EngineStats st;
+  Bytes ref = one->compress(data, &st);
+  CHECK(st.stored_blocks >= 1 && st.stored_blocks < st.blocks);
+  CHECK(peek_header(ref).model_param != 0);
+  CHECK(one->decompress(ref) == data);
+  o.threads = 3;
+  auto three = create_engine(TierLevel::Tier4_Enterprise, o);
+  CHECK(three->compress(data) == ref);
+  CHECK(three->decompress(ref) == data);
+  // Unprimed archives record model_param 0.
+  o.tier4_primer = false;
+  Bytes plain = create_engine(TierLevel::Tier4_Enterprise, o)->compress(data);
+  CHECK(peek_header(plain).model_param == 0 && plain != ref);
+  CHECK(decompress(plain) == data);
+  Bytes bad = ref;
+  detail::store32(bad.data() + 24, 12345);  // another primer
+  detail::store32(bad.data() + 28, detail::crc32c(bad.data(), 28));
+  try {
+    decompress(bad);
+    CHECK(false);
+  } catch (const Error&) {
+  }
+}
+
 void test_corruption() {
   const int iters = fuzz_iters(150);
   std::mt19937 rng(1234);
@@ -319,12 +365,13 @@ void test_rss_limits() {
     std::size_t input;
     double mib;
   };
-  // Targets: Tier 2 <= 256 MiB, Tier 3 ~500 MiB, Tier 4 3-4 GiB (all with
-  // the default 4 threads or fewer; inputs are counted in the RSS too).
+  // Targets: Tier 2 <= 256 MiB, Tier 3 ~500 MiB, Tier 4 ~200 MiB per model
+  // (here the snapshot and one worker, as 4 MiB is two blocks); inputs are
+  // counted in the RSS too.
   const Limit limits[] = {{TierLevel::Tier1_HyperSpeed, 32u << 20, 160},
                           {TierLevel::Tier2_Consumer, 32u << 20, 256},
                           {TierLevel::Tier3_Balanced, 4u << 20, 600},
-                          {TierLevel::Tier4_Enterprise, 4u << 20, 4096}};
+                          {TierLevel::Tier4_Enterprise, 4u << 20, 640}};
   for (const auto& l : limits) {
     double rss = child_peak_rss_mib(l.tier, l.input);
     std::printf("  peak RSS %-40s %.0f MiB (limit %.0f)\n", std::string(tier_name(l.tier)).c_str(), rss, l.mib);
@@ -346,6 +393,8 @@ int main() {
   test_thread_independence();
   std::printf("engine rules\n");
   test_engine_rules();
+  std::printf("tier 4 primer\n");
+  test_tier4_primer();
   std::printf("corruption\n");
   test_corruption();
 #if defined(ULTRA_TEST_RSS) && !defined(ULTRA_SANITIZED)
