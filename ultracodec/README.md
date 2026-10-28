@@ -43,6 +43,11 @@ counters and a rANS stream per 64 KiB. A worker needs 46 MiB less
 (398 -> 213 MiB peak at 4 threads), at the same size (-0.003%).
 `tier3_compact = false` writes the older format, which still decodes.
 
+October 28 (see "Tier 4 memory"): Tier 4 workers share the snapshot's
+history (primer + block 0) copy-on-write instead of each holding a copy:
+2.4 MiB less physical memory per worker (PSS 749 -> 739 MiB at 4
+threads). Archives are byte-identical.
+
 ## API
 
 ```cpp
@@ -222,6 +227,26 @@ instead of a memcpy (60-75 ms per 2 MiB block, under 1% of the block's
 time). The coded bits do not change, and the worker count is planned
 against the packed snapshot.
 
+The history is not packed. `Model::pack` turns the bytes seen so far
+(primer + block 0, 2.25 MiB with 2 MiB blocks) into a `SharedImage`: on
+POSIX an unnamed shared-memory file (`memfd_create`, or `shm_open` on
+macOS) that each worker maps copy-on-write over the start of its history
+buffer. Workers only append after it, so its pages stay shared, apart
+from the partial last page, which is copied. A worker that already maps
+the image does not touch it again at the next block. On Windows, for
+images under 1 MiB, or if the file cannot be made, the image is copied as
+before. Peak at 4 threads on the concatenation, compress / decompress:
+
+| Build | PSS | RSS |
+|---|---|---|
+| Private history per worker | 748.7 / 762.6 MiB | 750.3 / 764.2 MiB |
+| Shared history (default) | 739.1 / 753.1 MiB | 747.4 / 761.5 MiB |
+
+PSS (physical memory, shared pages split between their mappings) drops
+9.5 MiB, 2.4 MiB per worker. RSS drops only 2.8 MiB, because Linux counts
+a shared page once for every mapping of it, and the workers are threads of
+one process. Speed and archives are unchanged.
+
 Speed does not change with the layout: the model is bound by instructions,
 not cache misses. By default (`tier4_tables = -1`) the encoder picks
 Rebalanced, else Lean, else Small: the first whose snapshot plus four
@@ -316,7 +341,8 @@ skips the model. Measured on the same corpus: 0.97 -> 1.08 MB/s (1.11x),
 16 or 24 byte threshold (+1.3-3.9% size), and still training the context
 tables on skipped bytes (slower and larger).
 
-Sharing the snapshot copy-on-write does not help: after one 256 KiB block a
+Sharing the snapshot's tables copy-on-write does not help (only the
+history is shared): after one 256 KiB block a
 worker has written 99-100% of its 4 KiB table pages (100% at 16 KiB), because
 hashed contexts scatter their writes. Small inputs get smaller tables,
 because tables are sized from the bytes a model will see.
@@ -464,7 +490,7 @@ include/ultracodec/core.hpp     TierLevel, ArchiveHeader, EngineOptions, ICompre
 include/ultracodec/engine.hpp   create_engine factory, compress/decompress/peek_header helpers
 src/engine.cpp                  Factory
 src/block_engine.{hpp,cpp}      Block container: framing, validation, worker pool, wavefront waits
-src/common.{hpp,cpp}            LE access, CRC-32C (SSE4.2 or slice-by-8), vector copy, huge-page arrays
+src/common.{hpp,cpp}            LE access, CRC-32C (SSE4.2 or slice-by-8), vector copy, huge-page arrays, copy-on-write shared images
 src/lz_util.hpp                 Match length, wild and overlapping copies
 src/tier1_hyperspeed.cpp        Tier 1 LZ77: raw LZ4-layout mode and entropy mode
 src/seq_codec.hpp               Entropy-coded LZ77 sequences (Tiers 1 and 2)

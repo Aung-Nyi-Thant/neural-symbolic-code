@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -307,8 +308,10 @@ class Model {
 
   // Stores the large arrays packed (per 64-byte chunk: a mask of the non-zero bytes, then those
   // bytes) and releases them. Used for the Tier 4 snapshot, which is only ever copied: its tables
-  // are 60-66% zero bytes after block 0, so it shrinks to ~40%. A copy of a packed model is a
-  // full, bit-exact model; the packed model itself can no longer code.
+  // are 60-66% zero bytes after block 0, so it shrinks to ~40%. The history seen so far becomes a
+  // SharedImage instead, which every copy maps copy-on-write: copies only append to it, so its
+  // pages stay shared, and a copy that already maps it does not copy it again. A copy of a packed
+  // model is a full, bit-exact model; the packed model itself can no longer code.
   void pack();
   bool packed() const noexcept { return packed_.size() != 0; }
   // Bytes of heap memory this model holds now (less than bytes() once packed).
@@ -349,6 +352,9 @@ class Model {
   std::array<u16, 16 * 256> bypass_p_{};  // P(predicted byte is right), 16-bit, by log2 match length and that byte
   BigArray<u8> packed_;                    // the large arrays while packed (pack())
   std::vector<std::size_t> packed_sizes_;  // their element counts
+  // Packed: the history so far. Otherwise: the image that buffer_ starts with, if any.
+  std::shared_ptr<const SharedImage> image_;
+  std::size_t capacity_ = 0;  // buffer_ size, kept while packed
 };
 
 // Test hook: runs the mixer kernels on random inputs, weights and errors (with the ends of their

@@ -3,7 +3,12 @@
 #include <array>
 
 #if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdio>
 #define ULTRA_MMAP 1
 #endif
 #if defined(__x86_64__) || defined(__i386__)
@@ -105,6 +110,82 @@ void big_zero(void* p, std::size_t bytes) noexcept {
   if (bytes >= kMapThreshold && madvise(p, bytes, MADV_DONTNEED) == 0) return;
 #endif
   std::memset(p, 0, bytes);
+}
+
+namespace {
+
+#if defined(ULTRA_MMAP)
+// An unnamed shared-memory file holding `bytes`, or -1.
+int image_file(std::span<const u8> bytes) noexcept {
+#if defined(__linux__)
+  int fd = memfd_create("ultracodec-image", MFD_CLOEXEC);
+#else
+  static std::atomic<unsigned> serial{0};
+  char name[32];
+  std::snprintf(name, sizeof name, "/ultra-%ld-%u", static_cast<long>(getpid()), serial.fetch_add(1));
+  int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+  if (fd >= 0) shm_unlink(name);
+#endif
+  if (fd < 0) return -1;
+  // Filled through a mapping: macOS shared memory supports neither write() nor resizing twice.
+  void* p = ftruncate(fd, static_cast<off_t>(bytes.size())) == 0
+                ? mmap(nullptr, bytes.size(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+                : MAP_FAILED;
+  if (p == MAP_FAILED) {
+    close(fd);
+    return -1;
+  }
+  std::memcpy(p, bytes.data(), bytes.size());
+  munmap(p, bytes.size());
+  return fd;
+}
+
+std::size_t page_bytes() noexcept {
+  static const std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  return page;
+}
+#endif
+
+}  // namespace
+
+SharedImage::SharedImage(std::span<const u8> bytes) : size_(bytes.size()) {
+#if defined(ULTRA_MMAP)
+  if (size_ >= kMapThreshold && (fd_ = image_file(bytes)) >= 0) {
+    void* p = mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
+    if (p != MAP_FAILED) {
+      data_ = static_cast<const u8*>(p);
+      return;
+    }
+    close(fd_);
+    fd_ = -1;
+  }
+#endif
+  copy_.assign(bytes.begin(), bytes.end());
+  data_ = copy_.data();
+}
+
+SharedImage::~SharedImage() {
+#if defined(ULTRA_MMAP)
+  if (fd_ >= 0) {
+    munmap(const_cast<u8*>(data_), size_);
+    close(fd_);
+  }
+#endif
+}
+
+void SharedImage::map_over(u8* dst, std::size_t bytes) const {
+  if (bytes < size_) throw Error("ultracodec: shared image does not fit");
+  std::size_t mapped = 0;
+#if defined(ULTRA_MMAP)
+  // Only big_alloc mappings are page-aligned blocks that a fixed mapping may replace. If the
+  // mapping fails, dst is left as it was and is copied whole.
+  if (fd_ >= 0 && bytes >= kMapThreshold && reinterpret_cast<std::uintptr_t>(dst) % page_bytes() == 0) {
+    const std::size_t whole = size_ / page_bytes() * page_bytes();
+    if (whole && mmap(dst, whole, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd_, 0) != MAP_FAILED) mapped = whole;
+  }
+#endif
+  // The partial last page is copied, so appending after the image dirties no shared page.
+  if (size_ > mapped) std::memcpy(dst + mapped, data_ + mapped, size_ - mapped);
 }
 
 }  // namespace ultracodec::detail

@@ -783,7 +783,20 @@ Model& Model::operator=(const Model& o) {
   if (this == &o) return *this;
   // Arrays of equal size copy in place, so a worker's model is refreshed without reallocating.
   // A packed source has no arrays to copy; they are unpacked below.
-  copy_big(buffer_, o.buffer_);
+  if (o.packed()) {
+    // The history is o's image; a model that already starts with it only appended after it.
+    if (buffer_.size() != o.capacity_) {
+      buffer_.reset(o.capacity_);
+      image_.reset();
+    }
+    if (image_ != o.image_) {
+      o.image_->map_over(buffer_.data(), buffer_.size());
+      image_ = o.image_;
+    }
+  } else {
+    copy_big(buffer_, o.buffer_);
+    image_.reset();
+  }
   layout_ = o.layout_;
   bits_ = o.bits_;
   frontend_ = o.frontend_;
@@ -808,6 +821,7 @@ Model& Model::operator=(const Model& o) {
 }
 
 void Model::reset() {
+  image_.reset();  // the history is rewritten from the start
   history_ = {buffer_.data(), 0};
   bits_ = {};
   inputs_.fill(0);
@@ -837,7 +851,6 @@ void Model::for_each_array(F&& f) {
   static const Baseline zero, apm(Calibration::Apm::initial().data(), 33 * sizeof(u16)),
       weight(&Mixer::kInitialWeight, sizeof(Mixer::kInitialWeight)),
       weight16(&Mixer::kInitialWeight16, sizeof(Mixer::kInitialWeight16));
-  f(buffer_, zero);
   for (auto& table : contexts_.tables_) f(table.buckets_, zero);
   f(match_.table_, zero);
   f(mixer_.weights_, weight);  // one of the two weight arrays is empty
@@ -864,6 +877,9 @@ void Model::pack() {
     out = pack_bytes(reinterpret_cast<const u8*>(a.data()), a.size() * sizeof(T), b, out);
     a.reset(0);  // release
   });
+  image_ = std::make_shared<const SharedImage>(std::span<const u8>(buffer_.data(), history_.position));
+  capacity_ = buffer_.size();
+  buffer_.reset(0);
   history_.data = nullptr;
 }
 
@@ -878,7 +894,7 @@ void Model::unpack_into(Model& dst) const {
 }
 
 std::size_t Model::resident_bytes() const noexcept {
-  std::size_t b = sizeof(Model) + packed_.size() + buffer_.size() + match_.table_.size() * 4 + mixer_.weights_.size() * 4 +
+  std::size_t b = sizeof(Model) + packed_.size() + (packed() ? image_->size() : buffer_.size()) + match_.table_.size() * 4 + mixer_.weights_.size() * 4 +
                   mixer_.weights16_.size() * 2;
   for (const auto& table : contexts_.tables_) b += table.buckets_.size() * sizeof(SlotTable::Bucket);
   for (const auto* apm : {&calibration_.apm0_, &calibration_.apm1_, &calibration_.apm2_, &calibration_.apm3_}) b += apm->values.size() * 2;
