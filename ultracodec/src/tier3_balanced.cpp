@@ -1,6 +1,6 @@
 // Tier 3: Balanced / Fast Ultra. A long-range dedup pass (cross-block
-// repeats >= 40 bytes, any repeat >= 256), then 1 MiB blocks, each primed
-// with the first 64 KiB of its predecessor (wavefront), through a lean
+// repeats >= 40 bytes, any repeat >= 256), then 2 MiB blocks, each primed
+// with the first 256 KiB of its predecessor (wavefront), through a lean
 // 6-context CM: order-1 direct counters, hashed orders 2, 3, 4 and a word
 // context, one match model; one mixer (weight row by match state and partial
 // byte) and one APM with confident-prediction bypass; two-state binary rANS.
@@ -13,7 +13,10 @@
 // Archives use CompactProfile: 16-bit hashed counters (a bucket pair is one
 // cache line, 16 MiB per worker for the slots 32-bit counters held in 32 MiB)
 // and one rANS stream per 64 KiB, so the encoder's bit record is 1 MiB
-// instead of 16 MiB. LeanProfile, the format before that, still decodes and
+// instead of 16 MiB. They also use 2 MiB blocks primed with 256 KiB of the
+// predecessor: on the tier4 text corpus that is -15.5% vs zstd -19 instead of
+// -13.6%, at ~5 MB/s on 4 threads instead of ~6.4 (both in the header, so
+// any block size decodes). LeanProfile, the format before that, still decodes and
 // is written with EngineOptions::tier3_compact = false.
 #include "cm_codec.hpp"
 #include "tiers.hpp"
@@ -65,6 +68,8 @@ struct CompactProfile : LeanProfile {
   static constexpr bool kCompact = true;
   static constexpr std::size_t kChunkBytes = 64 * 1024;
   static constexpr int kCounterLimit = 15;
+  static constexpr unsigned kBlockLog2 = 21;
+  static constexpr std::size_t kPrimeBytes = 256 * 1024;
   static constexpr std::size_t kTableBytes = std::size_t{16} << 20;
   static constexpr std::size_t kMaxTablePerByte = 64;
   static constexpr u64 kMaxTableBytes = u64{4} << 30;

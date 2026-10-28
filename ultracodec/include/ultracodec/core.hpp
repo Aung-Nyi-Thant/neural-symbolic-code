@@ -33,7 +33,7 @@ namespace ultracodec {
 enum class TierLevel : std::uint8_t {
   Tier1_HyperSpeed = 1,  // byte-level LZ77, LZ4-class speed
   Tier2_Consumer = 2,    // lazy hash-chain LZ77 + 8-way interleaved static rANS
-  Tier3_Balanced = 3,    // 1 MiB primed blocks, lean 6-context CM + binary rANS
+  Tier3_Balanced = 3,    // 2 MiB primed blocks, lean 6-context CM + binary rANS
   Tier4_Enterprise = 4,  // 2 MiB blocks warm-started from block 0, 22-context CM
 };
 

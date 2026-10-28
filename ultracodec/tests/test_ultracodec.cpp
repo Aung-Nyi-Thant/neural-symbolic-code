@@ -614,6 +614,13 @@ void test_rss_limits() {
 }  // namespace
 
 int main() {
+  // First, while this process is small: the forked child's peak RSS also
+  // counts the pages it inherits, and heap left over from the other tests
+  // (~15 MiB more with Tier 3's 2 MiB blocks) would be charged to the tier.
+#if defined(ULTRA_TEST_RSS) && !defined(ULTRA_SANITIZED)
+  std::printf("RSS limits\n");
+  test_rss_limits();
+#endif
   std::printf("header\n");
   test_header();
   std::printf("rANS kernels (active: %d)\n", static_cast<int>(detail::rans_active_kernel()));
@@ -640,10 +647,6 @@ int main() {
   test_word_filter();
   std::printf("corruption\n");
   test_corruption();
-#if defined(ULTRA_TEST_RSS) && !defined(ULTRA_SANITIZED)
-  std::printf("RSS limits\n");
-  test_rss_limits();
-#endif
   if (g_failures) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);
     return 1;

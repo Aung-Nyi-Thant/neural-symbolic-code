@@ -8,7 +8,7 @@ four strategies:
 |---|---|---|---|---|
 | 1 | Hyper-Speed | Default: greedy two-hash LZ77 over the whole block with repeat offsets, entropy-coded sequences (rANS). Raw mode: byte-level LZ77 in the LZ4 block layout, 64 KiB window | 1 MiB | ~0.8 MiB tables per thread |
 | 2 | Consumer | Gated word-dictionary pre-filter, lazy hash-chain LZ77 with repeat offsets, 8-way interleaved static rANS (AVX2 / NEON decode) with literals split into 16 context streams | 2 MiB | ~30 MiB per thread |
-| 3 | Balanced | Long-range dedup pass, then 1 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 1 MiB + 64 KiB prefix | 16 MiB table (16-bit counters) + ~14 MiB per thread, budget 512 MiB |
+| 3 | Balanced | Long-range dedup pass, then 2 MiB wavefront-primed blocks through a lean 6-context CM + binary rANS | 2 MiB + 256 KiB prefix | 16 MiB table (16-bit counters) + ~14 MiB per thread, budget 512 MiB |
 | 4 | Enterprise SWS | 256 KiB built-in primer and block 0 train one model; every later 2 MiB block starts from a copy of it (snapshot warm-start). 22-context CM, 4 int16 mixer sets, 4 APMs, binary range coder | 2 MiB | 74-194 MiB per model by table layout (default Rebalanced, ~159 MiB): packed snapshot (~61 MiB) + one per worker (794 MiB peak at 4 threads), budget 900 MiB |
 
 **Results in one line:** every tier round-trips, all archives are
@@ -98,7 +98,7 @@ archives the AArch64 build writes.
 |---|---|---|---|
 | Confident-prediction skipping (APM bypass) | `cm_model.hpp` | When the mixer logit is above a threshold (\|st\| >= 1900/1950 of 2047), the APM lookup and update are skipped. A second option, `kMatchSkip`, also bypasses the mixer and all counters inside long, reliable matches. | APM bypass: density unchanged (threshold 1000: +0.15% size); speed change within noise. Match skip: +1.3% size (len >= 32) or +3.9% (len >= 16), with no speed gain on code, so it is **off** by default. |
 | Vectorized multi-stream rANS | `rans_static.cpp`, `rans_binary.hpp` | Tier 2: 8 interleaved 32-bit states. The AVX2 decoder does one gather plus a permute-based renormalization per 8 symbols, and NEON does two 4-lane halves. The stream is defined so the scalar and vector decoders read the same words (tests compare them). Tiers 3/4: two interleaved binary rANS states. The encoder uses exact reciprocal multiplication instead of division. | Tier 2 end-to-end decode: scalar 275 MB/s, AVX2 306-323 MB/s (+11-17%). For the CM tiers the coder is a few % of the time (as the Phase 8 study found), so rANS there gives a parallel-decodable stream, not speed. |
-| Staggered / wavefront scheduling | `block_engine.cpp` | Block k is primed with the first P bytes of block k-1 (64 KiB in Tier 3, 256 KiB in Tier 4). Encoding is fully parallel. In decoding, the worker on block k waits only until block k-1 has published its first P bytes (an atomic flag), so the workers start a few % of a block apart. A serial long-range dedup pass (`dedup.cpp`) also removes repeats whose source is in another block. | 2 × 1 MiB blocks vs one 2 MiB block: +1.5% size. The 64 KiB prefix wins back 0.5%, a 256 KiB prefix 0.9%. Dedup: Tier 3 full corpus -0.9% (prose/docs -4.7%, XML faster). |
+| Staggered / wavefront scheduling | `block_engine.cpp` | Block k is primed with the first P bytes of block k-1 (256 KiB in Tier 3 and Tier 4). Encoding is fully parallel. In decoding, the worker on block k waits only until block k-1 has published its first P bytes (an atomic flag), so the workers start a few % of a block apart. A serial long-range dedup pass (`dedup.cpp`) also removes repeats whose source is in another block. | 2 × 1 MiB blocks vs one 2 MiB block: +1.5% size. The 64 KiB prefix wins back 0.5%, a 256 KiB prefix 0.9%. Dedup: Tier 3 full corpus -0.9% (prose/docs -4.7%, XML faster). |
 | Mixer distillation and LUTs | `cm_model.hpp` | stretch/squash are 4096-entry integer tables built at compile time from lpaq's 33-point curve, so there is no floating point and every platform is identical. The mixer is int16 SIMD (SSE2 `pmaddwd` / NEON `vmlal`): exact 32-bit dot product, multiply-high + saturating-add training. Inputs are built in registers. The adaptive rate 1/(n+1.5) comes from a table. | Building the inputs in registers instead of per-element stores fixed a store-forwarding stall: +38% on the order-1-only model. Moving the int16 SIMD mixer from 32-bit scalar cut ~106 to ~10 instructions per bit for training. |
 | Memory-wall mitigation | `cm_model.hpp`, `common.cpp` | Counters sit in 64-byte buckets (one cache line holds a nibble's 15 nodes plus a tag), two-way associative on 128-byte pairs. One bit before each nibble boundary, both possible buckets of every context are prefetched (`__builtin_prefetch`), along with the match-table slot and the next bit's APM row and order-1 counter. Tables are huge-page backed (`MADV_HUGEPAGE`) and reset with `MADV_DONTNEED`, so RSS tracks the pages actually touched. Blocks run on parallel workers. | Prefetching changed speed by under 10% (within VM noise). With a 256 KiB table that fits in L2 the model is barely faster, so these tiers are bound by instructions and dependencies, not memory, on this machine. |
 
@@ -270,6 +270,24 @@ Full corpus, x86 VM:
 
 That is 46 MiB less per worker at 4 threads (44 MiB on one thread), with
 speed the same within noise.
+
+#### Tier 3 block size
+
+Compact archives also use 2 MiB blocks primed with the first 256 KiB of the
+previous block (1 MiB and 64 KiB before; both are in the header, so either
+decodes, and `tier3_compact = false` keeps the old sizes). A larger table
+does not help Tier 3, since a 1 MiB block cannot fill 16 MiB; a longer
+block does. Tier 4 text corpus (22.8 MB, zstd -19 = 4,191,049), x86 VM,
+4 threads:
+
+| Blocks | Sum of files | Concatenation | Comp / dec MB/s (concatenation) | Peak RSS |
+|---|---|---|---|---|
+| 1 MiB + 64 KiB | 3,621,491 (-13.6%) | 3,620,697 (-13.6%) | 6.21 / 6.82 | 213 MiB |
+| 2 MiB + 256 KiB (default) | 3,511,923 (-16.2%) | 3,541,060 (-15.5%) | 5.03 / 5.51 | 217 MiB |
+
+Per file it is 3.66 MB/s instead of 4.53, because a 4 MiB file now has only
+two blocks for four threads. 4 MiB blocks gave -16.4% on the concatenation
+but run on one thread for files up to 4 MiB.
 
 #### Tier 4 mixer
 
