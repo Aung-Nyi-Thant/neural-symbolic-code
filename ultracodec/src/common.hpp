@@ -124,6 +124,33 @@ void BigArray<T>::release() noexcept {
   n_ = 0;
 }
 
+// An immutable byte image that big_alloc blocks can map copy-on-write. On POSIX it lives in an
+// anonymous shared-memory file, so every block it is mapped into reads the same physical pages
+// and only pages a block writes become private. Elsewhere, or when the file cannot be made, it is
+// a heap copy and map_over copies it; so is an image under 1 MiB. Thread-safe once constructed.
+class SharedImage {
+ public:
+  explicit SharedImage(std::span<const u8> bytes);
+  ~SharedImage();
+  SharedImage(const SharedImage&) = delete;
+  SharedImage& operator=(const SharedImage&) = delete;
+
+  const u8* data() const noexcept { return data_; }
+  std::size_t size() const noexcept { return size_; }
+  bool shared() const noexcept { return fd_ >= 0; }
+  // Makes the first size() bytes of dst, a big_alloc block of `bytes` >= size() bytes, equal to
+  // the image. Whole pages are mapped when dst is a mapping; the rest is copied. Bytes after
+  // size() are unspecified. Writing dst later never changes the image; big_zero on dst restores
+  // the image in its mapped pages rather than zeroing them.
+  void map_over(u8* dst, std::size_t bytes) const;
+
+ private:
+  int fd_ = -1;
+  const u8* data_ = nullptr;  // a read-only view of the file, or copy_
+  std::size_t size_ = 0;
+  std::vector<u8> copy_;      // when fd_ < 0
+};
+
 // A bounds-checked little-endian reader over an untrusted byte span.
 class Reader {
  public:

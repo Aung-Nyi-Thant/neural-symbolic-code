@@ -489,6 +489,62 @@ void test_tier4_packed_snapshot() {
   }
 }
 
+// The snapshot's history is a SharedImage: mapped copy-on-write into every copy, unchanged by what
+// copies write after it, and mapped (not copied) once the image reaches 1 MiB on POSIX.
+void test_shared_history() {
+  const Bytes img = text_bytes((3u << 20) / 2 + 123, 51);  // 1.5 MiB and a partial page
+  const detail::SharedImage image(img);
+#if defined(__unix__) || defined(__APPLE__)
+  CHECK(image.shared());
+#endif
+  CHECK(image.size() == img.size() && std::memcmp(image.data(), img.data(), img.size()) == 0);
+  detail::BigArray<std::uint8_t> a(4u << 20), b(4u << 20), small(img.size());
+  image.map_over(a.data(), a.size());
+  image.map_over(b.data(), b.size());
+  image.map_over(small.data(), small.size());  // heap block: copied
+  std::memset(a.data() + img.size(), 0xAB, a.size() - img.size());
+  a[0] ^= 1;  // a private page now
+  CHECK(std::memcmp(b.data(), img.data(), img.size()) == 0 && std::memcmp(small.data(), img.data(), img.size()) == 0);
+  CHECK(std::memcmp(image.data(), img.data(), img.size()) == 0 && a[img.size() - 1] == img.back());
+  image.map_over(a.data(), a.size());  // remapping drops a's private copy
+  CHECK(std::memcmp(a.data(), img.data(), img.size()) == 0);
+
+  // Worker models over a mapped history: reused, reset and retrained, refreshed from a second
+  // snapshot, they code exactly like copies of the unpacked snapshots.
+  namespace sws = detail::sws;
+  const Bytes p = text_bytes(100000, 52), q = text_bytes(60000, 53);
+  sws::Model s1(2u << 20, sws::TableLayout::Small, true), s2(2u << 20, sws::TableLayout::Small, true);
+  s1.train(sws::primer());
+  s1.train(p);
+  s2.train(q);
+  const sws::Model u1(s1), u2(s2);
+  s1.pack();
+  s2.pack();
+  const auto code = [](sws::Model m, const Bytes& raw) {
+    Bytes out;
+    CHECK(m.encode(raw, out));
+    return out;
+  };
+  const Bytes r1 = code(u1, q), r2 = code(u2, p);
+  sws::Model w(s1);
+  for (int round = 0; round < 2; ++round) {
+    Bytes out;
+    CHECK(w.encode(q, out) && out == r1);
+    w = s1;  // same image: not mapped again
+  }
+  w.reset();
+  w.train(p);  // overwrites the start of the history
+  w = s1;
+  Bytes out;
+  CHECK(w.encode(q, out) && out == r1);
+  w = s2;
+  out.clear();  // encode appends
+  CHECK(w.encode(p, out) && out == r2);
+  w = u1;  // from an unpacked model: copied
+  out.clear();
+  CHECK(w.encode(q, out) && out == r1);
+}
+
 void test_corruption() {
   const int iters = fuzz_iters(150);
   std::mt19937 rng(1234);
@@ -636,6 +692,8 @@ int main() {
   test_tier4_mixers();
   std::printf("tier 4 packed snapshot\n");
   test_tier4_packed_snapshot();
+  std::printf("tier 4 shared history\n");
+  test_shared_history();
   std::printf("word filter\n");
   test_word_filter();
   std::printf("corruption\n");
