@@ -5,8 +5,15 @@
 #   linux        GCC and Clang release builds; ASan+UBSan and TSan under both compilers
 #   aarch64      a cross build run under QEMU user mode (NEON kernels)
 #   mingw-wine   a MinGW-w64 cross build for Windows, run under Wine
-#   benchmark    tools/benchmark.py on three source-code corpora: a smoke test of
-#                the CLI and the script, with the tables in the job summary
+#   macos        native macOS (Apple clang) on arm64 and x86-64: every C++ suite,
+#                then a wheel installed with its hce command and the pytest suite
+#   fuzz         the libFuzzer targets (clang-fuzz preset): their seeds and saved
+#                regressions, then a bounded smoke run of each; not a campaign
+#   benchmark    tools/benchmark.py on the built-in corpora (three source-code
+#                ones, four pinned synthetic ones), then synthetic-small per file
+#                over three runs: a smoke test of the CLI and the script, with the
+#                tables in the job summary and the raw runs, manifests and build
+#                settings kept as artifacts
 #   python       the hce package on the oldest and newest supported Pythons: an
 #                sdist, a wheel built from it with -Werror, the pytest suite
 #                against the installed wheel and its hce command
@@ -150,6 +157,100 @@ jobs:
           path: build/mingw-wine/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
 
+  macos:
+    name: macos (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]  # arm64 (NEON), x86-64 (SSE2/AVX2)
+    env:
+      PIP_CONSTRAINT: ${{ github.workspace }}/constraints.txt
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the toolchain
+        run: brew install ninja
+
+      - name: Describe the runner
+        run: |
+          uname -a
+          sw_vers
+          c++ --version
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+
+      # The thread backend: io_uring is Linux only.
+      - name: Configure, build and test (release preset)
+        run: |
+          cmake --preset release
+          cmake --build --preset release
+          ctest --preset release
+
+      - name: Build the wheel, install it, run the test suite against it
+        run: |
+          python -m pip install build==1.2.2
+          python -m build --wheel --outdir dist -C cmake.define.HCE_WERROR=ON
+          python -m pip install "$(ls dist/hce-*.whl)[dev]"
+          python -c "import hce, sys; print(hce.__file__); sys.exit('site-packages' not in hce.__file__)"
+          hce --version
+          python -m pytest
+
+      - name: Keep the test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.runner }}
+          path: build/release/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  fuzz:
+    name: fuzz (libFuzzer smoke)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build clang libclang-rt-18-dev
+
+      - name: Limit address-space randomization for the sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Build the fuzz targets
+        run: |
+          cmake --preset clang-fuzz
+          cmake --build --preset clang-fuzz --target fuzz_framed fuzz_structural fuzz_codec fuzz_model fuzz_ultra fuzz_ultra_t4
+
+      - name: Replay the seeds and the saved regressions
+        run: ctest --preset clang-fuzz -R '^fuzz_'
+
+      # Two minutes per target from the seed corpora: catches what a change
+      # breaks quickly. Long campaigns run elsewhere (fuzz/README.md). Tier 4
+      # decodes take seconds each and are covered by the replay above.
+      - name: Fuzz each target briefly
+        run: |
+          mkdir -p artifacts
+          for t in framed structural codec model ultra; do
+            mkdir -p "work/$t"
+            build/clang-fuzz/fuzz/fuzz_$t -max_total_time=120 -rss_limit_mb=3072 -timeout=120 -max_len=12000 \
+              -artifact_prefix="$PWD/artifacts/$t-" "work/$t" fuzz/corpus/* tests/python/golden
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: artifacts/
+          if-no-files-found: ignore
+
   benchmark:
     name: benchmark (smoke)
     runs-on: ubuntu-24.04
@@ -175,12 +276,23 @@ jobs:
       # Shared runners are noisy: the speeds are indicative, the sizes exact.
       # Every result is decompressed and compared; a mismatch fails the job.
       - name: Run the benchmark
-        run: python3 tools/benchmark.py --threads "$(nproc)" --md benchmark.md --csv benchmark.csv
+        run: >-
+          python3 tools/benchmark.py --threads "$(nproc)" --md benchmark.md --csv benchmark.csv
+          --json benchmark.json --manifest benchmark-manifest.json
+
+      # A pinned corpus (generated, its SHA-256 checked) with each file
+      # compressed on its own too: the run any machine can reproduce exactly.
+      - name: Run the benchmark on the pinned synthetic corpus
+        run: >-
+          python3 tools/benchmark.py --corpus synthetic-small --per-file --runs 3 --threads "$(nproc)"
+          --md synthetic.md --json synthetic.json --manifest synthetic-manifest.json
 
       - name: Publish the tables
         if: always()
         run: |
-          if [ -f benchmark.md ]; then cat benchmark.md >> "$GITHUB_STEP_SUMMARY"; fi
+          for f in benchmark.md synthetic.md; do
+            if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -189,6 +301,11 @@ jobs:
           path: |
             benchmark.md
             benchmark.csv
+            benchmark.json
+            benchmark-manifest.json
+            synthetic.md
+            synthetic.json
+            synthetic-manifest.json
           if-no-files-found: ignore
 
   python:

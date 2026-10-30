@@ -47,6 +47,17 @@
       }
     },
     {
+      "name": "clang-fuzz",
+      "inherits": "base",
+      "displayName": "Clang, libFuzzer targets with AddressSanitizer + UndefinedBehaviorSanitizer",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "HCE_SANITIZE": "address,undefined",
+        "HCE_FUZZ": "ON"
+      }
+    },
+    {
       "name": "gcc-tsan",
       "inherits": "base",
       "displayName": "GCC, ThreadSanitizer",
@@ -87,6 +98,7 @@
     { "name": "python", "configurePreset": "python" },
     { "name": "gcc-asan", "configurePreset": "gcc-asan" },
     { "name": "clang-asan", "configurePreset": "clang-asan" },
+    { "name": "clang-fuzz", "configurePreset": "clang-fuzz" },
     { "name": "gcc-tsan", "configurePreset": "gcc-tsan" },
     { "name": "clang-tsan", "configurePreset": "clang-tsan" },
     { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu" },
@@ -98,6 +110,7 @@
     { "name": "python", "configurePreset": "python", "output": { "outputOnFailure": true } },
     { "name": "gcc-asan", "configurePreset": "gcc-asan", "output": { "outputOnFailure": true } },
     { "name": "clang-asan", "configurePreset": "clang-asan", "output": { "outputOnFailure": true } },
+    { "name": "clang-fuzz", "configurePreset": "clang-fuzz", "output": { "outputOnFailure": true } },
     { "name": "gcc-tsan", "configurePreset": "gcc-tsan", "output": { "outputOnFailure": true } },
     { "name": "clang-tsan", "configurePreset": "clang-tsan", "output": { "outputOnFailure": true } },
     { "name": "aarch64-qemu", "configurePreset": "aarch64-qemu", "output": { "outputOnFailure": true } },

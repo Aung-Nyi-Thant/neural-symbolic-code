@@ -418,10 +418,16 @@ static void test_limits_and_unsupported() {
   CHECK(hce("-t -i legacy.hce").code == 5);
 }
 
+// pipe2(O_CLOEXEC) where it exists; macOS has only pipe() and fcntl().
+static bool cloexec_pipe(int fds[2]) {
+  if (::pipe(fds) != 0) return false;
+  return ::fcntl(fds[0], F_SETFD, FD_CLOEXEC) == 0 && ::fcntl(fds[1], F_SETFD, FD_CLOEXEC) == 0;
+}
+
 static void test_signals_and_pipes() {
   // SIGINT while blocked on an idle pipe: prompt exit 1, no output, no temp file.
   int in_pipe[2];
-  CHECK(::pipe2(in_pipe, O_CLOEXEC) == 0);
+  CHECK(cloexec_pipe(in_pipe));
   const pid_t pid = spawn({"-o", path("interrupted.hce")}, in_pipe[0], -1);
   CHECK(pid > 0);
   ::close(in_pipe[0]);
@@ -434,7 +440,7 @@ static void test_signals_and_pipes() {
 
   // The reader of our stdout goes away: EPIPE ends the run with exit 1, without hanging.
   int out_pipe[2];
-  CHECK(::pipe2(out_pipe, O_CLOEXEC) == 0);
+  CHECK(cloexec_pipe(out_pipe));
   const pid_t dec = spawn({"-d", "-T", "3", "-i", path("data.hce")}, -1, out_pipe[1]);
   CHECK(dec > 0);
   ::close(out_pipe[1]);

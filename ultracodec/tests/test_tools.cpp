@@ -38,7 +38,7 @@ static std::string slurp(const fs::path& p) {
   std::ifstream f(p, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(f), {});
 }
-static void spit(const fs::path& p, const std::string& s) {
+[[maybe_unused]] static void spit(const fs::path& p, const std::string& s) {  // POSIX tests only
   std::ofstream f(p, std::ios::binary | std::ios::trunc);
   f << s;
 }

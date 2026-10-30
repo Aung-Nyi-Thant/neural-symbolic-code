@@ -48,6 +48,17 @@ if(HCE_NATIVE)
   add_compile_options(-march=native)
 endif()
 
+# Coverage-guided fuzzing (fuzz/README.md): Clang only; pair it with
+# HCE_SANITIZE=address,undefined (the clang-fuzz preset). Every target gets the
+# coverage instrumentation, and the fuzz_* targets link libFuzzer.
+option(HCE_FUZZ "Build the fuzz targets with libFuzzer (Clang)" OFF)
+if(HCE_FUZZ)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "HCE_FUZZ=ON needs Clang (libFuzzer)")
+  endif()
+  add_compile_options(-fsanitize=fuzzer-no-link)
+endif()
+
 # Profile-guided optimization, off by default: GENERATE builds instrumented
 # binaries that write profiles to HCE_PGO_DIR when run; USE rebuilds from
 # those profiles (branch weights and code layout of the codec's bit loops).
@@ -263,6 +274,9 @@ if(HCE_BUILD_TESTS)
     list(APPEND HCE_TEST_ENV "HCE_TEST_WRAPPER=${HCE_WRAPPER}")
   endif()
   set_tests_properties(${HCE_TESTS} PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
+
+  # The fuzz targets, each run over its seeds and saved regressions.
+  add_subdirectory(fuzz)
 
   # The pytest suite (tests/python), against the staged package and the CLI.
   if(HCE_BUILD_PYTHON)

@@ -60,8 +60,22 @@ size, memory budget, wavefront prefix, decompression size cap) and
 `engine.hpp` has the factory `create_engine(TierLevel, EngineOptions)` and
 the one-call helpers. Every failure throws `ultracodec::Error`.
 
+`memory_budget` bounds the model tables of all workers (Tiers 3 and 4) and
+nothing else. The whole-buffer API also holds the input, the output and the
+archive, plus per-block scratch, so a process needs about the budget plus
+those buffers; `max_output_bytes` caps the output a decoder allocates.
+
 The `ultra` tool compresses files: `ultra c -t 3 in out`, `ultra d in out`,
-`ultra i archive`. `ultra_bench <tier> FILE...` measures round trips.
+`ultra i archive`. Numbers are checked in full (`-t 1..4`, `-T 0..1024`; a
+sign, suffix or overflow is a usage error, exit 2). The output goes to a new
+temporary file beside the destination, is synced and closed with its errors
+checked, and replaces the destination only then, so a failed run (corrupt
+archive, full disk, file size limit) leaves the old file as it was; a device
+such as `/dev/null` is written in place. `ultra_bench <tier> FILE...`
+measures round trips: it verifies every repetition, reports the median and
+the best of `--runs`, and its peak RSS covers the whole process. The
+throughput tables below were measured with the earlier `ultra_bench`, which
+reported the best repetition.
 
 ## Archive format
 
@@ -85,6 +99,16 @@ uses bounded copies in every tier. The corruption tests truncate archives
 and flip random bits, under ASan/UBSan and TSan in CI. A corrupt archive
 either throws `Error` or, rarely, decodes to the exact original (when the
 flip lands in padding). None has crashed.
+
+Format version 1 has not been frozen: ultracodec has not been in a release,
+and some formats changed in place, without a version or parameter change.
+`tests/fixtures/` holds archives written by the encoders of the main branch
+after each pull request that changed ultracodec (#7, #8, #10, #12, #13; built
+from those commits by `make_fixtures.sh`, never by today's encoder), and the
+`ultracodec_fixtures` test decodes them. Today's decoder rejects three of
+them with an error (listed in `tests/fixtures/KNOWN_BREAKS`): Tier 2 archives
+from before #10 and Tier 4 archives from #7. All others decode to the
+original bytes.
 
 Archives do not depend on the thread count (the memory budget limits how
 many workers run, never the model size). The x86 build (SSE2/AVX2) and the
@@ -453,6 +477,13 @@ in a forked child (Linux, not under sanitizers). It passes with GCC and
 Clang at `-Werror` and under ASan+UBSan and TSan. The AArch64 and MinGW
 builds compile cleanly at `-Werror`.
 
+`ultracodec_fixtures` (`tests/test_fixtures.cpp`) decodes the archives of
+past commits in `tests/fixtures/` on one and four threads, and
+`ultracodec_tools` (`tests/test_tools.cpp`) covers the tools: number
+parsing, transactional writes, per-repetition verification and peak-RSS
+units. The `fuzz_ultra` and `fuzz_ultra_t4` libFuzzer targets live in
+[`../fuzz`](../fuzz/README.md).
+
 `HCE_FUZZ_ITERS` / `ULTRA_FUZZ_ITERS` scale the corruption rounds
 (sanitizer and emulator runs use 24). `ULTRA_SKIP_RSS=1` skips the RSS
 checks.
@@ -484,4 +515,8 @@ src/range_coder.hpp             Tier 4 binary range coder
 tools/ultra_cli.cpp             ultra: compress/decompress/inspect files
 tools/ultra_bench.cpp           ultra_bench: round-trip benchmark
 tests/test_ultracodec.cpp       Test suite
+tests/test_tools.cpp            Tool tests (tools/tool_util.hpp)
+tests/test_fixtures.cpp         Decodes tests/fixtures/: archives written by past commits
+tests/fixtures/                 Those archives, MANIFEST, KNOWN_BREAKS, make_fixtures.sh
+tools/tool_util.hpp             Number parsing, checked reads, transactional writes, verified repetitions
 ```

@@ -68,14 +68,11 @@ CommitResult fail(const char* stage, int sys_error, bool published = false) noex
 int last_error() noexcept { return static_cast<int>(::GetLastError()); }
 #endif
 
+#if !defined(_WIN32)
 // The new directory entry, durable. File systems that cannot sync a
-// directory (EINVAL, ENOTSUP) have nothing to sync. Windows: MoveFileExW's
-// MOVEFILE_WRITE_THROUGH already waited for it.
+// directory (EINVAL, ENOTSUP) have nothing to sync. (Windows needs nothing:
+// MoveFileExW's MOVEFILE_WRITE_THROUGH already waited for it.)
 int sync_parent(const fs::path& p) noexcept {
-#if defined(_WIN32)
-  (void)p;
-  return 0;
-#else
   fs::path dir = p.parent_path();
   if (dir.empty()) dir = ".";
   const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -84,10 +81,8 @@ int sync_parent(const fs::path& p) noexcept {
   if (::fsync(fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != EROFS) err = errno;
   ::close(fd);
   return err;
-#endif
 }
 
-#if !defined(_WIN32)
 // One no-replace rename. ok, or the errno; ENOTSUP / ENOSYS / EINVAL mean
 // "not on this file system", so the next method may try.
 int rename_noreplace(const fs::path& from, const fs::path& to) noexcept {
