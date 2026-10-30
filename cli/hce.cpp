@@ -90,8 +90,9 @@ Compression:
       --lang LANG         keyword table for --structural: auto (default: from
                           the input's extension), generic, c, cpp, python,
                           javascript, typescript, java, go, rust
-      --spool-dir DIR     where --structural keeps its token spool (default:
-                          next to the output file, else the temporary directory)
+      --spool-dir DIR     where --structural keeps its token spool, a new
+                          owner-only file (default: next to the output file,
+                          else the temporary directory)
 
 Decompression:
       --recovery MODE     strict | skip | skip_and_fill (default strict)
@@ -106,8 +107,9 @@ Decompression:
       --ratio-burst SIZE  burst depth of the expansion budget (default 64M)
       --max-output SIZE   largest total output
                           Structural archives are verified as a whole: they take
-                          --max-memory, but not --recovery, --report or the
-                          other limits.
+                          --max-memory, --max-output and --max-level (and those
+                          of --limits); --recovery, --report, --max-window,
+                          --max-block, --max-ratio and --ratio-burst are refused.
 
 Reporting:
       --stats[=FORMAT]    integer telemetry on stderr: text (default) or json
@@ -151,6 +153,7 @@ struct Options {
   hc::Recovery recovery = hc::Recovery::strict;
   std::byte fill{0};
   hc::DecodeLimits limits = hc::DecodeLimits::trusted();
+  std::string byte_only_limit;  // the first --max-window/--max-block/--max-ratio/--ratio-burst given
 };
 
 std::optional<u64> parse_uint(std::string_view s) {
@@ -341,6 +344,8 @@ Options parse(int argc, char** argv) {
   if (ov.ratio) o.limits.max_ratio = static_cast<hc::u32>(*ov.ratio);
   if (ov.burst) o.limits.ratio_burst_bytes = *ov.burst;
   if (ov.output) o.limits.max_output_bytes = *ov.output;
+  o.byte_only_limit = ov.window ? "--max-window" : ov.block ? "--max-block" : ov.ratio ? "--max-ratio"
+                      : ov.burst ? "--ratio-burst" : "";
 
   const bool decoding = o.mode != Mode::compress;
   if (!decoding && (o.report || o.recovery != hc::Recovery::strict || profile || ov.window || ov.block || ov.level ||
@@ -420,7 +425,7 @@ class GapReport {
       err = "write failed";
       return false;
     }
-    return file_.commit(err);
+    return file_.commit(err) == OutputFile::Commit::published;
   }
 
  private:
@@ -498,9 +503,12 @@ struct Input {
 
 struct Output {
   OutputFile file;
-  bool is_file = false, pollable = false;
+  bool is_file = false, pollable = false, owned = false;
   int fd = STDOUT_FILENO;
   std::string name = "<stdout>";
+  ~Output() {
+    if (owned) ::close(fd);
+  }
 };
 
 std::string sys_error(const std::string& what) { return what + ": " + std::strerror(errno); }
@@ -530,6 +538,13 @@ void open_output(const Options& o, const Input& in, mode_t mode, Output& out) {
       if (same_file(st, in.st)) throw UsageError(out.name + ": input and output are the same file");
       if (S_ISDIR(st.st_mode)) throw UsageError(out.name + ": is a directory");
       if (!o.force) throw UsageError(out.name + ": already exists (use -f to overwrite)");
+      if (!S_ISREG(st.st_mode)) {  // a device or a pipe (-o /dev/null): written in place, never renamed over
+        out.fd = ::open(o.output->c_str(), O_WRONLY | O_CLOEXEC);
+        if (out.fd < 0) throw std::runtime_error(sys_error(out.name));
+        out.owned = true;
+        out.pollable = true;
+        return;
+      }
     }
     std::string err;
     if (!out.file.open(*o.output, o.force, mode, err)) throw std::runtime_error(out.name + ": " + err);
@@ -748,14 +763,15 @@ Outcome run_decompress(const Options& o, const std::string& in_name, const std::
 // ------------------------------------------------------- structural mode ---
 
 // The spool goes next to the output file (same file system, cleaned up with
-// it), else to the temporary directory (empty path: the archive default).
-std::string spool_path(const Options& o, const Output& out) {
+// it), else to the temporary directory (empty: the archive default). The
+// archive layer picks a fresh name there and creates it exclusively.
+std::string spool_dir(const Options& o, const Output& out) {
   std::filesystem::path dir;
   if (o.spool_dir) dir = *o.spool_dir;
   else if (out.is_file) dir = std::filesystem::path(out.name).parent_path();
   else return {};
   if (dir.empty()) dir = ".";
-  return (dir / (".hce-spool-" + num(static_cast<u64>(::getpid())) + ".tmp")).string();
+  return dir.string();
 }
 
 st::Language resolve_language(const Options& o, const Input& in) {
@@ -804,7 +820,7 @@ Outcome run_compress_structural(const Options& o, const Input& in, const Output&
   ao.language = resolve_language(o, in);
   ao.max_memory = o.limits.max_memory_bytes;
   ao.stop = std::move(stop);
-  ao.spool = spool_path(o, out);
+  ao.spool_dir = spool_dir(o, out);
   const st::ArchiveStats s = st::compress_stream(io.in, io.out, ao);
 
   t.add("mode", "compress");
@@ -832,7 +848,7 @@ Outcome run_compress_structural(const Options& o, const Input& in, const Output&
   if (code == kUsageOrIo && (stage == "read" || stage == "write" || s.status == Errc::cancelled))
     return {kUsageOrIo, io_failure(io, in.name, out.name), {}};
   if (code == kUsageOrIo) {
-    const std::string where = ao.spool.empty() ? "token spool" : "token spool " + ao.spool.string();
+    const std::string where = ao.spool_dir.empty() ? "token spool" : "token spool in " + ao.spool_dir.string();
     return {kUsageOrIo, where + ": " + (s.sys_error ? std::strerror(s.sys_error) : hc::to_string(s.status)), {}};
   }
   if (code == kLimit)
@@ -845,9 +861,14 @@ Outcome run_decompress_structural(const Options& o, const std::string& in_name, 
                                   Streams io, std::stop_token stop, Telemetry& t) {
   if (o.recovery != hc::Recovery::strict || o.report)
     return {kUsageOrIo, in_name + ": structural archives are verified as a whole; --recovery and --report apply to byte-codec streams", {}};
+  if (!o.byte_only_limit.empty())
+    return {kUsageOrIo, in_name + ": " + o.byte_only_limit + " applies to byte-codec streams, not structural archives "
+                        "(they take --max-memory, --max-output and --max-level)", {}};
   st::ArchiveOptions ao;
   ao.threads = o.threads ? o.threads : default_threads();
   ao.max_memory = o.limits.max_memory_bytes;
+  ao.max_output = o.limits.max_output_bytes;
+  ao.max_level = o.limits.max_level;
   ao.stop = std::move(stop);
   const st::ArchiveStats s = st::decompress_stream(io.in, io.out, ao);
 
@@ -874,7 +895,7 @@ Outcome run_decompress_structural(const Options& o, const std::string& in_name, 
   const std::string what = std::string(hc::to_string(s.status)) + " (" + s.stage + ")";
   switch (code) {
     case kCorrupt: return {kCorrupt, in_name + ": corrupt structural archive: " + what, {}};
-    case kLimit: return {kLimit, in_name + ": resource limit exceeded: " + what + " (raise --max-memory)", {}};
+    case kLimit: return {kLimit, in_name + ": resource limit exceeded: " + what + limit_hint(s.status), {}};
     case kUnsupported: return {kUnsupported, in_name + ": unsupported structural archive: " + what, {}};
     default:
       if (s.status == Errc::out_of_memory) return {kUsageOrIo, "out of memory", {}};
@@ -1009,7 +1030,7 @@ int run(int argc, char** argv) {
   std::string err;
   if (out.is_file) {
     if (res.exit == kSuccess || res.exit == kDataLoss || o.keep_partial) {
-      if (!out.file.commit(err)) res = {kUsageOrIo, out.name + ": " + err, {}};
+      if (out.file.commit(err) != OutputFile::Commit::published) res = {kUsageOrIo, out.name + ": " + err, {}};
     } else {
       out.file.discard();
     }

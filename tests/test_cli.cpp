@@ -256,6 +256,47 @@ static void test_structural_mode() {
   CHECK(!temp_files_left());  // no spool and no temporary output left behind
 }
 
+// Structural limits, spool hygiene and racing no-overwrite publication.
+static void test_structural_limits_and_races() {
+  const std::string n = std::to_string(read_file("code.py").size());
+  const std::string m = std::to_string(read_file("code.py").size() - 1);
+  CHECK(hce("-d --max-output " + n + " -i code.hcs -o lim_exact.py").code == 0);
+  CHECK(read_file("lim_exact.py") == read_file("code.py"));
+  const Run over = hce("-d --max-output " + m + " -i code.hcs -o lim_over.py");
+  CHECK(over.code == 4 && !exists("lim_over.py") && over.err.find("--max-output") != std::string::npos);
+  CHECK(hce("-t --max-output 10 -i code.hcs").code == 4);
+  CHECK(hce("-d --max-level 1 -i code.hcs -o lim_level.py").code == 4 && !exists("lim_level.py"));
+  CHECK(hce("-d --limits untrusted -i code.hcs -o lim_untrusted.py").code == 0);
+  for (const char* flag : {"--max-window 1M", "--max-block 64K", "--max-ratio 10", "--ratio-burst 1M"}) {
+    const Run r = hce(std::string("-d ") + flag + " -i code.hcs -o lim_flag.py");
+    CHECK(r.code == 1 && !exists("lim_flag.py") && r.err.find("structural") != std::string::npos);
+  }
+  write_file("empty.src", {});
+  CHECK(hce("--structural -i empty.src -o empty.hcs").code == 0);
+  CHECK(hce("-d --max-output 0 -i empty.hcs -o empty.out").code == 0 && read_file("empty.out").empty());
+
+  // Spools are new files with fresh names: whatever already sits in the spool
+  // directory (a symbolic link included) is never followed, reused or removed.
+  shell("mkdir -p spools && echo VICTIM > spools/victim && ln -sf victim spools/.hce-spool-1.tmp");
+  shell("for i in 0 1 2 3; do " + hce_cmd() + " --structural --spool-dir spools -i code.py -o par$i.hcs 2>/dev/null & done; wait");
+  for (int i = 0; i < 4; ++i) CHECK(read_file("par" + std::to_string(i) + ".hcs") == read_file("code.hcs"));
+  CHECK(text(read_file("spools/victim")) == "VICTIM\n");
+  CHECK(shell("test -L spools/.hce-spool-1.tmp && test \"$(ls -A spools | wc -l)\" -eq 2") == 0);
+
+  // Six runs racing to create one file without -f: one wins, the rest refuse.
+  shell("rm -f race.hce rc*; for i in 1 2 3 4 5 6; do (" + hce_cmd() +
+        " -q -i data.log -o race.hce; echo $? > rc$i) & done; wait");
+  int winners = 0, refused = 0;
+  for (int i = 1; i <= 6; ++i) {
+    const std::string rc = text(read_file("rc" + std::to_string(i)));
+    winners += rc == "0\n";
+    refused += rc == "1\n";
+  }
+  CHECK(winners == 1 && refused == 5);
+  CHECK(hce("-d -i race.hce -o race.log").code == 0 && read_file("race.log") == read_file("data.log"));
+  CHECK(!temp_files_left());
+}
+
 static void test_files_and_sizes() {
   const Vec before = read_file("data.hce");
   CHECK(hce("-i data.log -o data.hce").code == 1);  // exists
@@ -422,6 +463,7 @@ int main(int argc, char** argv) {
 
   test_roundtrips();
   test_structural_mode();
+  test_structural_limits_and_races();
   test_files_and_sizes();
   test_usage_errors();
   test_corruption_and_recovery();

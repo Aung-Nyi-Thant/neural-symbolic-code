@@ -45,6 +45,22 @@ struct Options {
 
 inline constexpr std::size_t kIoAlign = 4096;  // buffers, offsets and chunk sizes: O_DIRECT safe
 
+// Which file an open handle refers to: device and inode on POSIX, volume
+// serial number and file index on Windows. Tells a reopened path from a
+// file that replaced it.
+struct FileId {
+  u64 device = 0, inode = 0;
+  friend bool operator==(const FileId&, const FileId&) = default;
+};
+
+// How open_writer() creates its file.
+enum class Create : std::uint8_t {
+  truncate,           // create or truncate (following a symbolic link)
+  exclusive,          // a new file: fails with EEXIST (Windows: ERROR_FILE_EXISTS) if the name is taken by
+                      // anything, a symbolic link included; mode 0666 less the umask
+  exclusive_private,  // the same, readable and writable by the owner only (0600; Windows: the directory's ACL)
+};
+
 // Clamps depth to 1..256 and the chunk to 4 KiB..64 MiB, a multiple of kIoAlign.
 Options normalize(Options o) noexcept;
 
@@ -72,6 +88,8 @@ class IAsyncFile {
   virtual std::size_t reap(std::span<Completion> out, std::size_t min) noexcept = 0;
   // Makes a waiting and every later reap() return promptly. Any thread.
   virtual void interrupt() noexcept = 0;
+  // The file, as identified when it was opened.
+  virtual FileId file_id() const noexcept = 0;
 };
 
 // Tags are the caller's; ~0 is reserved. Every queue_*() returns output_full
@@ -89,6 +107,10 @@ class IAsyncWriter : public IAsyncFile {
   // Written data and the file size reach stable storage. Queue it after the
   // writes it must cover have completed: operations are not ordered.
   virtual Errc queue_sync(u64 tag) noexcept = 0;
+  // Closes the file once every operation has been reaped; returns the error
+  // close() reports (0: none), which some file systems (NFS) use for writes
+  // that failed late. Destruction closes it too, silently.
+  virtual int close() noexcept = 0;
 };
 
 struct OpenError {
@@ -100,9 +122,9 @@ struct OpenError {
 // unsupported_feature: they stay on the blocking streams.
 std::unique_ptr<IAsyncReader> open_reader(const std::filesystem::path& path, const Options& opt = {},
                                           OpenError* err = nullptr) noexcept;
-// Creates or truncates a regular file.
+// Creates a regular file as `how` says.
 std::unique_ptr<IAsyncWriter> open_writer(const std::filesystem::path& path, const Options& opt = {},
-                                          OpenError* err = nullptr) noexcept;
+                                          OpenError* err = nullptr, Create how = Create::truncate) noexcept;
 
 // io_uring: compiled in, and this process may create a ring with the needed
 // opcodes (seccomp profiles, kernel.io_uring_disabled and old kernels say no).

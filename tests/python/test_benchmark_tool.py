@@ -86,3 +86,57 @@ def test_end_to_end(bench, cli, tmp_path, capsys):
         assert row["verified"] == "1" and not row["error"]
         assert 0 < int(row["compressed_bytes"]) < 20000
     capsys.readouterr()
+
+
+def _fake_codec(bench, tmp_path, bad_runs):
+    """A codec that copies its input; its decompressor corrupts the output on the listed runs (1-based)."""
+    counter = tmp_path / "runs"
+    counter.write_text("0")
+    decomp = tmp_path / "fake_decompress.py"
+    decomp.write_text(
+        "import sys, pathlib\n"
+        f"c = pathlib.Path({str(counter)!r}); n = int(c.read_text()) + 1; c.write_text(str(n))\n"
+        "data = pathlib.Path(sys.argv[1]).read_bytes()\n"
+        f"if n in {tuple(bad_runs)!r}: data = data[:-1] + bytes([data[-1] ^ 1])\n"
+        "pathlib.Path(sys.argv[2]).write_bytes(data)\n")
+    copy = ["-c", "import shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2])"]
+    return bench.Codec("fake", "fake", ".fk",
+                       lambda s, o: [sys.executable, *copy, str(s), str(o)],
+                       lambda p, o: [sys.executable, str(decomp), str(p), str(o)])
+
+
+def test_every_repetition_is_verified(bench, tmp_path):
+    src = tmp_path / "in.txt"
+    src.write_bytes(testdata.text(4, 3000))
+    work = tmp_path / "work"
+    work.mkdir()
+    corpus = bench.build_corpus(f"t={src}", work, None)
+    # A wrong first repetition fails the measurement although the second is right.
+    r = bench.measure(corpus, _fake_codec(bench, tmp_path, [1]), work, 2, 60)
+    assert not r.verified and "run 1" in r.error
+    # A wrong last repetition too; three right ones pass, with every run recorded.
+    assert not bench.measure(corpus, _fake_codec(bench, tmp_path, [3]), work, 3, 60).verified
+    ok = bench.measure(corpus, _fake_codec(bench, tmp_path, []), work, 3, 60)
+    assert ok.verified and not ok.error and len(ok.compress_runs) == 3 and ok.packed_bytes == src.stat().st_size
+
+
+def test_median_best_and_rss_units(bench, monkeypatch):
+    assert bench.median([3.0, 1.0, 2.0]) == 2.0 and bench.median([4.0, 1.0, 2.0, 3.0]) == 2.5
+    r = bench.Result("c", 10_000_000, "x", "x", compress_runs=[1.0, 4.0, 2.0], decompress_runs=[0.5, 0.5])
+    assert r.compress_mb_s == 5.0 and r.best_compress_mb_s == 10.0
+    monkeypatch.setattr(bench.sys, "platform", "darwin")
+    assert bench.max_rss_bytes(1 << 20) == 1 << 20  # macOS: bytes
+    monkeypatch.setattr(bench.sys, "platform", "linux")
+    assert bench.max_rss_bytes(1024) == 1 << 20  # Linux: KiB
+
+
+def test_synthetic_corpora_are_fixed(bench, tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    for name in bench.SYNTHETIC:
+        ca, cb = bench.build_corpus(name, a, None), bench.build_corpus(name, b, None)
+        ma, mb = bench.manifest_of(ca, a), bench.manifest_of(cb, b)
+        assert ma["sha256"] == mb["sha256"] == bench.SYNTHETIC_SHA256[name]
+        assert ma["files"] == mb["files"] and ma["bytes"] > 0
+    assert bench.build_corpus("synthetic-small", a, None).files == 300

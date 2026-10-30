@@ -41,16 +41,40 @@ struct ArchiveOptions {
   Language language = Language::generic;     // keyword table for tokenizing (compression only)
   aio::Options io{};                         // backend, queue depth, chunk size, O_DIRECT
   GlobalModelLimits model_limits{};
-  hc::u64 max_memory = hc::u64{1} << 30;     // decoder memory bound (DecodeLimits::max_memory_bytes)
-  // Token spool, removed afterwards. Empty: <archive>.spool for compress_file(),
-  // a unique file in the temporary directory for compress_stream().
+  // Decoder memory bound, in bytes. It covers the codec workers of each
+  // decoding phase together with what that phase keeps: while the model
+  // section decodes, its decoder plus the dictionary image (capped at half
+  // the budget); while the token stream decodes, its workers plus the parsed
+  // model and the 1 MiB output stage. A budget that cannot hold the parsed
+  // model fails with limit_memory before any source byte is written. Not
+  // covered: the brief overlap of the image and the parsed model while the
+  // model is parsed (at most the image size again plus 15 bytes per
+  // symbol), and the caller's own buffers.
+  hc::u64 max_memory = hc::u64{1} << 30;
+  // Largest source (decompressed) size accepted, in bytes. Checked against
+  // the archive header before anything is decoded: a larger archive fails
+  // with limit_output and writes nothing. The dictionary has its own bound,
+  // model_limits.max_dictionary_bytes.
+  hc::u64 max_output = ~hc::u64{0};
+  hc::u8 max_level = 255;  // decoding: archives of a higher level fail with limit_level, from the header
+  // The token spool (compression), removed afterwards. It is always created
+  // new and owner-only (0600): never over an existing file or through a
+  // symbolic link. `spool` names it exactly (it must not exist); otherwise a
+  // fresh name .hce-spool-<random>.tmp goes in `spool_dir`, or by default
+  // next to the archive for compress_file() and in the temporary directory
+  // for compress_stream(). Both passes check they read the file they wrote.
   std::filesystem::path spool;
+  std::filesystem::path spool_dir;
   std::stop_token stop;                      // cancellation: every stage stops with Errc::cancelled
 };
 
 struct ArchiveStats {
   hc::Errc status = hc::Errc::ok;
-  const char* stage = "";  // where it failed: open, read, spool, pass1, model, pass2, write, header, decode, verify, finish
+  // Where it failed: open, alias (the file functions' source and destination
+  // are one file), read, spool, pass1, model, pass2, write, header, decode,
+  // verify, finish, or sync-dir: the file functions published the output but
+  // could not sync its directory, so it may not survive a crash; it is kept.
+  const char* stage = "";
   int sys_error = 0;
   hc::u64 source_bytes = 0, tokens = 0, symbols = 0, dictionary_bytes = 0;
   hc::u64 spool_bytes = 0, model_bytes = 0, stream_bytes = 0, archive_bytes = 0;
@@ -67,8 +91,12 @@ struct ArchiveStats {
 ArchiveStats compress_stream(InputStream& source, OutputStream& archive, const ArchiveOptions& opt = {});
 ArchiveStats decompress_stream(InputStream& archive, OutputStream& source, const ArchiveOptions& opt = {});
 
-// Files, through aio at both ends. decompress_file() removes its output on
-// failure: nothing unverified is left behind.
+// Files, through aio at both ends. The output is written to a temporary file
+// beside it and renamed over `archive` / `output` only once complete and, for
+// decompression, verified: on any failure, cancellation included, an existing
+// destination keeps its content and only the temporary file is removed. A
+// source and destination that are the same file (hard or symbolic links
+// included) fail with stage "alias" before anything is written.
 ArchiveStats compress_file(const std::filesystem::path& source, const std::filesystem::path& archive,
                            const ArchiveOptions& opt = {});
 ArchiveStats decompress_file(const std::filesystem::path& archive, const std::filesystem::path& output,
@@ -78,12 +106,15 @@ ArchiveStats decompress_file(const std::filesystem::path& archive, const std::fi
 bool is_archive(hc::Bytes prefix) noexcept;
 
 // The first two stages on their own. The spool is a sequence of records
-// [u32 LE length][HST1 image], one per tokenize() call.
+// [u32 LE length][HST1 image], one per tokenize() call. write_token_spool()
+// creates `spool` new and owner-only (an existing name fails with io_error,
+// EEXIST) and removes it again if spooling fails. build_global_model() with
+// `expect` fails with content_mismatch unless `spool` is still that file.
 ArchiveStats write_token_spool(InputStream& source, const std::filesystem::path& spool, const ArchiveOptions& opt,
                                hc::u32& source_crc);
 ArchiveStats write_token_spool(const std::filesystem::path& source, const std::filesystem::path& spool,
                                const ArchiveOptions& opt, hc::u32& source_crc);
 hc::Errc build_global_model(const std::filesystem::path& spool, const ArchiveOptions& opt, GlobalModel& out,
-                            hc::u64* tokens = nullptr);
+                            hc::u64* tokens = nullptr, const aio::FileId* expect = nullptr);
 
 }  // namespace hce::structural

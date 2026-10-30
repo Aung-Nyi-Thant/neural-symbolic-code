@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import errno
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -161,3 +163,117 @@ def test_decompress_file_memory_limit(tmp_path, source_file):
     with pytest.raises(hce.LimitExceededError):
         hce.decompress_file(packed, tmp_path / "restored", max_memory=16 << 20)
     assert not (tmp_path / "restored").exists()
+
+
+# ------------------------------------------------- transactional outputs ---
+
+
+@pytest.mark.parametrize("structural", [False, True])
+def test_failed_decompress_keeps_existing_destination(tmp_path, source_file, structural):
+    packed, dest = tmp_path / "packed", tmp_path / "dest"
+    hce.compress_file(source_file, packed, structural=structural)
+    damaged = bytearray(packed.read_bytes())
+    damaged[len(damaged) // 2] ^= 0x10
+    (tmp_path / "bad").write_bytes(bytes(damaged))
+    (tmp_path / "short").write_bytes(packed.read_bytes()[:-9])
+    dest.write_bytes(b"PRECIOUS")
+    for bad in ("bad", "short"):
+        with pytest.raises(hce.CorruptInputError):
+            hce.decompress_file(tmp_path / bad, dest)
+        assert dest.read_bytes() == b"PRECIOUS"
+    with pytest.raises(hce.CorruptInputError):
+        hce.decompress_file(source_file, dest)  # not an archive
+    assert dest.read_bytes() == b"PRECIOUS"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bad", "dest", "module.py", "packed", "short"]
+
+
+@pytest.mark.parametrize("fn", ["compress_file", "decompress_file"])
+def test_same_file_is_refused(tmp_path, source_file, fn):
+    target = source_file
+    if fn == "decompress_file":
+        target = tmp_path / "packed"
+        hce.compress_file(source_file, target)
+    before = target.read_bytes()
+    aliases = [target, tmp_path / "." / target.name]
+    os.link(target, tmp_path / "hard")
+    aliases.append(tmp_path / "hard")
+    if hasattr(os, "symlink"):
+        os.symlink(target.name, tmp_path / "soft")
+        aliases.append(tmp_path / "soft")
+    for alias in aliases:
+        for structural in (False, True):
+            kwargs = {"structural": structural} if fn == "compress_file" else {}
+            with pytest.raises(ValueError, match="same file"):
+                getattr(hce, fn)(target, alias, **kwargs)
+            assert target.read_bytes() == before
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="no symbolic links")
+def test_symlink_destination_is_replaced_not_followed(tmp_path, source_file):
+    (tmp_path / "target").write_bytes(b"TARGET")
+    os.symlink("target", tmp_path / "link")
+    hce.compress_file(source_file, tmp_path / "link")
+    assert not (tmp_path / "link").is_symlink()
+    assert (tmp_path / "target").read_bytes() == b"TARGET"
+    assert hce.decompress(bytes((tmp_path / "link").read_bytes())) == source_file.read_bytes()
+
+
+def test_destination_keeps_permissions(tmp_path, source_file):
+    dest = tmp_path / "dest"
+    dest.write_bytes(b"x")
+    os.chmod(dest, 0o640)
+    hce.compress_file(source_file, dest)
+    assert dest.stat().st_mode & 0o777 == 0o640
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX resource limits")
+@pytest.mark.parametrize("fn, structural", [("compress_file", False), ("compress_file", True),
+                                            ("decompress_file", False), ("decompress_file", True)])
+def test_write_failure_keeps_existing_destination(tmp_path, source_file, fn, structural):
+    src = source_file
+    if fn == "decompress_file":
+        src = tmp_path / "packed"
+        hce.compress_file(source_file, src, structural=structural)
+    dest = tmp_path / "dest"
+    dest.write_bytes(b"PRECIOUS")
+    kwargs = "structural=True" if fn == "compress_file" and structural else ""
+    script = (
+        "import resource, signal, sys, hce\n"
+        "signal.signal(signal.SIGXFSZ, signal.SIG_IGN)\n"
+        "resource.setrlimit(resource.RLIMIT_FSIZE, (2048, 2048))\n"
+        "try:\n"
+        f"    hce.{fn}({str(src)!r}, {str(dest)!r}, {kwargs})\n"
+        "except hce.HceIOError as e:\n"
+        "    sys.exit(0 if e.errno else 3)\n"
+        "sys.exit(2)\n")
+    rc = subprocess.run([sys.executable, "-c", script], env=dict(os.environ)).returncode
+    assert rc == 0
+    assert dest.read_bytes() == b"PRECIOUS"
+    assert not [p for p in tmp_path.iterdir() if ".hce-" in p.name]
+
+
+# ----------------------------------------------------------- max_output ---
+
+
+@pytest.mark.parametrize("structural", [False, True])
+def test_max_output_boundaries(tmp_path, source_file, structural):
+    packed, dest = tmp_path / "packed", tmp_path / "dest"
+    hce.compress_file(source_file, packed, structural=structural)
+    size = source_file.stat().st_size
+    assert hce.decompress_file(packed, dest, max_output=size).output_bytes == size
+    dest.write_bytes(b"PRECIOUS")
+    with pytest.raises(hce.LimitExceededError) as info:
+        hce.decompress_file(packed, dest, max_output=size - 1)
+    assert info.value.code == "limit_output"
+    assert dest.read_bytes() == b"PRECIOUS"
+    data = packed.read_bytes()
+    assert len(hce.decompress(data, max_output=size)) == size
+    with pytest.raises(hce.LimitExceededError):
+        hce.decompress(data, max_output=10)
+
+
+@pytest.mark.parametrize("structural", [False, True])
+def test_max_output_empty(structural):
+    assert hce.decompress(hce.compress(b"", structural=structural), max_output=0) == b""
+    with pytest.raises(hce.LimitExceededError):
+        hce.decompress(hce.compress(b"x", structural=structural), max_output=0)

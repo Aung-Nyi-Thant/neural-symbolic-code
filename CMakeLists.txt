@@ -131,6 +131,7 @@ add_library(hce_aio STATIC
   aio/async_io.cpp
   aio/async_streams.cpp
   aio/native_file.cpp
+  aio/staged_file.cpp
   aio/thread_backend.cpp)
 target_link_libraries(hce_aio PUBLIC hce_core Threads::Threads PRIVATE hce_warnings)
 

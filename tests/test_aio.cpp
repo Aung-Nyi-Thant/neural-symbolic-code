@@ -2,6 +2,7 @@
 // here, the engines' contract, the stream adapters, and the unchanged
 // pipelines running on top of them.
 #include "aio/async_streams.hpp"
+#include "aio/staged_file.hpp"
 #include "codec/neural_cm_codec.hpp"
 #include "decoder/pipeline.hpp"
 #include "encoder/parallel.hpp"
@@ -15,7 +16,13 @@
 #include <iterator>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <sys/stat.h>
+#endif
 
 namespace fs = std::filesystem;
 namespace aio = hce::aio;
@@ -301,6 +308,124 @@ static void test_selection() {
   std::printf("  automatic backend here: %s\n", aio::to_string(automatic));
 }
 
+#if defined(_WIN32)
+constexpr int kExists = 80;          // ERROR_FILE_EXISTS
+constexpr int kNotSupported = 50;    // ERROR_NOT_SUPPORTED
+#else
+constexpr int kExists = EEXIST;
+constexpr int kNotSupported = ENOTSUP;
+#endif
+
+static int temp_files(const fs::path& dir) {
+  int n = 0;
+  for (const auto& e : fs::directory_iterator(dir))
+    if (e.path().filename().string().find(".hce-") != std::string::npos) ++n;
+  return n;
+}
+
+// Exclusive creation, close() errors and transactional publication.
+static void test_staged_output() {
+  const fs::path dir = g_dir / "staged";
+  fs::create_directories(dir);
+  const Vec data = log_text(300000, 21), old = random_bytes(5000, 22);
+  aio::OpenError err;
+
+  // Create::exclusive and exclusive_private never reuse a name.
+  write_plain(dir / "taken", old);
+  CHECK(!aio::AsyncFileOutput::create(dir / "taken", {}, &err, aio::Create::exclusive) && err.sys_error == kExists);
+  CHECK(read_plain(dir / "taken") == old);
+  {
+    auto out = aio::AsyncFileOutput::create(dir / "fresh", {}, &err, aio::Create::exclusive_private);
+    explain("create exclusive_private", err);
+    CHECK(out && out->write(data) && out->finish(true) == Errc::ok && out->close() == Errc::ok);
+    CHECK(out && out->close() == Errc::ok);  // once; later calls repeat the result
+  }
+  CHECK(read_plain(dir / "fresh") == data);
+#if !defined(_WIN32)
+  struct stat sb {};
+  CHECK(::stat((dir / "fresh").c_str(), &sb) == 0 && (sb.st_mode & 0777) == 0600);
+  fs::create_symlink("nowhere", dir / "dangling");
+  CHECK(!aio::AsyncFileOutput::create(dir / "dangling", {}, &err, aio::Create::exclusive) && err.sys_error == EEXIST);
+  CHECK(!fs::exists(dir / "nowhere"));
+#endif
+
+  // Nothing at the destination until commit(); then all of it, and no temporary file.
+  {
+    auto out = aio::StagedFileOutput::create(dir / "dest", {}, &err);
+    explain("StagedFileOutput::create", err);
+    CHECK(out && out->temp_path().parent_path() == dir && out->write(data));
+    CHECK(!fs::exists(dir / "dest") && temp_files(dir) == 1);
+    const aio::CommitResult c = out->commit();
+    CHECK(c.status == Errc::ok && c.published && read_plain(dir / "dest") == data && temp_files(dir) == 0);
+  }
+  // Discarded or abandoned output leaves the old destination.
+  write_plain(dir / "dest", old);
+  for (int abandon = 0; abandon < 2; ++abandon) {
+    auto out = aio::StagedFileOutput::create(dir / "dest", {}, &err);
+    CHECK(out && out->write(data));
+    if (!abandon) out->discard();
+    out.reset();
+    CHECK(read_plain(dir / "dest") == old && temp_files(dir) == 0);
+  }
+  // Publish::no_replace refuses an existing destination and keeps it.
+  {
+    auto out = aio::StagedFileOutput::create(dir / "dest", {}, &err);
+    CHECK(out && out->write(data));
+    const aio::CommitResult c = out->commit(aio::Publish::no_replace);
+    CHECK(c.status == Errc::io_error && c.sys_error == kExists && !c.published);
+    CHECK(read_plain(dir / "dest") == old && temp_files(dir) == 0);
+  }
+  // A directory is not a destination.
+  fs::create_directories(dir / "subdir");
+  CHECK(!aio::StagedFileOutput::create(dir / "subdir", {}, &err) && err.status == Errc::io_error);
+  CHECK(aio::same_file(dir / "dest", dir / "." / "dest") && !aio::same_file(dir / "dest", dir / "fresh"));
+  CHECK(!aio::same_file(dir / "dest", dir / "absent"));
+
+  // Racing no-replace publications: exactly one wins, whichever methods the file system has.
+  for (const unsigned methods : {aio::detail::kPublishAll, aio::detail::kPublishLink}) {
+#if defined(_WIN32)
+    if (methods == aio::detail::kPublishLink) continue;
+#endif
+    for (int round = 0; round < 20; ++round) {
+      const fs::path dest = dir / "race";
+      fs::remove(dest);
+      constexpr int kRacers = 6;
+      std::vector<fs::path> tmp(kRacers);
+      for (int i = 0; i < kRacers; ++i) {
+        tmp[static_cast<std::size_t>(i)] = dir / ("racer" + std::to_string(i));
+        write_plain(tmp[static_cast<std::size_t>(i)], random_bytes(1000, static_cast<std::uint32_t>(100 + i)));
+      }
+      std::vector<aio::CommitResult> r(kRacers);
+      std::vector<std::thread> threads;
+      for (int i = 0; i < kRacers; ++i)
+        threads.emplace_back([&, i] {
+          r[static_cast<std::size_t>(i)] =
+              aio::detail::publish_with(tmp[static_cast<std::size_t>(i)], dest, aio::Publish::no_replace, methods);
+        });
+      for (auto& t : threads) t.join();
+      int winners = 0, winner = -1;
+      for (int i = 0; i < kRacers; ++i) {
+        if (r[static_cast<std::size_t>(i)].published) {
+          ++winners;
+          winner = i;
+        } else {
+          CHECK(r[static_cast<std::size_t>(i)].sys_error == kExists);
+        }
+      }
+      CHECK(winners == 1);
+      if (winner >= 0) CHECK(read_plain(dest) == random_bytes(1000, static_cast<std::uint32_t>(100 + winner)));
+      for (const fs::path& t : tmp) fs::remove(t);
+    }
+  }
+  // Without an atomic no-replace method, publication fails and touches nothing:
+  // no check-then-rename fallback.
+  write_plain(dir / "lonely", data);
+  const aio::CommitResult none = aio::detail::publish_with(dir / "lonely", dir / "nobody", aio::Publish::no_replace, 0);
+  CHECK(none.status == Errc::io_error && none.sys_error == kNotSupported && !none.published);
+  CHECK(!fs::exists(dir / "nobody") && read_plain(dir / "lonely") == data);
+  fs::remove_all(dir);
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::random_device rd;
@@ -308,6 +433,8 @@ int main() {
   fs::create_directories(g_dir);
 
   test_selection();
+  test_staged_output();
+  std::printf("  exclusive creation, staged output and no-replace publication ok\n");
   for (const aio::Backend b : backends()) {
     test_engine_contract(b);
     test_stream_roundtrips(b);

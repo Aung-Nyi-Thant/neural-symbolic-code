@@ -41,6 +41,7 @@ class AsyncFileInput final : public InputStream {
   const char* backend() const noexcept { return io_->backend(); }
   bool direct() const noexcept { return io_->direct(); }
   u64 size() const noexcept { return size_; }
+  FileId file_id() const noexcept { return io_->file_id(); }
   int sys_error() const noexcept { return sys_error_; }
 
  private:
@@ -73,9 +74,10 @@ class AsyncFileInput final : public InputStream {
 
 class AsyncFileOutput final : public OutputStream {
  public:
-  // Creates or truncates `path`. nullptr on failure; `err` says why.
+  // Creates `path` as `how` says (default: create or truncate). nullptr on
+  // failure; `err` says why.
   static std::unique_ptr<AsyncFileOutput> create(const std::filesystem::path& path, const Options& opt = {},
-                                                 OpenError* err = nullptr);
+                                                 OpenError* err = nullptr, Create how = Create::truncate);
   AsyncFileOutput(const AsyncFileOutput&) = delete;
   AsyncFileOutput& operator=(const AsyncFileOutput&) = delete;
   // Does not flush: output nobody finish()ed is incomplete by definition.
@@ -88,6 +90,10 @@ class AsyncFileOutput final : public OutputStream {
   // Writes the partial chunk, waits for every write and, with `durable`, makes
   // the data reach stable storage. Call once, after the last write().
   Errc finish(bool durable = true) noexcept;
+  // After finish(): closes the file, failing with io_error when close()
+  // reports an error (late write errors on NFS, for one). Once.
+  Errc close() noexcept;
+  FileId file_id() const noexcept { return io_->file_id(); }
 
   const char* backend() const noexcept { return io_->backend(); }
   Errc error() const noexcept { return error_; }
@@ -117,6 +123,7 @@ class AsyncFileOutput final : public OutputStream {
   unsigned in_flight_ = 0;
   bool synced_ = false;
   bool finished_ = false;
+  bool closed_ = false;
   Errc error_ = Errc::ok;
   int sys_error_ = 0;
   std::atomic<bool> interrupted_{false};

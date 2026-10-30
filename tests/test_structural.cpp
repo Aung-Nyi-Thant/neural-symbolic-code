@@ -20,7 +20,15 @@
 #include <iterator>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 namespace aio = hce::aio;
@@ -479,6 +487,242 @@ static void test_archives() {
   CHECK(st::compress_file(g_dir / "missing.txt", g_dir / "m.hcs", o).status == Errc::io_error);
 }
 
+// Files in `dir` whose names start with `prefix`: temporary and spool files left behind.
+static int leftovers(const fs::path& dir, const std::string& prefix) {
+  int n = 0;
+  for (const auto& e : fs::directory_iterator(dir))
+    if (e.path().filename().string().rfind(prefix, 0) == 0) ++n;
+  return n;
+}
+
+// Transactional file output: a destination changes only when the new content
+// is complete and verified; failures, cancellation and aliases leave it alone.
+static void test_file_safety() {
+  const fs::path dir = g_dir / "safety";
+  fs::create_directories(dir);
+  const fs::path src = dir / "src.py", arc = dir / "src.hcs", dst = dir / "dst.txt";
+  const std::string code = corpus().substr(0, 200000);
+  write_text(src, code);
+  st::ArchiveOptions o;
+  o.frame_tokens = 16384;
+  CHECK(st::compress_file(src, arc, o).status == Errc::ok);
+  const std::string good = read_text(arc);
+
+  // A corrupt archive over an existing destination: the destination survives.
+  std::string bad = good;
+  bad[bad.size() / 2] = static_cast<char>(bad[bad.size() / 2] ^ 0x10);
+  write_text(dir / "bad.hcs", bad);
+  write_text(dst, "PRECIOUS");
+  st::ArchiveStats d = st::decompress_file(dir / "bad.hcs", dst, o);
+  CHECK(d.status != Errc::ok && read_text(dst) == "PRECIOUS");
+  // Not an archive at all, and a truncated one: the same.
+  CHECK(st::decompress_file(src, dst, o).status == Errc::bad_magic && read_text(dst) == "PRECIOUS");
+  write_text(dir / "short.hcs", good.substr(0, good.size() - 7));
+  CHECK(st::decompress_file(dir / "short.hcs", dst, o).status != Errc::ok && read_text(dst) == "PRECIOUS");
+
+  // Cancellation, compressing and decompressing, over existing files.
+  std::stop_source stop;
+  stop.request_stop();
+  st::ArchiveOptions co = o;
+  co.stop = stop.get_token();
+  write_text(dir / "old.hcs", "OLD ARCHIVE");
+  CHECK(st::compress_file(src, dir / "old.hcs", co).status == Errc::cancelled && read_text(dir / "old.hcs") == "OLD ARCHIVE");
+  CHECK(st::decompress_file(arc, dst, co).status == Errc::cancelled && read_text(dst) == "PRECIOUS");
+
+  // Success replaces the destination; nothing temporary is left anywhere.
+  CHECK(st::decompress_file(arc, dst, o).status == Errc::ok && read_text(dst) == code);
+  CHECK(leftovers(dir, ".") == 0);
+
+  // Aliases: the same path, a hard link, a symbolic link. Refused before anything is written.
+  CHECK(st::compress_file(src, src, o).stage == std::string("alias") && read_text(src) == code);
+  CHECK(st::decompress_file(arc, arc, o).stage == std::string("alias") && read_text(arc) == good);
+  std::error_code ec;
+  fs::create_hard_link(arc, dir / "arc-link.hcs", ec);
+  if (!ec) {
+    CHECK(st::decompress_file(arc, dir / "arc-link.hcs", o).stage == std::string("alias") && read_text(arc) == good);
+    fs::remove(dir / "arc-link.hcs");
+  }
+#if !defined(_WIN32)
+  fs::create_symlink(src.filename(), dir / "src-link.py");
+  CHECK(st::compress_file(src, dir / "src-link.py", o).stage == std::string("alias") && read_text(src) == code);
+  // A symbolic link to another file is replaced, never written through.
+  write_text(dir / "target.txt", "TARGET");
+  fs::remove(dir / "src-link.py");
+  fs::create_symlink("target.txt", dir / "out-link.txt");
+  CHECK(st::decompress_file(arc, dir / "out-link.txt", o).status == Errc::ok);
+  CHECK(!fs::is_symlink(dir / "out-link.txt") && read_text(dir / "out-link.txt") == code);
+  CHECK(read_text(dir / "target.txt") == "TARGET");
+  // A replaced file keeps its permission bits.
+  ::chmod(dst.c_str(), 0640);
+  CHECK(st::decompress_file(arc, dst, o).status == Errc::ok);
+  struct stat sb {};
+  CHECK(::stat(dst.c_str(), &sb) == 0 && (sb.st_mode & 0777) == 0640);
+
+  // A write that fails (the file size limit) leaves the old destination.
+  write_text(dst, "PRECIOUS");
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    ::signal(SIGXFSZ, SIG_IGN);
+    const rlimit lim{4096, 4096};
+    ::setrlimit(RLIMIT_FSIZE, &lim);
+    const st::ArchiveStats r = st::decompress_file(arc, dst, o);
+    ::_exit(r.status == Errc::io_error ? 0 : 1);
+  }
+  int status = -1;
+  ::waitpid(pid, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  CHECK(read_text(dst) == "PRECIOUS");
+#endif
+  CHECK(leftovers(dir, ".") == 0);
+  // A directory as the destination: refused, untouched.
+  fs::create_directories(dir / "sub");
+  CHECK(st::decompress_file(arc, dir / "sub", o).status == Errc::io_error && fs::is_directory(dir / "sub"));
+  fs::remove_all(dir);
+}
+
+// The token spool: always a new owner-only file, never shared, never through
+// a link, removed only when this run created it.
+static void test_spool_safety() {
+  const fs::path dir = g_dir / "spool";
+  fs::create_directories(dir);
+  const fs::path src = dir / "src.c", arc = dir / "src.hcs";
+  const std::string code = corpus().substr(0, 120000);
+  write_text(src, code);
+  st::ArchiveOptions o;
+  o.frame_tokens = 16384;
+
+  // An explicit spool path that exists is refused and kept as it was.
+  write_text(dir / "taken.spool", "MINE");
+  o.spool = dir / "taken.spool";
+  st::ArchiveStats c = st::compress_file(src, arc, o);
+  CHECK(c.status == Errc::io_error && std::string(c.stage) == "spool");
+  CHECK(read_text(dir / "taken.spool") == "MINE" && !fs::exists(arc));
+#if !defined(_WIN32)
+  // The same through a symbolic link, dangling or not: the target is untouched.
+  fs::create_symlink("victim.txt", dir / "link.spool");
+  write_text(dir / "victim.txt", "VICTIM");
+  o.spool = dir / "link.spool";
+  CHECK(st::compress_file(src, arc, o).status == Errc::io_error && read_text(dir / "victim.txt") == "VICTIM");
+  CHECK(fs::is_symlink(dir / "link.spool"));
+  fs::remove(dir / "victim.txt");
+  CHECK(st::compress_file(src, arc, o).status == Errc::io_error && !fs::exists(dir / "victim.txt"));
+  fs::remove(dir / "link.spool");
+  // The old default name, <archive>.spool, is no longer used: a file there stays.
+  o.spool.clear();
+  fs::create_symlink("victim.txt", fs::path(arc) += ".spool");
+  write_text(dir / "victim.txt", "VICTIM");
+  CHECK(st::compress_file(src, arc, o).status == Errc::ok && read_text(dir / "victim.txt") == "VICTIM");
+  CHECK(fs::is_symlink(fs::path(arc) += ".spool"));
+  fs::remove(fs::path(arc) += ".spool");
+  // write_token_spool() makes it owner-only.
+  hc::u32 crc = 0;
+  CHECK(st::write_token_spool(src, dir / "own.spool", o, crc).status == Errc::ok);
+  struct stat sb {};
+  CHECK(::stat((dir / "own.spool").c_str(), &sb) == 0 && (sb.st_mode & 0777) == 0600);
+  // Pass 1 refuses a spool that is not the file it was told about.
+  st::GlobalModel m;
+  const aio::FileId other{1, 2};
+  CHECK(st::build_global_model(dir / "own.spool", o, m, nullptr, &other) == Errc::content_mismatch);
+  fs::remove(dir / "own.spool");
+#endif
+  o.spool.clear();
+  const std::string reference = (st::compress_file(src, arc, o).status == Errc::ok) ? read_text(arc) : "";
+  CHECK(!reference.empty());
+
+  // Concurrent runs sharing a spool directory each get their own spool.
+  o.spool_dir = dir;
+  std::vector<std::thread> runs;
+  std::vector<st::ArchiveStats> results(4);
+  for (int i = 0; i < 4; ++i)
+    runs.emplace_back([&, i] { results[static_cast<std::size_t>(i)] = st::compress_file(src, dir / ("c" + std::to_string(i) + ".hcs"), o); });
+  for (auto& t : runs) t.join();
+  for (int i = 0; i < 4; ++i) {
+    CHECK(results[static_cast<std::size_t>(i)].status == Errc::ok);
+    CHECK(read_text(dir / ("c" + std::to_string(i) + ".hcs")) == reference);
+  }
+  // Failure and cancellation remove the spool they made, and nothing else.
+  std::stop_source stop;
+  stop.request_stop();
+  st::ArchiveOptions co = o;
+  co.stop = stop.get_token();
+  CHECK(st::compress_file(src, dir / "cancel.hcs", co).status == Errc::cancelled);
+  CHECK(st::compress_file(dir / "missing.c", dir / "missing.hcs", o).status == Errc::io_error);
+  CHECK(leftovers(dir, ".hce-spool-") == 0 && leftovers(dir, ".") == 0 && read_text(dir / "taken.spool") == "MINE");
+  fs::remove_all(dir);
+}
+
+// Decoder limits: the source size against max_output before any decoding;
+// the parsed dictionary and the output stage against max_memory.
+static void test_decode_limits() {
+  for (const std::string& s : {corpus().substr(0, 100000), std::string()}) {
+    hce::MemoryInput in(Bytes(reinterpret_cast<const std::byte*>(s.data()), s.size()));
+    hce::MemoryOutput arc;
+    st::ArchiveOptions o;
+    o.frame_tokens = 16384;
+    CHECK(st::compress_stream(in, arc, o).status == Errc::ok);
+    for (const u64 limit : {u64{s.size()}, u64{s.size()} + 1, u64{s.size()} - 1}) {
+      if (s.empty() && limit != 0) continue;
+      st::ArchiveOptions d = o;
+      d.max_output = limit;
+      hce::MemoryInput ain(arc.data);
+      hce::MemoryOutput back;
+      const st::ArchiveStats r = st::decompress_stream(ain, back, d);
+      if (limit >= s.size()) {
+        CHECK(r.status == Errc::ok && back.data.size() == s.size());
+      } else {
+        CHECK(r.status == Errc::limit_output && std::string(r.stage) == "header" && back.data.empty());
+      }
+    }
+  }
+
+  // A large dictionary: 300,000 distinct identifiers, about 3.6 MB of values.
+  std::string big;
+  for (u32 i = 0; i < 300000; ++i) big += "identifier_" + std::to_string(i * 2654435761u) + " = " + std::to_string(i) + ";\n";
+  hce::MemoryInput in(Bytes(reinterpret_cast<const std::byte*>(big.data()), big.size()));
+  hce::MemoryOutput arc;
+  st::ArchiveOptions o;
+  o.level = 1;
+  o.threads = 4;
+  const st::ArchiveStats c = st::compress_stream(in, arc, o);
+  CHECK(c.status == Errc::ok && c.symbols > 300000);
+  // A budget the retained model does not fit in fails before writing a byte;
+  // the old decoder gave each phase the whole budget and accepted it.
+  st::ArchiveOptions d = o;
+  d.max_memory = c.dictionary_bytes + (u64{1} << 20);
+  hce::MemoryInput ain(arc.data);
+  hce::MemoryOutput back;
+  st::ArchiveStats r = st::decompress_stream(ain, back, d);
+  CHECK(r.status == Errc::limit_memory && back.data.empty());
+  d.max_memory = u64{1} << 30;
+  hce::MemoryInput ain2(arc.data);
+  r = st::decompress_stream(ain2, back, d);
+  CHECK(r.status == Errc::ok && back.data.size() == big.size());
+#if defined(__linux__)
+  // Peak memory of a 4-worker decode stays within its budget (plus the
+  // archive and output buffers this test holds, and allocator slack).
+  const u64 budget = u64{96} << 20;
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    rusage before {}, after {};
+    ::getrusage(RUSAGE_SELF, &before);
+    st::ArchiveOptions b = o;
+    b.max_memory = budget;
+    hce::MemoryInput bin(arc.data);
+    hce::NullOutput sink;
+    const st::ArchiveStats br = st::decompress_stream(bin, sink, b);
+    ::getrusage(RUSAGE_SELF, &after);
+    const u64 grew = static_cast<u64>(after.ru_maxrss - before.ru_maxrss) << 10;
+    std::printf("  4-worker decode, %llu symbols, budget %llu MiB: %s, peak grew %.1f MiB\n",
+                static_cast<unsigned long long>(c.symbols), static_cast<unsigned long long>(budget >> 20),
+                hc::to_string(br.status), static_cast<double>(grew) / (1 << 20));
+    ::_exit(br.status == Errc::ok && grew <= budget + (u64{16} << 20) ? 0 : 1);
+  }
+  int status = -1;
+  ::waitpid(pid, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+#endif
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::random_device rd;
@@ -493,6 +737,10 @@ int main() {
   test_global_model();
   test_codec();
   test_archives();
+  test_file_safety();
+  test_spool_safety();
+  test_decode_limits();
+  std::printf("  file safety, spool safety and decoder limits ok\n");
 
   if (g_failures) {
     std::printf("%d check(s) failed (files kept in %s)\n", g_failures, g_dir.string().c_str());

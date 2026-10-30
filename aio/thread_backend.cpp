@@ -9,6 +9,7 @@
 #include "aio/backends.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <condition_variable>
 #include <mutex>
 #include <stop_token>
@@ -41,6 +42,9 @@ class ThreadEngine {
 
   unsigned depth() const noexcept { return depth_; }
   const NativeFile& file() const noexcept { return file_; }
+  // Workers touch the file only while they run an operation: with none
+  // outstanding, it is the driving thread's to close.
+  int close_file() noexcept { return outstanding_ == 0 ? file_.close() : EBUSY; }
   void register_buffers(std::span<const MutBytes>) noexcept {}
 
   Errc queue(const Op& op) noexcept {

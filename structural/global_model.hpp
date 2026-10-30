@@ -72,6 +72,12 @@ class GlobalModel {
   std::uint8_t traits(hc::u32 id) const noexcept { return traits_[id]; }
   std::uint8_t indent(hc::u32 id) const noexcept { return indent_[id]; }  // INDENTATION width, at most 255
   hc::u64 dictionary_bytes() const noexcept { return blob_.size(); }
+  // Heap bytes the model holds: values, offsets, per-symbol tables (and the
+  // encoder index's entries, without the hash table's own overhead).
+  hc::u64 memory_bytes() const noexcept {
+    return blob_.capacity() + offsets_.capacity() * sizeof(hc::u64) + types_.capacity() + traits_.capacity() +
+           indent_.capacity() + succ_.capacity() * sizeof(hc::u32) + index_.size() * (sizeof(Key) + 2 * sizeof(void*));
+  }
 
   // Encoder side: the ID of (type, value), or kNoSymbol. Only models built by
   // GlobalModelBuilder::freeze() carry the index; parsed models do not.

@@ -40,7 +40,8 @@ else()
   target_compile_options(ultracodec PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion)
 endif()
 
-# File tool: ultra c|d|i ...
+# File tool: ultra c|d|i ... (tools/tool_util.hpp: argument parsing, checked
+# and transactional file I/O, shared with ultra_bench and tests/test_tools.cpp)
 add_executable(ultra tools/ultra_cli.cpp)
 target_link_libraries(ultra PRIVATE ultracodec ${ULTRA_WARNINGS})
 
@@ -56,6 +57,13 @@ if(ULTRA_BUILD_TESTS)
   target_link_libraries(test_ultracodec PRIVATE ultracodec ${ULTRA_WARNINGS})
   target_include_directories(test_ultracodec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME ultracodec COMMAND test_ultracodec)
+  add_executable(test_ultra_tools tests/test_tools.cpp)
+  target_link_libraries(test_ultra_tools PRIVATE ultracodec ${ULTRA_WARNINGS})
+  if(CMAKE_CROSSCOMPILING)  # the tool itself runs only natively
+    add_test(NAME ultracodec_tools COMMAND test_ultra_tools)
+  else()
+    add_test(NAME ultracodec_tools COMMAND test_ultra_tools $<TARGET_FILE:ultra>)
+  endif()
   set(ULTRA_TEST_ENV
     "ASAN_OPTIONS=exitcode=86:detect_leaks=1"
     "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1:exitcode=87"
@@ -66,5 +74,5 @@ if(ULTRA_BUILD_TESTS)
   if(WIN32 AND CMAKE_CROSSCOMPILING)
     list(APPEND ULTRA_TEST_ENV "WINEDEBUG=-all")
   endif()
-  set_tests_properties(ultracodec PROPERTIES TIMEOUT 3600 ENVIRONMENT "${ULTRA_TEST_ENV}")
+  set_tests_properties(ultracodec ultracodec_tools PROPERTIES TIMEOUT 3600 ENVIRONMENT "${ULTRA_TEST_ENV}")
 endif()

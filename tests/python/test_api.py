@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import array
 import dataclasses
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -115,6 +117,40 @@ def test_default_max_memory():
 )
 def test_detect_format_magic(data, expected):
     assert hce.detect_format(data) == expected
+
+
+@pytest.mark.parametrize("make", [bytes, bytearray, memoryview, lambda b: array.array("B", b),
+                                  lambda b: memoryview(bytearray(b))[0:len(b)]])
+def test_detect_format_buffer_types(make):
+    assert hce.detect_format(make(b"HCS1" + bytes(50))) == "structural"
+    assert hce.detect_format(make(b"\x89HCZ")) == "framed"
+    assert hce.detect_format(make(b"HC")) is None
+
+
+def test_detect_format_multi_byte_items():
+    assert hce.detect_format(array.array("I", [int.from_bytes(b"HCS1", "little"), 7])) == "structural"
+
+
+def test_detect_format_rejects_non_contiguous():
+    with pytest.raises(ValueError, match="contiguous"):
+        hce.detect_format(memoryview(b"HHCCSS11")[::2])
+    with pytest.raises(TypeError):
+        hce.detect_format("HCS1")  # type: ignore[arg-type]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="getrusage")
+def test_detect_format_reads_only_the_prefix():
+    # Peak memory must not grow by the buffer's size: only four bytes are copied.
+    script = (
+        "import resource, hce\n"
+        "data = bytearray(256 << 20); data[:4] = b'HCS1'\n"
+        "before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "assert hce.detect_format(data) == 'structural'\n"
+        "after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "scale = 1 if __import__('sys').platform == 'darwin' else 1024\n"
+        "print((after - before) * scale)\n")
+    grew = int(subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout)
+    assert grew < 32 << 20
 
 
 def test_detect_format_on_real_output():
