@@ -16,7 +16,7 @@ zero sanitizer findings across GCC and Clang
 [![CMake](https://img.shields.io/badge/CMake-%E2%89%A5%203.20-064F8C?logo=cmake&logoColor=white)](#quick-start)
 [![Python](https://img.shields.io/badge/Python-3.10%E2%80%933.13-3776AB?logo=python&logoColor=white)](#python-package)
 
-[Overview](#overview) · [Architecture](#architecture) · [Hardening](#hardening-and-security-r11r21) ·
+[Overview](#overview) · [ultracodec](#ultracodec-the-4-tier-engine) · [Architecture](#architecture) · [Hardening](#hardening-and-security-r11r21) ·
 [Quality](#quality-assurance) · [Benchmarks](#performance-and-benchmarks) · [Quick start](#quick-start) ·
 [Python](#python-package) · [Tooling](#tooling-and-automation) · [License](#license)
 
@@ -30,6 +30,10 @@ HCE is a C++20 compression engine built for data that must be **small, verifiabl
 log archives, backups, data-lake cold tiers and bandwidth-bound transfers. It pairs a real
 **neural-symbolic context-mixing (CM) codec** with **Container v3 FRAMED**, a streaming format engineered
 for hostile input, partial damage and parallelism.
+
+The repository also ships [**ultracodec**](#ultracodec-the-4-tier-engine), a separate 4-tier engine that spans
+LZ77 speed (Tier 1, 606–626 MB/s on 4 threads) to CM density (Tier 4, 28.7% smaller than `zstd -19` on
+text and code). Its measured throughput, memory bounds and audit results are below.
 
 | Pillar | What it means |
 |---|---|
@@ -45,6 +49,152 @@ for hostile input, partial damage and parallelism.
 > Every 2.0 and 2.1 stream decodes unchanged.
 > Streams from 1.x, written by the retired LZ stand-in codec, are rejected as unsupported (exit 5),
 > never misdecoded.
+
+---
+
+## ultracodec: the 4-tier engine
+
+[`ultracodec/`](ultracodec/README.md) is a second, independent engine in this repository (C++20, no code
+shared with the HCE codec). One `ICompressionEngine` interface fronts four strategies, from an LZ77 tier
+that runs at hundreds of MB/s to a 22-context CM tier that beats `zstd -19` by 28.7%. Every tier
+round-trips, every archive is byte-identical for any thread count and on x86-64 (SSE2/AVX2) and AArch64
+(NEON), and the decoder validates every length before it allocates.
+
+> [!NOTE]
+> **Every number in this section was measured.** Where a metric has not been measured for the current
+> default build, the cell says so. Measurements come from three corpora on 4-vCPU cloud VMs, so read each
+> tier's row against its own corpus (listed under [How these numbers were measured](#how-these-numbers-were-measured)).
+> Timing on these VMs varies by about ±20% from run to run; ranges show the spread across sessions.
+
+### Tier specification
+
+| Tier | Name | Pipeline (default build on `main`) | Block | Memory model |
+|---|---|---|---|---|
+| 1 | Hyper-Speed | Greedy two-hash LZ77 (8-byte 2¹⁷ + 5-byte 2¹⁶ hashes, repeat offsets), entropy-coded sequences via rANS. Raw LZ4-layout mode still available (`tier1_entropy = false`) | 1 MiB | 256–768 KiB of hash tables per thread (L2-resident) |
+| 2 | Consumer | Gated word-dictionary pre-filter → lazy hash-chain LZ77 → 8-way interleaved static rANS (AVX2 / NEON decode), literals in 16 context streams | 2 MiB | ~30 MiB per thread (computed: 1 MiB head + 4 B chain per position) |
+| 3 | Balanced | Long-range dedup pass → wavefront-primed blocks → lean CM with **16-bit counters** → **one rANS stream per 64 KiB** | 1 MiB + 64 KiB prefix | 16 MiB table per worker; 512 MiB default budget |
+| 4 | Enterprise SWS | 256 KiB built-in primer + block 0 train one model; every later block starts from a **packed snapshot** of it. 22-context CM in the **Rebalanced** layout, 4 **int16** mixer sets, 4 APMs, binary range coder | 2 MiB | ~159 MiB per worker model + ~61 MiB packed snapshot; 900 MiB default budget |
+
+### Performance floor (current defaults on `main`)
+
+Size is the sum of per-file archives against the sum of per-file `zstd -19` archives. Negative = smaller
+than `zstd -19`.
+
+| Tier | Reference corpus | vs `zstd -19` | 1 thread comp / dec (MB/s) | 4 threads comp / dec (MB/s) | Peak RSS, 4 threads |
+|---|---|---:|---:|---:|---:|
+| 1 | Mixed 26.97 MB | **+33.5%** | 160–168 / 310–356 | 606–626 / 866–937 (concatenation) | not measured for entropy mode (raw mode: 152 MiB) |
+| 2 | Mixed 26.4 MB | **+8.6%** | 24–26 / 270–279 | 32–52 / 490–570 | not re-measured since the word filter (177 MiB before it) |
+| 3 | Text/code 22.8 MB | **−13.6%** | not measured for the compact format | 4.45 / 5.18 (concatenation) | **213.1 MiB** (131.1 MiB on 1 thread) |
+| 4 | Text/code 22.8 MB | **−28.7%** (−26.9% as one archive) | not measured since the memory pass | 0.52–0.74 / 0.51–0.76 (concatenation); 0.25–0.26 per file | **788.1 MiB** (750.3 / 764.2 MiB comp / dec, concatenation only) |
+
+Density on the other corpora, for the same tiers:
+
+| Tier | Mixed corpus (with ELF binaries) | Text/code corpus |
+|---|---:|---:|
+| 1 | +33.5% (26.97 MB) | not measured |
+| 2 | +8.6% (26.4 MB); per file: bin +10.2%, novel +1.7%, Perl +8.5%, Python +8.7%, XML +17.8% | not measured |
+| 3 | −10.4% (26.4 MB, measured before the compact format, which changes size by −0.003%) | −13.6% |
+| 4 | −24.0% (26.97 MB, measured on the PR #10 build: Balanced layout, int32 mixer) | −28.7%; per file (PR #8 build): Python −30.8%, Perl −29.5%, XML −29.3%, novels −26.6% |
+
+```mermaid
+xychart-beta
+    title "Size vs zstd -19, % (each tier on its reference corpus; lower is better)"
+    x-axis ["Tier 1", "Tier 2", "Tier 3", "Tier 4"]
+    y-axis "% vs zstd -19" -35 --> 40
+    bar [33.5, 8.6, -13.6, -28.7]
+```
+
+**Against peers (one thread, 26.4 MB mixed corpus, Tiers 1 and 2):** Tier 2 at +8.6% and 24–26 MB/s is
+denser than `zstd -12` (+10%, 18 MB/s) and `brotli -6` (+11%, 27 MB/s). No measured LZ codec reaches
+`zstd -19` size above about 2.5 MB/s per core (`zstd -18`: +0.3% at 2.4 MB/s). Tier 1's entropy mode is as
+dense as `zstd -2` (+34.7%) and 1.5× slower to compress.
+
+### Memory bounds
+
+Peak RSS ceilings are enforced by the test suite (`test_rss_limits`), which runs each tier in a forked child and reads
+`ru_maxrss` (Linux release builds; skipped under sanitizers). The inputs are counted in the RSS.
+
+| Tier | Test input | Test ceiling | Measured (2026-10-30, `main`, x86 VM) | Default model budget |
+|---|---:|---:|---:|---:|
+| 1 | 32 MiB | 160 MiB | 139 MiB | n/a |
+| 2 | 32 MiB | 256 MiB | 144 MiB | n/a |
+| 3 | 4 MiB | 256 MiB | 130 MiB | 512 MiB |
+| 4 | 4 MiB (snapshot + one worker) | 640 MiB | 263 MiB | 900 MiB |
+
+`memory_budget` caps the worker count, never the model size, so archives do not depend on how many workers
+run. Tier 4 picks its table layout (Rebalanced, else Lean, else Small) as the first whose snapshot plus four
+workers fits the budget, independent of the thread count.
+
+### Memory audit results (PRs #11–#13)
+
+The 2026-10-27 audit inventoried every allocation in all four tiers. It found no pointers or padding in any
+table to strip. The waste was RAM given to contexts that could not use it, a match table 82–92% empty, a
+full snapshot kept resident only to be copied, and 32-bit Tier 3 counters that only needed 16 bits. Each
+change shipped behind a `model_param` salt or flag, so every older archive still decodes.
+
+All rows: 22.8 MB text/code corpus, x86 VM, 4 threads.
+
+| Step | PR | Size: sum of files | Concatenation | Peak RSS | Speed (concatenation) |
+|---|:---:|---:|---:|---:|---:|
+| **Tier 4** before (Balanced layout, unpacked snapshot) | #10 | 2,990,482 | 3,071,982 | 883.6 MiB | 0.71–0.76 MB/s comp |
+| + Rebalanced layout, packed snapshot (T4-A, T4-C) | #11 | 2,983,124 (−0.25%) | 3,063,104 (−0.29%) | 794.4 MiB | same within noise |
+| + int16 mixer weights (T4-D) | #12 | 2,986,164 (+0.10%) | 3,065,845 (+0.09%) | 788.1 MiB | +8% comp and dec (8 interleaved runs) |
+| Lean layout instead (T4-A′, `tier4_tables = 5`) | #11 | 2,992,783 (+0.08% vs #10) | 3,074,208 | 638.9 MiB | same within noise |
+| **Tier 3** before (32-bit counters, one rANS stream per block) | #10 | 3,621,559 | 3,620,815 | 397.8 MiB | 4.39 / 4.80 MB/s |
+| Compact format (T3-A, T3-B) | #13 | 3,621,491 (−0.002%) | 3,620,697 (−0.003%) | **213.1 MiB** (−46 MiB per worker) | 4.45 / 5.18 MB/s |
+
+The 788.1 MiB row comes from the phase 4 gate run of the default build; the other RSS figures are from each
+PR's own run.
+
+```mermaid
+xychart-beta
+    title "Peak RSS at 4 threads, MiB (22.8 MB text/code corpus)"
+    x-axis ["T4 before", "T4 #11", "T4 #12", "T4 Lean", "T3 before", "T3 #13"]
+    y-axis "MiB" 0 --> 900
+    bar [883.6, 794.4, 788.1, 638.9, 397.8, 213.1]
+```
+
+### How the wins were achieved
+
+| Technique | Tier | Status | What it does | Measured effect |
+|---|:---:|---|---|---|
+| **Rebalanced context tables** (T4-A) | 4 | Merged, #11 (default) | The audit halved each context's table on its own and measured the size cost per MiB freed. Bits moved from contexts that do not use them (column −3 bits, indirect 1 −2, orders 2/16 and two others −1) to the starved ones (orders 3/4 +2 bits; order 5, word pair, 2 words + byte +1). Match table 2²² → 2²⁰ entries | −0.25% files / −0.29% concatenation at the same RAM per model |
+| Lean layout (T4-A′) | 4 | Merged, #11 (opt-in) | The shrinks only | −35 MiB per model, +0.08% size |
+| **Packed snapshot** (T4-C) | 4 | Merged, #11 (default) | After block 0, every large array is XORed with its initial value and stored per 64-byte chunk as a non-zero mask plus the non-zero bytes, in one exactly sized mapping. Workers expand it at each block start instead of a `memcpy` | Snapshot ~159 → ~61 MiB; expansion 60–75 ms per 2 MiB block (under 1% of block time); bit-exact |
+| **int16 mixer weights** (T4-D) | 4 | Merged, #12 (default) | Weights at 1.0 = 4096, saturating at ±8. A set's dot product is two `vpmaddwd` (AVX2) or four `smlal` (NEON); training rounds like `vpmulhrsw` / `sqrdmulh`. Scalar, AVX2 and NEON kernels give identical results | +8% comp and dec on 4 threads; +0.09–0.10% size; ~1 MiB less per model |
+| **16-bit counters** (T3-A) | 3 | Merged, #13 (default) | Hashed counters store `p12 << 4 \| n` (n ≤ 15). A nibble bucket is 32 bytes, so a two-way pair fits in one cache line instead of two; 16 MiB holds as many buckets as the old 32 MiB table | Part of the −46 MiB per worker below |
+| **Chunked rANS** (T3-B) | 3 | Merged, #13 (default) | One rANS stream per 64 KiB of the block. The reverse-coding record plus word buffer drops from 32 MiB to 2 MiB per 1 MiB block, for 12 bytes per stream | With T3-A: 397.8 → 213.1 MiB at 4 threads, −0.003% size |
+| Check bytes inside the bucket | 4 | Merged, #10 | A lookup reads one cache line instead of two (the separate tag array is gone) | +13% speed, byte-identical archives, ~10 MiB less per model |
+| Snapshot warm-start (SWS) | 4 | Merged, #8 | Later blocks start from a model trained on the primer and block 0, so they run in parallel without starting cold | Tier 4 study: −28.8% with 2 MiB SWS blocks vs −21.8% with cold 1 MiB blocks |
+| Shared history, copy-on-write (T4-F) | 4 | **Open, PR #15** | Primer + block 0 history mapped `MAP_PRIVATE` into each worker | −9.5 MiB peak PSS (−2.4 MiB per worker); RSS only −2.8 MiB; archives identical |
+| Tier 3 2 MiB blocks + 256 KiB prime | 3 | **Open, PR #14** | Longer blocks and prime in the compact format | −16.2% files / −15.5% concatenation at 5.03 / 5.51 MB/s, 217 MiB |
+| Compact path slots (T4-E) | 4 | **Dropped** (lab only) | 16-byte slot quarters holding one full slot or two 7-byte path entries | −0.41% size but −15 to −17% speed and +40 MiB RSS; missed its ≤8% speed gate |
+
+**What memory does not buy.** Doubling every Tier 4 table costs +124 MiB per model (about +620 MiB at
+4 threads) and returns −0.47%. One block dirties 99–100% of table pages, so copy-on-write or compressed
+working tables do not help; compression fits only the cold snapshot. Memory stalls are about 16% of Tier 4
+time, so the CM tiers are bound by instructions, and the next points of density have to come from more
+CPU per bit, not more RAM.
+
+### Targets that are not met
+
+| Tier | Target | Measured | Gap |
+|---|---|---|---|
+| 1 | 752 MB/s compress, 4 threads (entropy mode) | 606–626 MB/s | ~18% short |
+| 3 | ~11 MB/s, −17.2% vs `zstd -19` | 4.45 MB/s (4T); −13.6% text/code, −10.4% mixed | ~2.4× on speed; density short without PR #14 |
+| 4 | about −29% at about 2 MB/s | −28.7% per file; 0.52–0.74 MB/s on 4 x86 threads; 1.67 MB/s on 4 Apple M4 cores (measured before PRs #10–#12) | Density within 0.3 points; speed short |
+
+### How these numbers were measured
+
+| Corpus | Contents | `zstd -19` (sum of files) | Machine | Used for |
+|---|---|---:|---|---|
+| Text/code, 22.8 MB | 8 MiB Python 3.12 stdlib, 4 MiB Perl modules, 4 MiB `/usr/share` XML/HTML/SVG, 5.7 MB of five Gutenberg novels | 4,191,049 B | 4-vCPU Xeon VM, 2.8 GHz | Tiers 3 and 4, memory audit |
+| Mixed, 26.97 MB | The text/code corpus plus 4 MiB of `/usr/bin` ELF binaries | 5,758,651 B | 4-vCPU Xeon VM, 2.1 GHz | Tier 1 entropy mode, Tier 4 mixed row |
+| Mixed, 26.4 MB | 8 MiB Python, 6 MiB XML/HTML/SVG, 4 MiB Perl, 4 MiB ELF, 3.4 MB novel | 5,217,375 B (rebuild) | 4-vCPU Xeon VM, 2.8 GHz | Tier 2, Tier 3 mixed row |
+
+GCC 13 `-O3`, SSE2 baseline with AVX2 chosen at run time; `zstd -19` via python-zstandard; speeds in
+MB/s (10⁶ bytes/s) from `ultra_bench`. Per-tier design notes, tuning results and the full history are in
+[`ultracodec/README.md`](ultracodec/README.md).
 
 ---
 
