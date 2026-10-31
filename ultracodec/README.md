@@ -100,8 +100,10 @@ and flip random bits, under ASan/UBSan and TSan in CI. A corrupt archive
 either throws `Error` or, rarely, decodes to the exact original (when the
 flip lands in padding). None has crashed.
 
-Format version 1 has not been frozen: ultracodec has not been in a release,
-and some formats changed in place, without a version or parameter change.
+Format version 1 is frozen as of 2026-10-31: from here on, a change to
+what any tier writes needs a new format version or a new `model_param`
+value, and the fixtures below must keep decoding. Before that date, while
+ultracodec had not been in a release, some formats changed in place.
 `tests/fixtures/` holds archives written by the encoders of the main branch
 after each pull request that changed ultracodec (#7, #8, #10, #12, #13; built
 from those commits by `make_fixtures.sh`, never by today's encoder), and the
