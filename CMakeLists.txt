@@ -30,6 +30,25 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# std::stop_token and std::jthread: libc++ before LLVM 20 (Apple clang
+# included) ships them only behind -fexperimental-library.
+include(CheckCXXSourceCompiles)
+set(HCE_STOP_TOKEN_TEST "#include <stop_token>\n#include <thread>\nint main() { std::stop_source s; std::jthread t([](std::stop_token) {}); return s.stop_requested(); }")
+set(CMAKE_REQUIRED_LIBRARIES Threads::Threads)
+check_cxx_source_compiles("${HCE_STOP_TOKEN_TEST}" HCE_HAVE_STOP_TOKEN)
+if(NOT HCE_HAVE_STOP_TOKEN AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(CMAKE_REQUIRED_FLAGS "-fexperimental-library")
+  set(CMAKE_REQUIRED_LINK_OPTIONS "-fexperimental-library")
+  check_cxx_source_compiles("${HCE_STOP_TOKEN_TEST}" HCE_STOP_TOKEN_EXPERIMENTAL)
+  unset(CMAKE_REQUIRED_FLAGS)
+  unset(CMAKE_REQUIRED_LINK_OPTIONS)
+  if(HCE_STOP_TOKEN_EXPERIMENTAL)
+    add_compile_options(-fexperimental-library)
+    add_link_options(-fexperimental-library)
+  endif()
+endif()
+unset(CMAKE_REQUIRED_LIBRARIES)
+
 # Warning policy shared by every first-party target.
 add_library(hce_warnings INTERFACE)
 target_compile_options(hce_warnings INTERFACE
@@ -46,6 +65,17 @@ endif()
 
 if(HCE_NATIVE)
   add_compile_options(-march=native)
+endif()
+
+# Coverage-guided fuzzing (fuzz/README.md): Clang only; pair it with
+# HCE_SANITIZE=address,undefined (the clang-fuzz preset). Every target gets the
+# coverage instrumentation, and the fuzz_* targets link libFuzzer.
+option(HCE_FUZZ "Build the fuzz targets with libFuzzer (Clang)" OFF)
+if(HCE_FUZZ)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "HCE_FUZZ=ON needs Clang (libFuzzer)")
+  endif()
+  add_compile_options(-fsanitize=fuzzer-no-link)
 endif()
 
 # Profile-guided optimization, off by default: GENERATE builds instrumented
@@ -131,6 +161,7 @@ add_library(hce_aio STATIC
   aio/async_io.cpp
   aio/async_streams.cpp
   aio/native_file.cpp
+  aio/staged_file.cpp
   aio/thread_backend.cpp)
 target_link_libraries(hce_aio PUBLIC hce_core Threads::Threads PRIVATE hce_warnings)
 
@@ -262,6 +293,9 @@ if(HCE_BUILD_TESTS)
     list(APPEND HCE_TEST_ENV "HCE_TEST_WRAPPER=${HCE_WRAPPER}")
   endif()
   set_tests_properties(${HCE_TESTS} PROPERTIES TIMEOUT 3600 ENVIRONMENT "${HCE_TEST_ENV}")
+
+  # The fuzz targets, each run over its seeds and saved regressions.
+  add_subdirectory(fuzz)
 
   # The pytest suite (tests/python), against the staged package and the CLI.
   if(HCE_BUILD_PYTHON)

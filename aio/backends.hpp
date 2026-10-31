@@ -1,7 +1,8 @@
 // backends.hpp - internal: the engines behind IAsyncReader / IAsyncWriter.
 //
 // Each backend has one engine type with the same members (kName, depth(),
-// file(), register_buffers(), queue(), submit(), reap(), interrupt()); Reader
+// file(), close_file(), register_buffers(), queue(), submit(), reap(),
+// interrupt()); Reader
 // and Writer adapt it to the two public interfaces.
 #pragma once
 
@@ -36,6 +37,7 @@ class Reader final : public IAsyncReader {
   Errc submit() noexcept override { return engine_.submit(); }
   std::size_t reap(std::span<Completion> out, std::size_t min) noexcept override { return engine_.reap(out, min); }
   void interrupt() noexcept override { engine_.interrupt(); }
+  FileId file_id() const noexcept override { return engine_.file().id(); }
   u64 size() const noexcept override { return engine_.file().size(); }
   bool direct() const noexcept override { return engine_.file().direct(); }
   Errc queue_read(u64 offset, MutBytes dst, u64 tag) noexcept override {
@@ -63,6 +65,8 @@ class Writer final : public IAsyncWriter {
     return engine_.queue(Op{OpKind::write, offset, const_cast<std::byte*>(src.data()), src.size(), tag});
   }
   Errc queue_sync(u64 tag) noexcept override { return engine_.queue(Op{OpKind::sync, 0, nullptr, 0, tag}); }
+  FileId file_id() const noexcept override { return engine_.file().id(); }
+  int close() noexcept override { return engine_.close_file(); }
   Engine& engine() noexcept { return engine_; }
 
  private:

@@ -2,6 +2,7 @@
 #include "structural/archive.hpp"
 
 #include "aio/async_streams.hpp"
+#include "aio/staged_file.hpp"
 #include "codec/neural_cm_codec.hpp"
 #include "decoder/pipeline.hpp"
 #include "encoder/parallel.hpp"
@@ -10,6 +11,7 @@
 #include "structural/token_stream.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -170,6 +172,28 @@ class LimitedInput final : public InputStream {
   u64 left_;
 };
 
+// `prefix` (bytes already read from `in`), then the rest of `in`.
+class ReplayInput final : public InputStream {
+ public:
+  ReplayInput(InputStream& in, Bytes prefix) noexcept : in_(in), prefix_(prefix) {}
+  std::size_t read(MutBytes buf) override {
+    if (buf.empty()) return 0;
+    if (!prefix_.empty()) {
+      const std::size_t n = std::min(buf.size(), prefix_.size());
+      std::memcpy(buf.data(), prefix_.data(), n);
+      prefix_ = prefix_.subspan(n);
+      return n;
+    }
+    return in_.read(buf);
+  }
+  Errc error() const noexcept override { return in_.error(); }
+  void interrupt() noexcept override { in_.interrupt(); }
+
+ private:
+  InputStream& in_;
+  Bytes prefix_;
+};
+
 // Decoder output: ID records in, source bytes out (through a staging buffer).
 class SourceOutput final : public OutputStream {
  public:
@@ -292,25 +316,67 @@ class CountingOutput final : public OutputStream {
   OutputStream& out_;
 };
 
-// A spool name no other run uses: <dir>/hce-spool-<random>.tmp.
-fs::path temp_spool() {
+// A spool name no other run uses: .hce-spool-<random>.tmp.
+fs::path spool_name() {
+  static std::atomic<u64> counter{0};
   std::random_device rd;
-  const u64 r = (u64{rd()} << 32) ^ rd() ^ static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
-  char name[40];
-  std::snprintf(name, sizeof name, "hce-spool-%016llx.tmp", static_cast<unsigned long long>(r));
-  std::error_code ec;
-  fs::path dir = fs::temp_directory_path(ec);
-  if (ec) dir = ".";
-  return dir / name;
+  const u64 r = (u64{rd()} << 32) ^ rd() ^ static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                (counter.fetch_add(1, std::memory_order_relaxed) * 0x9E3779B97F4A7C15ull);
+  char name[48];
+  std::snprintf(name, sizeof name, ".hce-spool-%016llx.tmp", static_cast<unsigned long long>(r));
+  return name;
 }
 
-struct RemoveFile {
+// The spool this run created: removed when it goes, and only then. The
+// output closes first, since Windows cannot remove an open file.
+struct Spool {
   fs::path path;
-  ~RemoveFile() {
+  std::unique_ptr<aio::AsyncFileOutput> out;
+  aio::FileId id{};
+  Spool() = default;
+  Spool(const Spool&) = delete;
+  Spool& operator=(const Spool&) = delete;
+  ~Spool() {
+    out.reset();
     std::error_code ec;
-    fs::remove(path, ec);
+    if (!path.empty()) fs::remove(path, ec);
   }
 };
+
+// Creates the spool new and owner-only: `opt.spool` exactly, or a fresh name
+// in `opt.spool_dir` (else `dir`). An explicit name that exists fails; a
+// generated one that does is drawn again.
+Errc create_spool(const ArchiveOptions& opt, const fs::path& dir, Spool& spool, int& sys_error) {
+  aio::OpenError oe;
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    const fs::path p = !opt.spool.empty() ? opt.spool : (opt.spool_dir.empty() ? dir : opt.spool_dir) / spool_name();
+    spool.out = aio::AsyncFileOutput::create(p, opt.io, &oe, aio::Create::exclusive_private);
+    if (spool.out) {
+      spool.path = p;
+      spool.id = spool.out->file_id();
+      return Errc::ok;
+    }
+    std::error_code ec;
+    const bool taken = fs::symlink_status(p, ec).type() != fs::file_type::not_found;
+    if (!opt.spool.empty() || oe.status != Errc::io_error || !taken) break;  // a generated name is taken: draw again
+  }
+  sys_error = oe.sys_error;
+  return oe.status;
+}
+
+fs::path temp_dir() {
+  std::error_code ec;
+  fs::path dir = fs::temp_directory_path(ec);
+  return ec ? fs::path(".") : dir;
+}
+
+fs::path parent_dir(const fs::path& p) {
+  const fs::path dir = p.parent_path();
+  return dir.empty() ? fs::path(".") : dir;
+}
+
+// Stage 0 into an open spool; finishes and closes it.
+ArchiveStats spool_tokens(InputStream& in, aio::AsyncFileOutput& out, const ArchiveOptions& opt, u32& source_crc);
 
 }  // namespace
 
@@ -320,14 +386,13 @@ bool is_archive(Bytes prefix) noexcept {
   return prefix.size() >= kArchiveMagic.size() && std::equal(kArchiveMagic.begin(), kArchiveMagic.end(), prefix.begin());
 }
 
-ArchiveStats write_token_spool(InputStream& in, const fs::path& spool, const ArchiveOptions& opt, u32& source_crc) {
+namespace {
+
+ArchiveStats spool_tokens(InputStream& in, aio::AsyncFileOutput& spool, const ArchiveOptions& opt, u32& source_crc) {
   ArchiveStats st;
   st.language = opt.language;
   source_crc = 0;
-  if (check_options(opt)) return failed(st, "open", Errc::unsupported_feature);
-  aio::OpenError oe;
-  auto out = aio::AsyncFileOutput::create(spool, opt.io, &oe);
-  if (!out) return failed(st, "spool", oe.status, oe.sys_error);
+  aio::AsyncFileOutput* const out = &spool;
   st.backend = out->backend();
   try {
     StructuralPreprocessor pre;
@@ -370,8 +435,28 @@ ArchiveStats write_token_spool(InputStream& in, const fs::path& spool, const Arc
     return failed(st, "spool", Errc::out_of_memory);
   }
   if (const Errc e = out->finish(false); e != Errc::ok) return failed(st, "spool", e, out->sys_error());
+  if (const Errc e = out->close(); e != Errc::ok) return failed(st, "spool", e, out->sys_error());
   return st;
 }
+
+}  // namespace
+
+ArchiveStats write_token_spool(InputStream& in, const fs::path& spool, const ArchiveOptions& opt, u32& source_crc) {
+  source_crc = 0;
+  ArchiveStats st;
+  st.language = opt.language;
+  if (check_options(opt)) return failed(st, "open", Errc::unsupported_feature);
+  ArchiveOptions o = opt;
+  o.spool = spool;
+  Spool sp;
+  int sys_error = 0;
+  if (const Errc e = create_spool(o, {}, sp, sys_error); e != Errc::ok) return failed(st, "spool", e, sys_error);
+  st = spool_tokens(in, *sp.out, opt, source_crc);
+  if (st.status == Errc::ok) sp.path.clear();  // the caller's now
+  return st;
+}
+
+
 
 ArchiveStats write_token_spool(const fs::path& source, const fs::path& spool, const ArchiveOptions& opt,
                                u32& source_crc) {
@@ -388,10 +473,12 @@ ArchiveStats write_token_spool(const fs::path& source, const fs::path& spool, co
 
 // ------------------------------------------------------------- pass 1 ---
 
-Errc build_global_model(const fs::path& spool, const ArchiveOptions& opt, GlobalModel& model, u64* tokens) {
+Errc build_global_model(const fs::path& spool, const ArchiveOptions& opt, GlobalModel& model, u64* tokens,
+                        const aio::FileId* expect) {
   aio::OpenError oe;
   auto in = aio::AsyncFileInput::open(spool, opt.io, &oe);
   if (!in) return oe.status;
+  if (expect && in->file_id() != *expect) return Errc::content_mismatch;  // replaced since it was written
   GlobalModelBuilder builder(opt.model_limits);
   TokenStreamLimits lim;
   lim.max_token_bytes = opt.model_limits.max_token_bytes;
@@ -415,12 +502,16 @@ ArchiveStats compress_stream(InputStream& source, OutputStream& archive, const A
   st.threads = opt.threads;
   st.language = opt.language;
   if (check_options(opt)) return failed(st, "open", Errc::unsupported_feature);
-  const RemoveFile spool{opt.spool.empty() ? temp_spool() : opt.spool};
+  Spool spool;
+  int sys_error = 0;
+  if (const Errc e = create_spool(opt, temp_dir(), spool, sys_error); e != Errc::ok)
+    return failed(st, "spool", e, sys_error);
 
   // Stage 0: tokenize the source into the spool.
   auto t0 = std::chrono::steady_clock::now();
   u32 source_crc = 0;
-  st = write_token_spool(source, spool.path, opt, source_crc);
+  st = spool_tokens(source, *spool.out, opt, source_crc);
+  spool.out.reset();
   st.threads = opt.threads;
   st.seconds[0] = seconds_since(t0);
   if (st.status != Errc::ok) return st;
@@ -429,7 +520,8 @@ ArchiveStats compress_stream(InputStream& source, OutputStream& archive, const A
   t0 = std::chrono::steady_clock::now();
   GlobalModel model;
   u64 tokens = 0;
-  if (const Errc e = build_global_model(spool.path, opt, model, &tokens); e != Errc::ok) return failed(st, "pass1", e);
+  if (const Errc e = build_global_model(spool.path, opt, model, &tokens, &spool.id); e != Errc::ok)
+    return failed(st, "pass1", e);
   if (tokens != st.tokens) return failed(st, "pass1", Errc::content_mismatch);
   st.symbols = model.size();
   st.dictionary_bytes = model.dictionary_bytes();
@@ -454,6 +546,7 @@ ArchiveStats compress_stream(InputStream& source, OutputStream& archive, const A
   aio::OpenError oe;
   auto spool_in = aio::AsyncFileInput::open(spool.path, opt.io, &oe);
   if (!spool_in) return failed(st, "pass2", oe.status, oe.sys_error);
+  if (spool_in->file_id() != spool.id) return failed(st, "pass2", Errc::content_mismatch);
   CountingOutput out(archive);
   Header h;
   h.level = opt.level;
@@ -488,40 +581,38 @@ ArchiveStats compress_stream(InputStream& source, OutputStream& archive, const A
   return st;
 }
 
-// Removes a file this run created unless told to keep it; closes it first,
-// since Windows cannot remove an open file.
-template <class Out>
-struct RemoveUnlessKept {
-  std::unique_ptr<Out>& out;
-  const fs::path& path;
-  bool keep = false;
-  ~RemoveUnlessKept() {
-    if (keep) return;
-    out.reset();
-    std::error_code ec;
-    fs::remove(path, ec);
-  }
-};
+namespace {
 
-ArchiveStats compress_file(const fs::path& source, const fs::path& archive, const ArchiveOptions& opt) {
+// The file functions' common part: open the source, refuse an alias, run
+// `body` into a staged output, publish it only on success.
+template <class Body>
+ArchiveStats file_to_file(const fs::path& from, const fs::path& to, const ArchiveOptions& opt, Body body) {
   aio::OpenError oe;
-  auto in = aio::AsyncFileInput::open(source, opt.io, &oe);
+  auto in = aio::AsyncFileInput::open(from, opt.io, &oe);
   if (!in) return failed(ArchiveStats{}, "open", oe.status, oe.sys_error);
-  std::unique_ptr<aio::AsyncFileOutput> out = aio::AsyncFileOutput::create(archive, opt.io, &oe);
+  if (aio::same_file(from, to)) return failed(ArchiveStats{}, "alias", Errc::io_error);
+  auto out = aio::StagedFileOutput::create(to, opt.io, &oe);
   if (!out) return failed(ArchiveStats{}, "open", oe.status, oe.sys_error);
-  RemoveUnlessKept<aio::AsyncFileOutput> guard{out, archive};
-  ArchiveOptions o = opt;
-  if (o.spool.empty()) o.spool = fs::path(archive) += ".spool";
-  ArchiveStats st = compress_stream(*in, *out, o);
+  ArchiveStats st = body(*in, *out);
   st.backend = in->backend();
   if (st.status != Errc::ok) {
     if (st.status == Errc::io_error && st.sys_error == 0)
       st.sys_error = in->error() != Errc::ok ? in->sys_error() : out->sys_error();
-    return st;
+    return st;  // `out` goes, and with it the temporary file: `to` is as it was
   }
-  if (const Errc e = out->finish(true); e != Errc::ok) return failed(st, "finish", e, out->sys_error());
-  guard.keep = true;
+  if (const aio::CommitResult c = out->commit(aio::Publish::replace); c.status != Errc::ok)
+    return failed(st, c.published ? "sync-dir" : "finish", c.status, c.sys_error);
   return st;
+}
+
+}  // namespace
+
+ArchiveStats compress_file(const fs::path& source, const fs::path& archive, const ArchiveOptions& opt) {
+  return file_to_file(source, archive, opt, [&](InputStream& in, OutputStream& out) {
+    ArchiveOptions o = opt;
+    if (o.spool.empty() && o.spool_dir.empty()) o.spool_dir = parent_dir(archive);  // same file system as the archive
+    return compress_stream(in, out, o);
+  });
 }
 
 // -------------------------------------------------------- decompression ---
@@ -537,35 +628,59 @@ ArchiveStats decompress_stream(InputStream& in, OutputStream& output, const Arch
   if (read_exact(in, hb) != hb.size()) return failed(st, "header", in.error() != Errc::ok ? in.error() : Errc::truncated);
   if (const Errc e = decode_header(hb, h); e != Errc::ok) return failed(st, "header", e);
   st.language = static_cast<Language>(h.language);
+  // The source size is known up front: refuse it before decoding anything.
+  if (h.source_bytes > opt.max_output) return failed(st, "header", Errc::limit_output);
+  if (h.level > opt.max_level) return failed(st, "header", Errc::limit_level);
+  if (opt.max_memory < kOutStage) return failed(st, "model", Errc::limit_memory);
 
-  // The model section, then the frozen model every worker shares.
+  // The model section, then the frozen model every worker shares. Its decoder
+  // and the image it produces share max_memory. The encoder records the
+  // image size in the section's stream header; without it the image may take
+  // half the budget.
+  const u64 dictionary_cap = opt.model_limits.max_dictionary_bytes + u64{opt.model_limits.max_symbols} * 21 + 16;
   LimitedInput model_in(in, h.model_bytes);
+  std::array<std::byte, hc::kStreamHeaderSize> sh{};
+  const std::size_t sh_len = read_exact(model_in, sh);
+  hc::StreamParams sp;
+  u64 image_cap = std::min(dictionary_cap, opt.max_memory / 2);
+  if (sh_len == sh.size() && hc::parse_stream_header(sh, sp) == Errc::ok && sp.content_size) {
+    if (*sp.content_size > dictionary_cap) return failed(st, "model", Errc::limit_output);
+    if (*sp.content_size >= opt.max_memory) return failed(st, "model", Errc::limit_memory);
+    image_cap = *sp.content_size;
+  }
+  ReplayInput model_src(model_in, Bytes(sh.data(), sh_len));
   MemoryOutput model_out;
   DecodeOptions md;
   md.threads = 1;  // a dictionary: small next to the token stream
-  md.limits.max_memory_bytes = opt.max_memory;
-  md.limits.max_output_bytes = opt.model_limits.max_dictionary_bytes + u64{opt.model_limits.max_symbols} * 21 + 16;
+  md.limits.max_memory_bytes = opt.max_memory - image_cap;
+  md.limits.max_output_bytes = image_cap;
+  md.limits.max_level = std::min(md.limits.max_level, opt.max_level);
   md.stop = opt.stop;
-  if (const DecodeResult r = decode_stream<NeuralCMCodec>(model_in, model_out, md); r.status != Errc::ok)
-    return failed(st, "model", r.status);
+  if (const DecodeResult r = decode_stream<NeuralCMCodec>(model_src, model_out, md); r.status != Errc::ok)
+    return failed(st, "model", r.status == Errc::limit_output && image_cap < dictionary_cap ? Errc::limit_memory : r.status);
   if (model_in.left() != 0) return failed(st, "model", Errc::truncated);
   if (hc::crc32c(model_out.data) != h.model_crc) return failed(st, "model", Errc::payload_corrupt);
   GlobalModel model;
   if (const Errc e = GlobalModel::parse(model_out.data, opt.model_limits, model); e != Errc::ok)
     return failed(st, "model", e);
+  std::vector<std::byte>().swap(model_out.data);  // the image is not needed any more
   st.symbols = model.size();
   st.dictionary_bytes = model.dictionary_bytes();
   st.model_bytes = h.model_bytes;
   st.seconds[0] = seconds_since(t0);
 
+  // The token stream's workers get what the parsed model and the output stage leave.
+  const u64 retained = model.memory_bytes() + kOutStage;
+  if (retained >= opt.max_memory) return failed(st, "model", Errc::limit_memory);
   t0 = std::chrono::steady_clock::now();
   SourceOutput src(model, output, h.source_bytes);
   DecodeOptions d;
   d.threads = opt.threads;
-  d.limits.max_memory_bytes = opt.max_memory;
+  d.limits.max_memory_bytes = opt.max_memory - retained;
   d.limits.max_window_log = kStreamWindowLog;  // what the encoder writes: workers are sized for it
   d.limits.max_block_bytes = u32{1} << kStreamBlockLog;
   d.limits.max_output_bytes = h.tokens * kTokenRecordBytes;
+  d.limits.max_level = std::min(d.limits.max_level, opt.max_level);
   d.stop = opt.stop;
   d.codec_context = &model;  // shared read-only by every worker
   const DecodeResult r = decode_stream<StructuralCMCodec>(in, src, d);
@@ -584,21 +699,8 @@ ArchiveStats decompress_stream(InputStream& in, OutputStream& output, const Arch
 }
 
 ArchiveStats decompress_file(const fs::path& archive, const fs::path& output, const ArchiveOptions& opt) {
-  aio::OpenError oe;
-  auto in = aio::AsyncFileInput::open(archive, opt.io, &oe);
-  if (!in) return failed(ArchiveStats{}, "open", oe.status, oe.sys_error);
-  std::unique_ptr<aio::AsyncFileOutput> out = aio::AsyncFileOutput::create(output, opt.io, &oe);
-  if (!out) return failed(ArchiveStats{}, "open", oe.status, oe.sys_error);
-  RemoveUnlessKept<aio::AsyncFileOutput> guard{out, output};
-  ArchiveStats st = decompress_stream(*in, *out, opt);
-  st.backend = in->backend();
-  if (st.status != Errc::ok) {
-    if (st.status == Errc::io_error && st.sys_error == 0) st.sys_error = in->error() != Errc::ok ? in->sys_error() : out->sys_error();
-    return st;
-  }
-  if (const Errc e = out->finish(true); e != Errc::ok) return failed(st, "finish", e, out->sys_error());
-  guard.keep = true;
-  return st;
+  return file_to_file(archive, output, opt,
+                      [&](InputStream& in, OutputStream& out) { return decompress_stream(in, out, opt); });
 }
 
 }  // namespace hce::structural

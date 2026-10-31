@@ -1,6 +1,7 @@
 // posix_io.hpp - POSIX streams and atomic output files for the hce CLI.
 #pragma once
 
+#include "aio/staged_file.hpp"
 #include "io/stream.hpp"
 
 #include <algorithm>
@@ -122,12 +123,16 @@ class FdOutput final : public OutputStream {
 };
 
 // A file that appears at its path only once complete. Data goes to a
-// temporary file in the same directory; commit() fsyncs it and publishes it
-// atomically. Without `force` it is published with link(), which fails if the
-// path exists, so a file created meanwhile is never overwritten. Anything not
-// committed is removed.
+// temporary file in the same directory; commit() fsyncs it, closes it
+// (checking for late write errors) and publishes it atomically. Without
+// `force` it is published with an atomic no-replace rename (or link()),
+// which fails if the path exists, so a file created meanwhile is never
+// overwritten; a file system with neither fails rather than risk it. Anything
+// not committed is removed; a published file never is.
 class OutputFile {
  public:
+  enum class Commit { failed, published, not_durable };  // not_durable: published, the directory sync failed
+
   OutputFile() = default;
   OutputFile(const OutputFile&) = delete;
   OutputFile& operator=(const OutputFile&) = delete;
@@ -159,32 +164,27 @@ class OutputFile {
 
   int fd() const noexcept { return fd_; }
 
-  bool commit(std::string& err) {
+  Commit commit(std::string& err) {
     if (::fsync(fd_) != 0 && errno != EINVAL) return fail(err);
     const int fd = std::exchange(fd_, -1);
-    if (::close(fd) != 0) return fail(err);  // NFS reports deferred write errors here
-    if (force_) {
-      if (::rename(tmp_.c_str(), path_.c_str()) != 0) return fail(err);
-    } else if (::link(tmp_.c_str(), path_.c_str()) == 0) {
-      ::unlink(tmp_.c_str());
-    } else if (errno == EEXIST) {
-      err = "already exists (use -f to overwrite)";
-      return false;
-    } else {  // no hard links on this file system: best effort without them
-      struct stat st {};
-      if (::lstat(path_.c_str(), &st) == 0) {
-        err = "already exists (use -f to overwrite)";
-        return false;
-      }
-      if (::rename(tmp_.c_str(), path_.c_str()) != 0) return fail(err);
+    if (::close(fd) != 0 && errno != EINTR) return fail(err);  // NFS reports deferred write errors here
+    const aio::CommitResult r =
+        aio::publish_file(tmp_, path_, force_ ? aio::Publish::replace : aio::Publish::no_replace);
+    if (!r.published) {
+      err = r.sys_error == EEXIST    ? "already exists (use -f to overwrite)"
+            : r.sys_error == ENOTSUP ? "this file system cannot publish without the risk of overwriting a file "
+                                       "created meanwhile (no atomic no-replace rename or hard links); use -f"
+                                     : std::strerror(r.sys_error);
+      discard();
+      return Commit::failed;
     }
-    tmp_.clear();
-    const int dir = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir >= 0) {  // make the new directory entry durable too
-      ::fsync(dir);
-      ::close(dir);
+    tmp_.clear();  // published: never removed from here on
+    if (r.status != hc::Errc::ok) {
+      err = std::string("written, but the directory could not be synced (") + std::strerror(r.sys_error) +
+            "): the file may not survive a crash";
+      return Commit::not_durable;
     }
-    return true;
+    return Commit::published;
   }
 
   void discard() noexcept {
@@ -194,9 +194,10 @@ class OutputFile {
   }
 
  private:
-  static bool fail(std::string& err) {
+  Commit fail(std::string& err) {
     err = std::strerror(errno);
-    return false;
+    discard();
+    return Commit::failed;
   }
 
   std::string path_, dir_, tmp_;

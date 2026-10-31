@@ -111,6 +111,16 @@ class UringEngine {
 
   unsigned depth() const noexcept { return depth_; }
   const NativeFile& file() const noexcept { return file_; }
+  // A registered file stays open in the ring: unregister it first, so that
+  // this close is the last one and reports what it finds.
+  int close_file() noexcept {
+    if (outstanding_ != 0) return EBUSY;
+    if (fixed_file_) {
+      io_uring_unregister_files(&ring_);
+      fixed_file_ = false;
+    }
+    return file_.close();
+  }
 
   void register_buffers(std::span<const MutBytes> buffers) noexcept {
     if (!fixed_.empty() || buffers.empty() || buffers.size() > 1024) return;

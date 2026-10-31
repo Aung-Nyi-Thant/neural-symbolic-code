@@ -10,12 +10,16 @@
 //   * Inputs are any C-contiguous bytes-like object. They are copied before
 //     the GIL is released, so a caller mutating a bytearray in another thread
 //     cannot race the codec.
+//   * File outputs are transactional: written to a temporary file beside the
+//     destination and renamed over it only once complete (and, decoding,
+//     verified). A failure leaves an existing destination as it was.
 //   * Engine failures raise the exception classes defined below, each with
 //     .code (the engine's Errc name), .stage (where it failed, or None) and
 //     .errno (the OS error, or 0). Out of memory raises MemoryError; bad
 //     arguments raise ValueError or TypeError.
 //   * Defaults match the hce command-line tool, so both write identical bytes.
 #include "aio/async_streams.hpp"
+#include "aio/staged_file.hpp"
 #include "codec/neural_cm_codec.hpp"
 #include "decoder/pipeline.hpp"
 #include "encoder/parallel.hpp"
@@ -34,6 +38,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -110,7 +115,8 @@ PyObject* exception_for(Errc e) noexcept {
 
 // ------------------------------------------------------------- arguments ---
 
-Vec copy_buffer(const py::buffer& b) {
+// The buffer's bytes, checked to be C-contiguous; at most `limit` of them copied.
+Vec copy_buffer(const py::buffer& b, std::size_t limit = ~std::size_t{0}) {
   const py::buffer_info info = b.request();
   if (info.ndim > 1) {
     for (py::ssize_t i = info.ndim - 1, stride = info.itemsize; i >= 0; stride *= info.shape[static_cast<std::size_t>(i)], --i)
@@ -118,7 +124,7 @@ Vec copy_buffer(const py::buffer& b) {
   } else if (info.ndim == 1 && info.strides[0] != info.itemsize) {
     throw py::value_error("the buffer must be C-contiguous");
   }
-  const auto n = static_cast<std::size_t>(info.size * info.itemsize);
+  const auto n = std::min(static_cast<std::size_t>(info.size * info.itemsize), limit);
   const auto* p = static_cast<const std::byte*>(info.ptr);
   return Vec(p, p + n);
 }
@@ -284,11 +290,12 @@ Decoded decode(hce::InputStream& in, Format format, hce::OutputStream& sink, uns
                u64 max_output) {
   Decoded d;
   d.format = format;
-  BoundedOutput out(sink, max_output);
+  BoundedOutput out(sink, max_output);  // a second line of defense: both decoders check the limit first
   if (format == Format::structural) {
     st::ArchiveOptions o;
     o.threads = threads;
     o.max_memory = max_memory;
+    o.max_output = max_output;
     d.structural = st::decompress_stream(in, out, o);
   } else {
     hce::DecodeOptions o;
@@ -325,9 +332,18 @@ py::dict check_decoded(const Decoded& d, const char* what) {
   raise_as(g_exc.io, Errc::io_error, std::string(fn) + ": cannot open " + p.string() + ": " + why, "open", sys_error);
 }
 
-void remove_quietly(const fs::path& p) noexcept {
-  std::error_code ec;
-  fs::remove(p, ec);
+void refuse_alias(const char* fn, const fs::path& source, const fs::path& dest) {
+  if (hce::aio::same_file(source, dest))
+    throw py::value_error(std::string(fn) + ": source and dest are the same file: " + dest.string());
+}
+
+// A commit that failed. Before publication `dest` is untouched; after it (the
+// directory sync failed) the new file is in place but may not survive a crash.
+[[noreturn]] void raise_commit_error(const char* fn, const fs::path& dest, const hce::aio::CommitResult& c) {
+  if (c.published)
+    raise_errc(c.status, std::string(fn) + " " + dest.string() + ": written, but its directory could not be synced",
+               "sync-dir", c.sys_error);
+  raise_errc(c.status, std::string(fn) + " " + dest.string(), c.stage, c.sys_error);
 }
 
 // ------------------------------------------------------- module functions ---
@@ -392,6 +408,7 @@ py::dict py_compress_file(const fs::path& source, const fs::path& dest, int leve
   const hc::u32 prior = check_profile(profile);
   const unsigned t = check_threads(threads);
   const st::Language lang = file_language(language, source);
+  refuse_alias("compress_file", source, dest);
   if (structural) {
     st::ArchiveOptions o;
     o.level = lvl;
@@ -402,19 +419,22 @@ py::dict py_compress_file(const fs::path& source, const fs::path& dest, int leve
       py::gil_scoped_release nogil;
       s = st::compress_file(source, dest, o);
     }
+    if (s.status != Errc::ok && std::string_view(s.stage) == "sync-dir")
+      raise_commit_error("compress_file", dest, {s.status, s.sys_error, true, s.stage});
     if (s.status != Errc::ok) raise_errc(s.status, "compress_file " + source.string(), s.stage, s.sys_error);
     return structural_stats(s, false);
   }
   hce::EncodeResult r;
-  hc::Errc open_status = Errc::ok, finish_status = Errc::ok;
+  hc::Errc open_status = Errc::ok;
+  hce::aio::CommitResult commit;
   int open_errno = 0;
   const fs::path* open_path = &source;
   {
     py::gil_scoped_release nogil;
     hce::aio::OpenError oe;
     auto in = hce::aio::AsyncFileInput::open(source, {}, &oe);
-    std::unique_ptr<hce::aio::AsyncFileOutput> out;
-    if (in) out = hce::aio::AsyncFileOutput::create(dest, {}, &oe);
+    std::unique_ptr<hce::aio::StagedFileOutput> out;
+    if (in) out = hce::aio::StagedFileOutput::create(dest, {}, &oe);
     if (!in || !out) {
       open_status = oe.status;
       open_errno = oe.sys_error;
@@ -426,21 +446,22 @@ py::dict py_compress_file(const fs::path& source, const fs::path& dest, int leve
       o.threads = t;
       o.content_size = in->size();
       r = hce::encode_parallel<hce::NeuralCMCodec>(*in, *out, o);
-      if (r.status == Errc::ok) finish_status = out->finish(true);
-      out.reset();
-      if (r.status != Errc::ok || finish_status != Errc::ok) remove_quietly(dest);
-    }
+      if (r.status == Errc::ok) commit = out->commit();
+    }  // `out` goes here: unless committed, its temporary file with it
   }
   if (open_status != Errc::ok) raise_open_error("compress_file", *open_path, open_status, open_errno);
   if (r.status != Errc::ok) raise_errc(r.status, "compress_file " + source.string());
-  if (finish_status != Errc::ok) raise_errc(finish_status, "compress_file " + dest.string(), "finish");
+  if (commit.status != Errc::ok) raise_commit_error("compress_file", dest, commit);
   return framed_stats(r);
 }
 
-py::dict py_decompress_file(const fs::path& source, const fs::path& dest, int threads, u64 max_memory) {
+py::dict py_decompress_file(const fs::path& source, const fs::path& dest, int threads, u64 max_memory,
+                            std::optional<u64> max_output) {
   const unsigned t = check_threads(threads);
   const u64 mem = check_memory(max_memory);
-  hc::Errc open_status = Errc::ok, finish_status = Errc::ok;
+  refuse_alias("decompress_file", source, dest);
+  hc::Errc open_status = Errc::ok;
+  hce::aio::CommitResult commit;
   int open_errno = 0;
   const fs::path* open_path = &source;
   Decoded d;
@@ -448,45 +469,32 @@ py::dict py_decompress_file(const fs::path& source, const fs::path& dest, int th
     py::gil_scoped_release nogil;
     hce::aio::OpenError oe;
     auto in = hce::aio::AsyncFileInput::open(source, {}, &oe);
-    std::unique_ptr<hce::aio::AsyncFileOutput> out;
-    if (in) out = hce::aio::AsyncFileOutput::create(dest, {}, &oe);
-    if (!in || !out) {
+    // The format, from the first bytes, read through a separate handle: `in` still starts at 0.
+    if (in) d.format = file_format(source);
+    std::unique_ptr<hce::aio::StagedFileOutput> out;
+    if (in && d.format != Format::unknown) out = hce::aio::StagedFileOutput::create(dest, {}, &oe);
+    if (!in || (d.format != Format::unknown && !out)) {
       open_status = oe.status;
       open_errno = oe.sys_error;
       open_path = in ? &dest : &source;
-    } else {
-      // The format, from the first bytes, read through a separate handle: `in` still starts at 0.
-      d.format = file_format(source);
-      if (d.format != Format::unknown) {
-        d = decode(*in, d.format, *out, t, mem, ~u64{0});
-        const bool ok = !d.exceeded && (d.format == Format::structural
-                                            ? d.structural.status == Errc::ok
-                                            : d.framed.status == Errc::ok && d.framed.stats.content_verified &&
-                                                  d.framed.stats.damage_events == 0);
-        if (ok) finish_status = out->finish(true);
-        if (!ok || finish_status != Errc::ok) {
-          out.reset();
-          remove_quietly(dest);
-        }
-      } else {
-        out.reset();
-        remove_quietly(dest);
-      }
-    }
+    } else if (out) {
+      d = decode(*in, d.format, *out, t, mem, max_output.value_or(~u64{0}));
+      const bool ok = !d.exceeded && (d.format == Format::structural
+                                          ? d.structural.status == Errc::ok
+                                          : d.framed.status == Errc::ok && d.framed.stats.content_verified &&
+                                                d.framed.stats.damage_events == 0);
+      if (ok) commit = out->commit();
+    }  // `out` goes here: unless committed, its temporary file with it
   }
   if (open_status != Errc::ok) raise_open_error("decompress_file", *open_path, open_status, open_errno);
   if (d.format == Format::unknown) raise_errc(Errc::bad_magic, "decompress_file " + source.string() + ": not an hce stream or archive");
   py::dict stats = check_decoded(d, ("decompress_file " + source.string()).c_str());
-  if (finish_status != Errc::ok) raise_errc(finish_status, "decompress_file " + dest.string(), "finish");
+  if (commit.status != Errc::ok) raise_commit_error("decompress_file", dest, commit);
   return stats;
 }
 
 py::object py_detect_format(const py::buffer& data) {
-  const Vec head = [&] {
-    Vec v = copy_buffer(data);
-    if (v.size() > 4) v.resize(4);
-    return v;
-  }();
+  const Vec head = copy_buffer(data, 4);  // the magic: nothing more is read
   const Format f = format_of(head);
   return f == Format::unknown ? py::none() : py::object(py::str(to_string(f)));
 }
@@ -560,7 +568,7 @@ PYBIND11_MODULE(_hce, m) {
         py::arg("profile") = static_cast<int>(hce::kNeuralCMProfile2), py::arg("threads") = 1,
         py::arg("structural") = false, py::arg("language") = "auto");
   m.def("decompress_file", &py_decompress_file, py::arg("source"), py::arg("dest"), py::kw_only(),
-        py::arg("threads") = 1, py::arg("max_memory") = kDefaultMaxMemory);
+        py::arg("threads") = 1, py::arg("max_memory") = kDefaultMaxMemory, py::arg("max_output") = py::none());
   m.def("detect_format", &py_detect_format, py::arg("data"));
   m.def("tokenize", &py_tokenize, py::arg("source"), py::kw_only(), py::arg("language") = "generic");
   m.def("info", &py_info);

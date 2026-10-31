@@ -1,0 +1,9 @@
+# Archives of past commits that today's decoder rejects (it must reject them
+# cleanly, with an error, never decode them to wrong bytes). Each line: commit tier why.
+# Before any release (v2.1.0 predates ultracodec), format version 1 was
+# changed in place, with no version or parameter change. Accepted as
+# pre-release on 2026-10-31, when version 1 was frozen: add no new lines here;
+# a format change from now on takes a new version.
+2b63b18 2 Tier 2 payload layout replaced by PR #10 (word filter, 16 literal streams); same header, model_param 0
+334e2b3 2 Tier 2 payload layout replaced by PR #10 (word filter, 16 literal streams); same header, model_param 0
+2b63b18 4 Tier 4 replaced by snapshot warm-start CM in PR #8, which requires the snapshot flag

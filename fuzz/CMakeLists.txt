@@ -1,0 +1,56 @@
+# Coverage-guided fuzz targets (fuzz/README.md). Every target is one
+# LLVMFuzzerTestOneInput(); with HCE_FUZZ=ON (Clang) each links libFuzzer,
+# otherwise fuzz/replay.cpp drives it. Either way ctest runs every target over
+# its seed corpus and its saved regressions (fuzz/regressions/<target>/): the
+# regression check, not a fuzzing campaign.
+set(HCE_FUZZ_SEEDS_framed "${PROJECT_SOURCE_DIR}/tests/python/golden" "${PROJECT_SOURCE_DIR}/fuzz/corpus/framed")
+set(HCE_FUZZ_SEEDS_structural "${PROJECT_SOURCE_DIR}/tests/python/golden" "${PROJECT_SOURCE_DIR}/fuzz/corpus/structural")
+set(HCE_FUZZ_SEEDS_codec "${PROJECT_SOURCE_DIR}/fuzz/corpus/codec")
+set(HCE_FUZZ_SEEDS_model "${PROJECT_SOURCE_DIR}/fuzz/corpus/model")
+set(HCE_FUZZ_SEEDS_ultra "${PROJECT_SOURCE_DIR}/fuzz/corpus/ultra")
+set(HCE_FUZZ_SEEDS_ultra_t4 "${PROJECT_SOURCE_DIR}/fuzz/corpus/ultra")
+set(HCE_FUZZ_LIBS_framed hce_pipeline)
+set(HCE_FUZZ_LIBS_structural hce_structural)
+set(HCE_FUZZ_LIBS_codec hce_structural_codec)
+set(HCE_FUZZ_LIBS_model hce_structural_codec)
+set(HCE_FUZZ_LIBS_ultra ultracodec)
+set(HCE_FUZZ_LIBS_ultra_t4 ultracodec)
+
+# Wine sees the build machine's / as Z:.
+if(WIN32 AND CMAKE_CROSSCOMPILING)
+  foreach(name framed structural codec model ultra ultra_t4)
+    list(TRANSFORM HCE_FUZZ_SEEDS_${name} PREPEND "Z:")
+  endforeach()
+endif()
+
+set(HCE_FUZZ_NAMES framed structural codec model)
+if(TARGET ultracodec)
+  list(APPEND HCE_FUZZ_NAMES ultra ultra_t4)
+endif()
+
+foreach(name IN LISTS HCE_FUZZ_NAMES)
+  set(regressions "${PROJECT_SOURCE_DIR}/fuzz/regressions/${name}")
+  if(WIN32 AND CMAKE_CROSSCOMPILING)
+    set(regressions "Z:${regressions}")
+  endif()
+  set(source fuzz_${name}.cpp)
+  if(name STREQUAL "ultra_t4")
+    set(source fuzz_ultra.cpp)
+  endif()
+  if(HCE_FUZZ)
+    add_executable(fuzz_${name} ${source})
+    target_link_options(fuzz_${name} PRIVATE -fsanitize=fuzzer)
+    # -runs=0: run the given corpora once and stop.
+    add_test(NAME fuzz_${name} COMMAND fuzz_${name} -runs=0 -rss_limit_mb=4096 ${HCE_FUZZ_SEEDS_${name}} ${regressions})
+  else()
+    add_executable(fuzz_${name} ${source} replay.cpp)
+    add_test(NAME fuzz_${name} COMMAND fuzz_${name} ${HCE_FUZZ_SEEDS_${name}} ${regressions})
+  endif()
+  target_link_libraries(fuzz_${name} PRIVATE ${HCE_FUZZ_LIBS_${name}} hce_warnings)
+  set_tests_properties(fuzz_${name} PROPERTIES TIMEOUT 600 ENVIRONMENT "${HCE_TEST_ENV}")
+endforeach()
+if(TARGET ultracodec)
+  target_include_directories(fuzz_ultra PRIVATE "${PROJECT_SOURCE_DIR}/ultracodec/src")
+  target_include_directories(fuzz_ultra_t4 PRIVATE "${PROJECT_SOURCE_DIR}/ultracodec/src")
+  target_compile_definitions(fuzz_ultra_t4 PRIVATE ULTRA_FUZZ_TIER4)
+endif()

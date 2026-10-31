@@ -102,9 +102,12 @@ std::unique_ptr<IAsyncReader> open_reader(const std::filesystem::path& path, con
 }
 
 std::unique_ptr<IAsyncWriter> open_writer(const std::filesystem::path& path, const Options& opt,
-                                          OpenError* err) noexcept {
+                                          OpenError* err, Create how) noexcept {
+  const NativeFile::Mode mode = how == Create::truncate    ? NativeFile::Mode::write
+                                : how == Create::exclusive ? NativeFile::Mode::create_new
+                                                           : NativeFile::Mode::create_private;
   return open_file<IAsyncWriter>(
-      path, opt, NativeFile::Mode::write, err,
+      path, opt, mode, err,
       [](NativeFile& file, const Options& o, int& sys_error) -> std::unique_ptr<IAsyncWriter> {
 #if defined(HCE_AIO_HAVE_URING)
         return detail::make_uring_writer(file, o, sys_error);

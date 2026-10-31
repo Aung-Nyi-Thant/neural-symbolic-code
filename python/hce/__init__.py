@@ -174,6 +174,11 @@ def compress_file(
 
     Both files go through the engine's asynchronous I/O layer (io_uring where
     available). ``language="auto"`` picks the keyword table by extension.
+
+    The output is written to a temporary file beside ``dest`` and renamed over
+    it only once complete, so on any error an existing ``dest`` keeps its old
+    content. A symbolic link at ``dest`` is replaced, not written through.
+    ``source`` and ``dest`` naming the same file raises ``ValueError``.
     """
     return Stats._from(
         _hce.compress_file(os.fspath(source), os.fspath(dest), level=level, profile=profile, threads=threads,
@@ -182,10 +187,21 @@ def compress_file(
 
 
 def decompress_file(
-    source: PathLike, dest: PathLike, *, threads: int = 1, max_memory: int = DEFAULT_MAX_MEMORY
+    source: PathLike,
+    dest: PathLike,
+    *,
+    threads: int = 1,
+    max_memory: int = DEFAULT_MAX_MEMORY,
+    max_output: Optional[int] = None,
 ) -> Stats:
-    """Decompresses either format into ``dest``; on failure ``dest`` is removed."""
-    return Stats._from(_hce.decompress_file(os.fspath(source), os.fspath(dest), threads=threads, max_memory=max_memory))
+    """Decompresses either format into ``dest``, replacing it only once every byte verified.
+
+    On any failure ``dest`` is left as it was (absent, or with its old
+    content); see :func:`compress_file` for aliases and links. ``max_output``
+    bounds the decompressed size as in :func:`decompress`.
+    """
+    return Stats._from(_hce.decompress_file(os.fspath(source), os.fspath(dest), threads=threads,
+                                            max_memory=max_memory, max_output=max_output))
 
 
 def detect_format(data: BytesLike) -> Optional[str]:

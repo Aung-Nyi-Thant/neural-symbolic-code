@@ -44,8 +44,10 @@ text and code). Its measured throughput, memory bounds and audit results are bel
 | **Parallelism** | Frames compress and decompress on all cores under counting-semaphore back-pressure and a hard memory bound. |
 
 > [!NOTE]
-> **Status:** version 2.2.0. Container v3 FRAMED, codec profiles 1 (`prior_id` `0x4E434D01`) and 2
-> (`0x4E434D02`, the CLI's and the Python package's default since 2.2; see [Codec profile 2](#codec-profile-2)).
+> **Status:** development version 2.2.0, not yet released; the latest release is
+> [v2.1.0](https://github.com/Aung-Nyi-Thant/neural-symbolic-code/releases/tag/v2.1.0) (2026-10-24), and
+> this README describes `main`. Container v3 FRAMED, codec profiles 1 (`prior_id` `0x4E434D01`) and 2
+> (`0x4E434D02`, the CLI's and the Python package's default in 2.2.0; see [Codec profile 2](#codec-profile-2)).
 > Every 2.0 and 2.1 stream decodes unchanged.
 > Streams from 1.x, written by the retired LZ stand-in codec, are rejected as unsupported (exit 5),
 > never misdecoded.
@@ -359,8 +361,20 @@ HCE is specified by eleven hardening rules. Each is enforced in code and exercis
 - **Pipe-native.** The decoder is a push API that never seeks and never reads past what it consumes. The
   encoder emits frames as they complete. Both ends work on pipes, and the content size is recorded when
   it is known.
-- **Atomic files.** The CLI writes to a temporary file in the target directory, then fsyncs and renames
-  it. A failed or interrupted run leaves no partial file unless `--keep-partial` is given.
+- **Atomic files.** The CLI, the Python file functions (`compress_file`, `decompress_file`), structural
+  archives and the `ultra` tool write to a new temporary file in the target directory, fsync it, check
+  `close()`, and only then rename it over the destination and fsync the directory. A failed or interrupted
+  run leaves the old destination untouched and no partial file (`--keep-partial` keeps one, under its own
+  name). A replaced file keeps its permission bits. Without `-f` the rename itself refuses an existing
+  destination (`renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)` or `link()`), so two runs racing for
+  one name cannot both win; where none of these exist the CLI fails with an explanation rather than check
+  and then overwrite. Writing a file onto itself (the same path, a hard link or a symbolic link to it) is
+  refused before anything is opened for writing. A device such as `/dev/null` is written in place. If only
+  the directory sync fails, the output is kept and the run fails with a warning that it may not survive a
+  crash.
+- **Private spools.** `--structural` keeps its token spool in a new owner-only (0600) file with a random
+  name, created with `O_EXCL` (never through an existing file or symbolic link), and checks between its
+  passes that it reads the file it wrote.
 - **Clean shutdown.** SIGINT, SIGTERM and SIGHUP stop a run promptly and remove temporary files. A closed
   pipe surfaces as an error (exit 1), never as a hang.
 
@@ -373,6 +387,12 @@ HCE is specified by eleven hardening rules. Each is enforced in code and exercis
 - **Declared limits, checked before allocation.** Memory, window, block size, level and total output are
   validated against the stream header before anything is allocated, and each stream allocates at most once.
   The `untrusted` profile caps these at 256 MiB, 32 MiB, 1 MiB, level 3 and 64 GiB respectively.
+- **Structural archives.** `--max-output` (Python: `max_output`) and `--max-level` are checked against the
+  archive header before anything is decoded. `--max-memory` covers each decoding phase: while the model
+  section decodes, its decoder plus the dictionary image (sized from its stream header, or at most half the
+  budget); while the tokens decode, the workers plus the parsed model and a 1 MiB output stage. The CLI
+  refuses the byte-codec-only limits (`--max-window`, `--max-block`, `--max-ratio`, `--ratio-burst`) for a
+  structural archive rather than ignore them.
 - **Shape checks.** A CM block must be strictly smaller than its content, and a STORED block exactly the
   size of its content. Anything else is rejected as corrupt before decoding.
 - **Bounded work per byte.** CM decoding costs O(declared size) whatever the payload. A frame reset clears
@@ -425,6 +445,11 @@ preset, so any of them reproduces locally (see [Tooling and automation](#tooling
 | `aarch64-qemu` | GCC 13 cross, `armv8.2-a+dotprod` | QEMU user mode, `-cpu max` | 6 |
 | `mingw-wine` | MinGW-w64 GCC 13 cross, static | Wine 9 | 5 (the CLI is POSIX-only) |
 | `python` | GCC 13 `-O3`, `HCE_BUILD_PYTHON=ON` | — | 7 (the six, plus pytest) |
+| `clang-fuzz` | Clang 18, `HCE_FUZZ=ON` | libFuzzer + ASan + UBSan | the six, plus the [fuzz targets](fuzz/README.md) |
+
+Every preset also builds the six [fuzz targets](fuzz/README.md) (`fuzz_*` ctests, which replay each target's
+seeds and saved regressions) and the ultracodec suites, including `ultracodec_fixtures`: archives written by
+the encoders of past commits, decoded by today's decoder.
 
 | Suite | Scope | Highlights |
 |---|---|---|
@@ -451,8 +476,9 @@ builds. Streams written on either architecture decode on the other.
 
 ## Performance and benchmarks
 
-**Setup.** Intel Xeon @ 2.80 GHz (4 vCPU cloud VM), Linux 6.18, GCC 13.3 `release` build. Each figure is
-the best of two runs; tools ran single-threaded unless noted; MB = 10⁶ bytes. Baselines: gzip 1.12,
+**Setup.** Intel Xeon @ 2.80 GHz (4 vCPU cloud VM), Linux 6.18, GCC 13.3 `release` build. These tables
+were measured before 2.2.0 and not re-measured since. Each figure is the best of two runs (today's
+`tools/benchmark.py` reports the median and labels the best separately); tools ran single-threaded unless noted; MB = 10⁶ bytes. Baselines: gzip 1.12,
 zstd 1.5.5, xz 5.4.5.
 
 **Corpus.**
@@ -669,7 +695,10 @@ Input and output:
 
 Compression:
   -l, --level N           effort 0..4 (default 2); model memory per thread
-                          21M, 38M, 40M, 76M, 149M; decoding needs the same
+                          21M, 38M, 40M, 76M, 149M with --codec-profile 1,
+                          20M, 37M, 41M, 76M, 149M with 2; decoding needs the same
+      --codec-profile N   byte codec profile: 2 (default) is about 5% smaller,
+                          1 is faster and what hce 2.0 and 2.1 write
       --window SIZE       history window, power of two 64K..1G (default 8M)
       --block SIZE        block size, power of two 1K..8M (default 256K)
       --frame SIZE        frame length / sync interval, block..1G (default 8M)
@@ -680,8 +709,9 @@ Compression:
       --lang LANG         keyword table for --structural: auto (default: from
                           the input's extension), generic, c, cpp, python,
                           javascript, typescript, java, go, rust
-      --spool-dir DIR     where --structural keeps its token spool (default:
-                          next to the output file, else the temporary directory)
+      --spool-dir DIR     where --structural keeps its token spool, a new
+                          owner-only file (default: next to the output file,
+                          else the temporary directory)
 
 Decompression:
       --recovery MODE     strict | skip | skip_and_fill (default strict)
@@ -696,8 +726,9 @@ Decompression:
       --ratio-burst SIZE  burst depth of the expansion budget (default 64M)
       --max-output SIZE   largest total output
                           Structural archives are verified as a whole: they take
-                          --max-memory, but not --recovery, --report or the
-                          other limits.
+                          --max-memory, --max-output and --max-level (and those
+                          of --limits); --recovery, --report, --max-window,
+                          --max-block, --max-ratio and --ratio-burst are refused.
 
 Reporting:
       --stats[=FORMAT]    integer telemetry on stderr: text (default) or json
@@ -710,8 +741,7 @@ SIZE takes an optional K, M, G or T suffix (powers of 1024).
 
 Environment:
   HCE_AIO=io_uring|threads        I/O backend of the --structural token spool
-  HCE_SIMD=scalar|sse2|avx2|avx512|neon
-                                  mixer kernels (default: avx2, else sse2 or neon)
+  HCE_SIMD=scalar|sse2|avx2|neon  mixer kernels (default: the best available)
 
 Exit status: 0 success (with -d/-t: every byte verified), 1 usage or I/O error,
 2 corrupt input, 3 finished with data loss, 4 resource limit exceeded,
@@ -775,7 +805,7 @@ data = hce.decompress(packed, max_output=64 << 20)         # either format; boun
 stats = hce.verify(packed)                                 # Stats(format, input_bytes, output_bytes, ..., verified=True)
 
 hce.compress_file("big.log", "big.log.hce", threads=8)    # files go through the io_uring aio layer
-hce.decompress_file("big.log.hce", "big.log")             # on failure the output file is removed
+hce.decompress_file("big.log.hce", "big.log", max_output=8 << 30)  # big.log changes only once complete
 
 try:
     hce.decompress(untrusted, max_output=1 << 30)
@@ -894,8 +924,9 @@ reserved for that.
 ### Benchmark script
 
 [`tools/benchmark.py`](tools/benchmark.py) (Python 3.8+, standard library only) compresses each corpus
-with `hce --structural`, `hce`, `zstd -19` and `xz -9e`, decompresses every result and compares it with
-the original byte for byte, and writes Markdown and CSV tables of size and speed.
+with `hce --structural`, `hce`, `zstd -19` and `xz -9e`, decompresses every result after every repetition
+and compares it with the original byte for byte (one mismatch fails that codec), and writes Markdown, CSV
+and JSON tables of size, speed and each command's peak RSS.
 
 ```bash
 tools/benchmark.py                                   # every built-in corpus, every tool found
@@ -905,13 +936,19 @@ tools/benchmark.py --corpus logs=/var/log/syslog --codecs ncm,zstd --threads 8
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--corpus NAME[=PATH]` | all built-ins found | `python-stdlib`, `cxx-headers`, `hce-repo`, or any file or directory; repeatable |
+| `--corpus NAME[=PATH]` | all built-ins found | `python-stdlib`, `cxx-headers`, `hce-repo`, the generated `synthetic-logs`, `synthetic-binary`, `synthetic-random` and `synthetic-small` (fixed seeds, SHA-256 pinned), or any file or directory; repeatable |
 | `--codecs LIST` | `structural,ncm,zstd,xz` | Subset to run; missing tools are skipped unless named explicitly |
 | `--hce PATH` | `build/release/hce` | The binary under test |
 | `--level N`, `--threads N` | `2`, all CPUs | hce level; threads for every tool |
-| `--runs N` | `1` | Repetitions; the fastest time is reported |
+| `--runs N` | `1` | Repetitions, each verified; the median is reported and the fastest labeled best |
+| `--per-file` | off | Also compress every file on its own and report the sums |
 | `--max-bytes N` | none | Cut every corpus, for quick runs |
 | `--md FILE`, `--csv FILE` | none | Also write the report to files (Markdown always goes to stdout) |
+| `--json FILE`, `--manifest FILE` | none | Every raw repetition with the source revision, build settings and machine; the corpus manifest (each file's size and SHA-256) |
+
+A run anyone can reproduce: `tools/benchmark.py --corpus synthetic-small --per-file --runs 3 --json
+run.json --manifest manifest.json`. The manifest's SHA-256 shows the same bytes were measured; speeds still
+depend on the machine.
 
 Corpora are concatenations of their files in sorted order, so every run measures the same bytes. Exit
 status: 0 when every round trip verified, 1 when a command failed or an output differed, 2 for usage errors.
@@ -940,7 +977,9 @@ encodes at the same speed. Streams are byte-identical to every other build.
 | `linux (preset)` | `release`, `clang-release`, `gcc-asan`, `clang-asan`, `gcc-tsan`, `clang-tsan`: build with `-Werror`, then all six suites; io_uring compiled in (`HCE_AIO_URING=ON`) |
 | `aarch64 (QEMU)` | The `aarch64-qemu` preset: a static cross build, every suite under `qemu-aarch64 -cpu max` |
 | `windows (MinGW-w64 + Wine)` | The `mingw-wine` preset: a static Windows build, five suites under Wine |
-| `benchmark (smoke)` | `tools/benchmark.py` on the three corpora; tables in the job summary and as an artifact |
+| `macos (macos-15, macos-15-intel)` | Native Apple clang builds: the `release` preset's suites, then a wheel with `-Werror`, installed, with pytest and its `hce` command. Added for 2.2.0 and not yet run in CI at the time of writing |
+| `fuzz (libFuzzer smoke)` | The `clang-fuzz` preset: every fuzz target over its seeds and saved regressions, then two minutes of fuzzing per target. A smoke test, not a campaign |
+| `benchmark (smoke)` | `tools/benchmark.py` on the built-in corpora, then `synthetic-small` per file over three runs; tables in the job summary, and the tables, raw runs and manifests as artifacts |
 | `python (3.10, 3.13)` | An sdist, then a wheel built from it with `-Werror`, installed with the pinned test tools; pyflakes, `regenerate.py --check`, and pytest against the installed wheel and its `hce` command. The sdist and wheel are kept as artifacts |
 | `conda` | `environment.yml` as written: `ctest --preset python` with `-Werror`, then an editable install and pytest |
 
@@ -1021,17 +1060,20 @@ cmake/x86_64-w64-mingw32.cmake    Windows cross toolchain (MinGW-w64); tests run
   `--max-memory`, allow more.
 - **R12 consequence.** Incompressible data is stored and never enters the models, so a repeated
   incompressible region is not deduplicated.
-- **Fuzzing.** Fuzzing is randomized and runs inside the test suites (mutation and differential). There is
-  no coverage-guided harness (libFuzzer/OSS-Fuzz) yet.
+- **Fuzzing.** Randomized mutation and differential fuzzing run inside the test suites, and six libFuzzer
+  targets cover the FRAMED decoder, the block codecs, structural archives, the dictionary and token
+  parsers, and ultracodec ([fuzz/README.md](fuzz/README.md)). CI runs them for two minutes each; no
+  long-running campaign (OSS-Fuzz or similar) is set up, and a clean run is not proof of absence of bugs.
 - **Platforms.** Linux x86-64 and AArch64 are tested. Windows builds (MinGW-w64) pass the library suites
-  under Wine; native Windows (MSVC) and macOS have not been validated, and the CLI requires POSIX.
+  under Wine; native Windows (MSVC) has not been validated, and the CLI requires POSIX. A native macOS CI
+  job (arm64 and x86-64) exists but had not run when this was written, so macOS is not yet validated.
 - **Structural codec.** `--structural` is faster but compresses source code 15–20% larger than the byte
   codec: its dictionary of distinct tokens costs about a third of every archive.
 - **Format.** Profile 1 is frozen by golden vectors, but the 4-byte container magic is still provisional.
 
 ## Roadmap
 
-- Coverage-guided fuzz targets for the container and codec decoders (libFuzzer, OSS-Fuzz).
+- Continuous fuzzing campaigns for the [fuzz targets](fuzz/README.md) (OSS-Fuzz or a scheduled job).
 - Decoder worker planning driven by the stream header rather than the limits' worst case.
 - Seek-index ancillary blocks for random access; the container already reserves them.
 - A final container magic number, then a formal format specification document.

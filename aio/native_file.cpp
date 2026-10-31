@@ -22,19 +22,20 @@
 namespace hce::aio {
 
 NativeFile::NativeFile(NativeFile&& other) noexcept
-    : handle_(std::exchange(other.handle_, kClosed)), size_(other.size_), direct_(other.direct_) {}
+    : handle_(std::exchange(other.handle_, kClosed)), size_(other.size_), direct_(other.direct_), id_(other.id_) {}
 
 NativeFile& NativeFile::operator=(NativeFile&& other) noexcept {
   if (this != &other) {
-    close();
+    (void)close();
     handle_ = std::exchange(other.handle_, kClosed);
     size_ = other.size_;
     direct_ = other.direct_;
+    id_ = other.id_;
   }
   return *this;
 }
 
-NativeFile::~NativeFile() { close(); }
+NativeFile::~NativeFile() { (void)close(); }
 
 #if defined(_WIN32)
 
@@ -63,27 +64,30 @@ IoOutcome transfer(HANDLE h, bool write, std::byte* p, std::size_t len, u64 offs
 
 NativeFile NativeFile::open(const std::filesystem::path& path, Mode mode, bool direct, OpenError& err) noexcept {
   NativeFile f;
-  const bool write = mode == Mode::write;
+  const bool write = mode != Mode::read;
+  const DWORD disposition = mode == Mode::read ? OPEN_EXISTING : mode == Mode::write ? CREATE_ALWAYS : CREATE_NEW;
   DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
   // NO_BUFFERING needs sector-aligned offsets, lengths and memory: the adapters use kIoAlign.
   if (!write) flags |= FILE_FLAG_SEQUENTIAL_SCAN | (direct ? FILE_FLAG_NO_BUFFERING : 0);
   const HANDLE h = ::CreateFileW(path.c_str(), write ? GENERIC_WRITE : GENERIC_READ,
                                  write ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                 nullptr, write ? CREATE_ALWAYS : OPEN_EXISTING, flags, nullptr);
+                                 nullptr, disposition, flags, nullptr);
   if (h == INVALID_HANDLE_VALUE) {
     err = {Errc::io_error, static_cast<int>(::GetLastError())};
     return f;
   }
   f.handle_ = h;
   LARGE_INTEGER size{};
+  BY_HANDLE_FILE_INFORMATION info{};
   if (::GetFileType(h) != FILE_TYPE_DISK) {
     err = {Errc::unsupported_feature, ERROR_NOT_SUPPORTED};
-    f.close();
-  } else if (!::GetFileSizeEx(h, &size)) {
+    (void)f.close();
+  } else if (!::GetFileSizeEx(h, &size) || !::GetFileInformationByHandle(h, &info)) {
     err = {Errc::io_error, static_cast<int>(::GetLastError())};
-    f.close();
+    (void)f.close();
   } else {
     f.size_ = static_cast<u64>(size.QuadPart);
+    f.id_ = {info.dwVolumeSerialNumber, (u64{info.nFileIndexHigh} << 32) | info.nFileIndexLow};
     f.direct_ = !write && direct;
     err = {};
   }
@@ -102,27 +106,34 @@ IoOutcome NativeFile::sync() noexcept {
   return ::FlushFileBuffers(handle_) ? IoOutcome{} : IoOutcome{0, static_cast<int>(::GetLastError())};
 }
 
-void NativeFile::close() noexcept {
-  if (handle_ != kClosed) ::CloseHandle(handle_);
+int NativeFile::close() noexcept {
+  int err = 0;
+  if (handle_ != kClosed && !::CloseHandle(handle_)) err = static_cast<int>(::GetLastError());
   handle_ = kClosed;
+  return err;
 }
 
 #else  // POSIX
 
 NativeFile NativeFile::open(const std::filesystem::path& path, Mode mode, bool direct, OpenError& err) noexcept {
   NativeFile f;
-  const bool write = mode == Mode::write;
+  const bool write = mode != Mode::read;
   // O_NONBLOCK keeps a FIFO from blocking the open; it is rejected just below,
-  // and has no effect on regular files.
-  int flags = (write ? O_WRONLY | O_CREAT | O_TRUNC : O_RDONLY) | O_CLOEXEC | O_NONBLOCK;
+  // and has no effect on regular files. O_EXCL fails on any existing name,
+  // symbolic links included, so a new file is never someone else's.
+  int flags = (mode == Mode::read    ? O_RDONLY
+               : mode == Mode::write ? O_WRONLY | O_CREAT | O_TRUNC
+                                     : O_WRONLY | O_CREAT | O_EXCL) |
+              O_CLOEXEC | O_NONBLOCK;
+  const mode_t perms = mode == Mode::create_private ? 0600 : 0666;
 #if defined(__linux__)
   if (direct && !write) flags |= O_DIRECT;
 #endif
-  int fd = ::open(path.c_str(), flags, 0666);
+  int fd = ::open(path.c_str(), flags, perms);
 #if defined(__linux__)
   if (fd < 0 && (flags & O_DIRECT) != 0 && errno == EINVAL) {  // tmpfs and some FUSE file systems
     flags &= ~O_DIRECT;
-    fd = ::open(path.c_str(), flags, 0666);
+    fd = ::open(path.c_str(), flags, perms);
   }
 #endif
   if (fd < 0) {
@@ -133,15 +144,16 @@ NativeFile NativeFile::open(const std::filesystem::path& path, Mode mode, bool d
   struct stat st {};
   if (::fstat(fd, &st) != 0) {
     err = {Errc::io_error, errno};
-    f.close();
+    (void)f.close();
     return f;
   }
   if (!S_ISREG(st.st_mode)) {
     err = {Errc::unsupported_feature, ESPIPE};
-    f.close();
+    (void)f.close();
     return f;
   }
   f.size_ = static_cast<u64>(st.st_size);
+  f.id_ = {static_cast<u64>(st.st_dev), static_cast<u64>(st.st_ino)};
 #if defined(__linux__)
   f.direct_ = (flags & O_DIRECT) != 0;
   if (!write) (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
@@ -183,9 +195,12 @@ IoOutcome NativeFile::sync() noexcept {
   return {0, errno};
 }
 
-void NativeFile::close() noexcept {
-  if (handle_ != kClosed) ::close(handle_);
+int NativeFile::close() noexcept {
+  int err = 0;
+  // POSIX leaves the descriptor unspecified after EINTR; Linux and macOS have closed it: never retry.
+  if (handle_ != kClosed && ::close(handle_) != 0 && errno != EINTR) err = errno;
   handle_ = kClosed;
+  return err;
 }
 
 #endif

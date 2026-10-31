@@ -122,9 +122,9 @@ void AsyncFileInput::fail(Errc e, int sys_error) noexcept {
 // ----------------------------------------------------------------- output ---
 
 std::unique_ptr<AsyncFileOutput> AsyncFileOutput::create(const std::filesystem::path& path, const Options& opt,
-                                                         OpenError* err) {
+                                                         OpenError* err, Create how) {
   const Options o = normalize(opt);
-  std::unique_ptr<IAsyncWriter> io = open_writer(path, o, err);
+  std::unique_ptr<IAsyncWriter> io = open_writer(path, o, err, how);
   if (!io) return nullptr;
   try {
     return std::unique_ptr<AsyncFileOutput>(new AsyncFileOutput(std::move(io), o));
@@ -221,6 +221,15 @@ Errc AsyncFileOutput::finish(bool durable) noexcept {
     if (io_->queue_sync(kSyncTag) != Errc::ok || io_->submit() != Errc::ok) fail(Errc::io_error, 0);
     while (!synced_ && error_ == Errc::ok) wait_some();
   }
+  return error_;
+}
+
+Errc AsyncFileOutput::close() noexcept {
+  if (!finished_) (void)finish(false);
+  if (closed_) return error_;
+  closed_ = true;
+  if (in_flight_ > 0) return error_;  // a failed write left operations behind: destruction collects them
+  if (const int e = io_->close(); e != 0) fail(Errc::io_error, e);
   return error_;
 }
 
