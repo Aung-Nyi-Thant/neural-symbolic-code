@@ -32,6 +32,16 @@
 
 namespace fs = std::filesystem;
 namespace aio = hce::aio;
+
+// ThreadSanitizer: its shadow memory inflates RSS, and it cannot see liburing's rings.
+#if defined(__SANITIZE_THREAD__)
+#define HCE_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define HCE_TEST_TSAN 1
+#endif
+#endif
+
 namespace st = hce::structural;
 using hc::Bytes;
 using hc::Errc;
@@ -631,6 +641,13 @@ static void test_spool_safety() {
 
   // Concurrent runs sharing a spool directory each get their own spool.
   o.spool_dir = dir;
+#ifdef HCE_TEST_TSAN
+  // liburing maps its rings with raw syscalls TSan does not intercept, so a ring
+  // that reuses another thread's freed ring address reads as a race. This test is
+  // about spool names; the threads backend gives TSan full sight of it.
+  const aio::Backend saved_backend = o.io.backend;
+  o.io.backend = aio::Backend::threads;
+#endif
   std::vector<std::thread> runs;
   std::vector<st::ArchiveStats> results(4);
   for (int i = 0; i < 4; ++i)
@@ -640,6 +657,9 @@ static void test_spool_safety() {
     CHECK(results[static_cast<std::size_t>(i)].status == Errc::ok);
     CHECK(read_text(dir / ("c" + std::to_string(i) + ".hcs")) == reference);
   }
+#ifdef HCE_TEST_TSAN
+  o.io.backend = saved_backend;
+#endif
   // Failure and cancellation remove the spool they made, and nothing else.
   std::stop_source stop;
   stop.request_stop();
@@ -697,7 +717,7 @@ static void test_decode_limits() {
   hce::MemoryInput ain2(arc.data);
   r = st::decompress_stream(ain2, back, d);
   CHECK(r.status == Errc::ok && back.data.size() == big.size());
-#if defined(__linux__)
+#if defined(__linux__) && !defined(HCE_TEST_TSAN)  // TSan doubles RSS; release and ASan builds check this
   // Peak memory of a 4-worker decode stays within its budget (plus the
   // archive and output buffers this test holds, and allocator slack).
   const u64 budget = u64{96} << 20;

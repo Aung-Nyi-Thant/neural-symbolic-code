@@ -62,7 +62,9 @@ static void test_rss_units() {
   CHECK(tools::rss_to_mib(1048576, true) == 1.0 && tools::rss_to_mib(1024, false) == 1.0);
   CHECK(tools::rss_to_mib(3 * 1048576L, true) == 3.0 && tools::rss_to_mib(512, false) == 0.5);
 #if !defined(_WIN32)
-  // The platform's unit, measured: a child that touches 64 MiB reports 64..160 MiB of peak RSS.
+  // The platform's unit, measured: a child that touches 64 MiB reports at least 64 MiB of peak
+  // RSS and well under 64 GiB (a wrong unit is off by 1024x either way). Sanitizer shadow
+  // memory adds to the baseline: about 210 MiB under TSan.
   const pid_t pid = ::fork();
   if (pid == 0) {
     std::vector<char> v(std::size_t{64} << 20);
@@ -72,7 +74,7 @@ static void test_rss_units() {
     ::getrusage(RUSAGE_SELF, &ru);
     const double mib = tools::maxrss_mib(ru.ru_maxrss);
     std::printf("  peak RSS after touching 64 MiB: %.1f MiB\n", mib);
-    ::_exit(mib >= 64.0 && mib < 160.0 ? 0 : 1);
+    ::_exit(mib >= 64.0 && mib < 1024.0 ? 0 : 1);
   }
   int st = -1;
   ::waitpid(pid, &st, 0);
