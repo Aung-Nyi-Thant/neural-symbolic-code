@@ -44,8 +44,8 @@ text and code). Its measured throughput, memory bounds and audit results are bel
 | **Parallelism** | Frames compress and decompress on all cores under counting-semaphore back-pressure and a hard memory bound. |
 
 > [!NOTE]
-> **Status:** development version 2.2.0, not yet released; the latest release is
-> [v2.1.0](https://github.com/Aung-Nyi-Thant/neural-symbolic-code/releases/tag/v2.1.0) (2026-10-24), and
+> **Status:** the latest release is
+> [v2.2.0](https://github.com/Aung-Nyi-Thant/neural-symbolic-code/releases/tag/v2.2.0) (2026-10-31), and
 > this README describes `main`. Container v3 FRAMED, codec profiles 1 (`prior_id` `0x4E434D01`) and 2
 > (`0x4E434D02`, the CLI's and the Python package's default in 2.2.0; see [Codec profile 2](#codec-profile-2)).
 > Every 2.0 and 2.1 stream decodes unchanged.
@@ -977,7 +977,7 @@ encodes at the same speed. Streams are byte-identical to every other build.
 | `linux (preset)` | `release`, `clang-release`, `gcc-asan`, `clang-asan`, `gcc-tsan`, `clang-tsan`: build with `-Werror`, then all six suites; io_uring compiled in (`HCE_AIO_URING=ON`) |
 | `aarch64 (QEMU)` | The `aarch64-qemu` preset: a static cross build, every suite under `qemu-aarch64 -cpu max` |
 | `windows (MinGW-w64 + Wine)` | The `mingw-wine` preset: a static Windows build, five suites under Wine |
-| `macos (macos-15, macos-15-intel)` | Native Apple clang builds: the `release` preset's suites, then a wheel with `-Werror`, installed, with pytest and its `hce` command. Added for 2.2.0 and not yet run in CI at the time of writing |
+| `macos (macos-15, macos-15-intel)` | Native Apple clang builds: the `release` preset's suites, then a wheel with `-Werror`, installed, with pytest and its `hce` command. Added for 2.2.0; first green on PR #17 (2026-10-31) |
 | `fuzz (libFuzzer smoke)` | The `clang-fuzz` preset: every fuzz target over its seeds and saved regressions, then two minutes of fuzzing per target. A smoke test, not a campaign |
 | `benchmark (smoke)` | `tools/benchmark.py` on the built-in corpora, then `synthetic-small` per file over three runs; tables in the job summary, and the tables, raw runs and manifests as artifacts |
 | `python (3.10, 3.13)` | An sdist, then a wheel built from it with `-Werror`, installed with the pinned test tools; pyflakes, `regenerate.py --check`, and pytest against the installed wheel and its `hce` command. The sdist and wheel are kept as artifacts |
@@ -1065,8 +1065,9 @@ cmake/x86_64-w64-mingw32.cmake    Windows cross toolchain (MinGW-w64); tests run
   parsers, and ultracodec ([fuzz/README.md](fuzz/README.md)). CI runs them for two minutes each; no
   long-running campaign (OSS-Fuzz or similar) is set up, and a clean run is not proof of absence of bugs.
 - **Platforms.** Linux x86-64 and AArch64 are tested. Windows builds (MinGW-w64) pass the library suites
-  under Wine; native Windows (MSVC) has not been validated, and the CLI requires POSIX. A native macOS CI
-  job (arm64 and x86-64) exists but had not run when this was written, so macOS is not yet validated.
+  under Wine; native Windows (MSVC) has not been validated, and the CLI requires POSIX. macOS (arm64 and
+  x86-64, Apple clang) passes the `release` suites and the wheel's pytest in CI; sanitizers and fuzzing
+  run on Linux only.
 - **Structural codec.** `--structural` is faster but compresses source code 15–20% larger than the byte
   codec: its dictionary of distinct tokens costs about a third of every archive.
 - **Format.** Profile 1 is frozen by golden vectors, but the 4-byte container magic is still provisional.
