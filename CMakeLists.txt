@@ -30,6 +30,25 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# std::stop_token and std::jthread: libc++ before LLVM 20 (Apple clang
+# included) ships them only behind -fexperimental-library.
+include(CheckCXXSourceCompiles)
+set(HCE_STOP_TOKEN_TEST "#include <stop_token>\n#include <thread>\nint main() { std::stop_source s; std::jthread t([](std::stop_token) {}); return s.stop_requested(); }")
+set(CMAKE_REQUIRED_LIBRARIES Threads::Threads)
+check_cxx_source_compiles("${HCE_STOP_TOKEN_TEST}" HCE_HAVE_STOP_TOKEN)
+if(NOT HCE_HAVE_STOP_TOKEN AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(CMAKE_REQUIRED_FLAGS "-fexperimental-library")
+  set(CMAKE_REQUIRED_LINK_OPTIONS "-fexperimental-library")
+  check_cxx_source_compiles("${HCE_STOP_TOKEN_TEST}" HCE_STOP_TOKEN_EXPERIMENTAL)
+  unset(CMAKE_REQUIRED_FLAGS)
+  unset(CMAKE_REQUIRED_LINK_OPTIONS)
+  if(HCE_STOP_TOKEN_EXPERIMENTAL)
+    add_compile_options(-fexperimental-library)
+    add_link_options(-fexperimental-library)
+  endif()
+endif()
+unset(CMAKE_REQUIRED_LIBRARIES)
+
 # Warning policy shared by every first-party target.
 add_library(hce_warnings INTERFACE)
 target_compile_options(hce_warnings INTERFACE

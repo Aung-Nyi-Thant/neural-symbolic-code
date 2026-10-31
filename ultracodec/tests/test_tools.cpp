@@ -66,7 +66,8 @@ static void test_rss_units() {
   const pid_t pid = ::fork();
   if (pid == 0) {
     std::vector<char> v(std::size_t{64} << 20);
-    for (std::size_t i = 0; i < v.size(); i += 4096) v[i] = static_cast<char>(i);
+    volatile char* touch = v.data();  // volatile: clang -O2 otherwise drops the unread buffer
+    for (std::size_t i = 0; i < v.size(); i += 4096) touch[i] = static_cast<char>(i);
     rusage ru{};
     ::getrusage(RUSAGE_SELF, &ru);
     const double mib = tools::maxrss_mib(ru.ru_maxrss);
